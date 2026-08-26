@@ -1,0 +1,3 @@
+# Install with: sudo crontab -e -u jycrm
+# Keep this local backup, then copy it to a protected off-server bucket separately.
+20 3 * * * /opt/jy-customer/deploy/scripts/backup_postgres.sh >> /var/log/jy-customer-backup.log 2>&1

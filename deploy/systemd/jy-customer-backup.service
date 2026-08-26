@@ -1,0 +1,17 @@
+[Unit]
+Description=Back up the Jiaoyang Customer CRM PostgreSQL database
+After=postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=oneshot
+User=jycrm
+Group=jycrm
+EnvironmentFile=/etc/jy-customer/jy-customer.env
+ExecStart=/opt/jy-customer/deploy/scripts/backup_postgres.sh
+UMask=077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/var/backups/jy-customer

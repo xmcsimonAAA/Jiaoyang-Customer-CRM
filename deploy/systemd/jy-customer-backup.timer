@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightly Jiaoyang Customer CRM database backup
+
+[Timer]
+OnCalendar=*-*-* 03:20:00 UTC
+Persistent=true
+Unit=jy-customer-backup.service
+
+[Install]
+WantedBy=timers.target
