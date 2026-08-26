@@ -6,11 +6,11 @@ point is MuskZoom account identity and one-time SSO only.
 
 ## Before touching the server
 
-1. Create a **private** GitHub repository for this project. Do not upload `.env`,
-   `customer_data.db`, `backups/`, or exported customer files.
-2. Commit the reviewed customer-system code and push it to that private repository.
-3. Install a read-only GitHub deploy key for the new private repository under the `jycrm`
-   server user, or arrange another non-interactive private-repository access method.
+1. A public GitHub repository is acceptable only for reviewed source code. Never upload
+   `.env`, `customer_data.db`, `backups/`, customer spreadsheets, or exported customer files.
+2. Commit the reviewed customer-system code and push it to the public repository.
+3. The VPS can clone this public repository over HTTPS; no GitHub token or deploy key is
+   needed for read-only pulls. Never configure a personal GitHub token on the server.
 4. In Cloudflare, add an `A` record: `crm` -> the VPS public IP. Leave it **DNS only**
    until the TLS certificate is issued.
 5. Generate two independent secrets on a trusted computer:
@@ -60,10 +60,11 @@ CREATE DATABASE jy_customer_crm OWNER jy_crm ENCODING 'UTF8';
 
 ## 3. Put the application on the VPS
 
-Use the private repository created above.
+Use the public repository created above. The application data and production secrets remain
+on the VPS; they are not stored in GitHub.
 
 ```bash
-sudo -u jycrm git clone git@github.com:YOUR_ACCOUNT/YOUR_PRIVATE_CUSTOMER_REPO.git /opt/jy-customer
+sudo -u jycrm git clone https://github.com/xmcsimonAAA/Jiaoyang-Customer-CRM.git /opt/jy-customer
 sudo -u jycrm python3 -m venv /opt/jy-customer/.venv
 sudo -u jycrm /opt/jy-customer/.venv/bin/pip install --upgrade pip
 sudo -u jycrm /opt/jy-customer/.venv/bin/pip install -r /opt/jy-customer/requirements.txt
