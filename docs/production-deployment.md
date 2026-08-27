@@ -106,21 +106,30 @@ Do this only after the MuskZoom SSO/identity changes in the next section have be
 reviewed, but before opening the customer module to staff.
 
 1. Stop local customer-data entry for a short migration window.
-2. Make a final SQLite backup on the development machine.
-3. Copy that one backup file to the VPS using an encrypted transfer. Do not use email or
-   public file-sharing links.
-4. First perform a dry check on the VPS:
+2. Run the local SXY snapshot import in dry-run mode, review its counts, then run it with
+   `--apply`. The script uses a local ignored mapping file under `backups/`; that file
+   contains customer identifiers and must never be committed.
 
    ```bash
-   sudo -u jycrm /opt/jy-customer/.venv/bin/python /opt/jy-customer/backend/scripts/migrate_sqlite_to_postgres.py \
-     --source /secure-transfer/customer_data-final.db
+   .venv/bin/python backend/scripts/import_sxy_snapshot.py
+   .venv/bin/python backend/scripts/import_sxy_snapshot.py --apply
    ```
 
-5. After checking the reported counts, run the only write operation:
+3. Make a final SQLite backup of the resulting database on the development machine.
+4. Copy that one backup file to the VPS using an encrypted transfer. Do not use email or
+   public file-sharing links.
+5. First perform a dry check on the VPS:
 
    ```bash
-   sudo -u jycrm /opt/jy-customer/.venv/bin/python /opt/jy-customer/backend/scripts/migrate_sqlite_to_postgres.py \
-     --source /secure-transfer/customer_data-final.db --apply
+   sudo bash -c 'set -a; . /etc/jy-customer/jy-customer.env; set +a; exec /opt/jy-customer/.venv/bin/python /opt/jy-customer/backend/scripts/migrate_sqlite_to_postgres.py \
+     --source /secure-transfer/customer_data-final.db'
+   ```
+
+6. After checking the reported counts, run the only write operation:
+
+   ```bash
+   sudo bash -c 'set -a; . /etc/jy-customer/jy-customer.env; set +a; exec /opt/jy-customer/.venv/bin/python /opt/jy-customer/backend/scripts/migrate_sqlite_to_postgres.py \
+     --source /secure-transfer/customer_data-final.db --apply'
    ```
 
 The script refuses to overwrite a PostgreSQL target containing data. It deliberately
