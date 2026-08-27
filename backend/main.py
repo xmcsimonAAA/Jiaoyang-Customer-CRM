@@ -1253,7 +1253,9 @@ def meta(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
         and (user["customerScope"] == "all" or item["team"] == user["team"])
     ]
     customer_clause, customer_params = access_clause(user)
-    advisor_order = "lower(advisor)" if uses_postgres(DATABASE_URL) else "advisor COLLATE NOCASE"
+    # PostgreSQL does not resolve a SELECT DISTINCT alias inside lower(...).
+    # Ordering by the alias itself is portable and keeps this metadata query valid.
+    advisor_order = "advisor" if uses_postgres(DATABASE_URL) else "advisor COLLATE NOCASE"
     with db() as conn:
         batches = conn.execute("SELECT * FROM placement_batches ORDER BY COALESCE(close_date, '9999-12-31'), created_at DESC").fetchall()
         fields = conn.execute("SELECT * FROM customer_fields WHERE active=1 ORDER BY display_order, created_at").fetchall()
