@@ -181,6 +181,55 @@ def test_supervisor_team_scope_and_manager_cannot_assign():
     assert denied.status_code == 403
 
 
+def test_customer_assignment_worklist_and_bulk_reassignment():
+    manager_headers, manager = login("manager", "manager123")
+    second_headers, second = login("manager2", "manager2123")
+    supervisor_headers, _ = login("supervisor", "supervisor123")
+    admin_headers, _ = login("admin", "admin123")
+
+    created_ids = []
+    for name in ("归属批量客户甲", "归属批量客户乙"):
+        created = client.post(
+            "/api/customers", headers=admin_headers,
+            json={"name": name, "ownerId": "unassigned", "sourceAdvisorLabel": "历史顾问甲"},
+        )
+        assert created.status_code == 201, created.text
+        created_ids.append(created.json()["customer"]["id"])
+
+    denied_worklist = client.get("/api/customer-assignments", headers=manager_headers)
+    assert denied_worklist.status_code == 403
+
+    worklist = client.get("/api/customer-assignments?ownerId=unassigned", headers=admin_headers)
+    assert worklist.status_code == 200, worklist.text
+    assert set(created_ids) <= {item["id"] for item in worklist.json()["items"]}
+    assert any(item["owner_id"] == "unassigned" for item in worklist.json()["ownerGroups"])
+
+    bulk = client.post(
+        "/api/customers/bulk-assign", headers=admin_headers,
+        json={"customerIds": created_ids, "ownerId": manager["id"], "reason": "按历史顾问归属批量分配"},
+    )
+    assert bulk.status_code == 200, bulk.text
+    assert bulk.json()["assignedCount"] == 2
+
+    visible_to_manager = client.get("/api/customers?search=归属批量客户", headers=manager_headers)
+    assert visible_to_manager.status_code == 200
+    assert set(created_ids) <= {item["id"] for item in visible_to_manager.json()["items"]}
+    details = client.get(f"/api/customers/{created_ids[0]}", headers=manager_headers)
+    assert details.status_code == 200
+    assert details.json()["customer"]["owner_id"] == manager["id"]
+    assert any(item["reason"] == "按历史顾问归属批量分配" for item in details.json()["assignments"])
+
+    team_reassignment = client.post(
+        "/api/customers/bulk-assign", headers=supervisor_headers,
+        json={"customerIds": [created_ids[0]], "ownerId": second["id"], "reason": "组内调整服务负责人"},
+    )
+    assert team_reassignment.status_code == 200, team_reassignment.text
+    assert client.get(f"/api/customers/{created_ids[0]}", headers=manager_headers).status_code == 404
+    reassigned = client.get(f"/api/customers/{created_ids[0]}", headers=second_headers)
+    assert reassigned.status_code == 200
+    assert reassigned.json()["customer"]["owner_id"] == second["id"]
+
+
 def test_collaborators_extend_visibility_and_holding_snapshots():
     manager_headers, _ = login("manager", "manager123")
     second_headers, second = login("manager2", "manager2123")
@@ -708,3 +757,62 @@ def test_advisor_binding_rules_control_non_placement_defaults_and_manual_placeme
     )
     assert updated.status_code == 200
     assert updated.json()["binding"]["active"] is False
+
+
+def test_crm_permissions_can_extend_a_manager_without_changing_muskzoom_role_or_team():
+    manager_headers, manager = login("manager", "manager123")
+    second_headers, second = login("manager2", "manager2123")
+    admin_headers, _ = login("admin", "admin123")
+
+    managed_customer = client.post(
+        "/api/customers", headers=admin_headers,
+        json={"name": "CRM 全量维护测试客户", "phone": "13800000901", "ownerId": second["id"]},
+    )
+    assert managed_customer.status_code == 201, managed_customer.text
+    customer_id = managed_customer.json()["customer"]["id"]
+    assert client.get(f"/api/customers/{customer_id}", headers=manager_headers).status_code == 404
+
+    granted = client.patch(
+        f"/api/admin/users/{manager['id']}/permissions", headers=admin_headers,
+        json={
+            "crmScopeMode": "all",
+            "canImportCustomers": True,
+            "canManageAssignments": True,
+            "canManageAdvisorBindings": True,
+            "canManageCustomerFields": True,
+            "canExportAll": True,
+            "canManageCrmPermissions": True,
+        },
+    )
+    assert granted.status_code == 200, granted.text
+    granted_user = granted.json()["user"]
+    assert granted_user["rolePermission"] == "manager"
+    assert granted_user["team"] == manager["team"]
+    assert granted_user["customerScope"] == "all"
+    assert granted_user["crmScopeMode"] == "all"
+    assert all(granted_user[key] for key in (
+        "canImportCustomers", "canManageAssignments", "canManageAdvisorBindings",
+        "canManageCustomerFields", "canExportAll", "canManageCrmPermissions",
+    ))
+
+    refreshed = client.get("/api/session", headers=manager_headers)
+    assert refreshed.status_code == 200
+    assert refreshed.json()["user"]["customerScope"] == "all"
+    assert client.get(f"/api/customers/{customer_id}", headers=manager_headers).status_code == 200
+    assert client.get("/api/admin/users", headers=manager_headers).status_code == 200
+    assert client.get("/api/customer-assignments", headers=manager_headers).status_code == 200
+
+    reassigned = client.post(
+        f"/api/customers/{customer_id}/assign", headers=manager_headers,
+        json={"ownerId": manager["id"], "reason": "CRM 数据维护负责人临时接管"},
+    )
+    assert reassigned.status_code == 200, reassigned.text
+    assert client.get(f"/api/customers/{customer_id}", headers=second_headers).status_code == 404
+
+    reset = client.patch(
+        f"/api/admin/users/{manager['id']}/permissions", headers=manager_headers,
+        json={"crmScopeMode": "inherit"},
+    )
+    assert reset.status_code == 200, reset.text
+    assert reset.json()["user"]["crmScopeMode"] == "inherit"
+    assert reset.json()["user"]["customerScope"] == "self"

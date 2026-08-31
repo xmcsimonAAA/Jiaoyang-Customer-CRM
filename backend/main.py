@@ -53,6 +53,7 @@ SSO_REQUIRE_STRONG_CLAIMS = os.getenv("MUSKZOOM_SSO_REQUIRE_STRONG_CLAIMS", "tru
 ALLOWED_ROLE_KEYS = {"manager", "supervisor", "ceo", "developer"}
 ROLE_LABELS = {"manager": "商务经理", "supervisor": "部门主管", "ceo": "管理员", "developer": "开发者"}
 ROLE_PERMISSIONS = {"manager": "manager", "supervisor": "supervisor", "ceo": "admin", "developer": "developer"}
+CRM_SCOPE_MODES = {"inherit", "self", "team", "all"}
 STAGES = ["新客户", "初步接洽", "开户推进", "定增意向", "批次推进", "资金准备", "已参与定增", "已流失", "暂缓"]
 ACCOUNT_STATUSES = ["未启动", "资料准备", "开户审核", "已开户", "开户失败"]
 INTENT_STATUSES = ["未确认", "有意向", "已锁定", "无意向"]
@@ -123,6 +124,10 @@ def init_sqlite_db() -> None:
                 can_import_customers INTEGER,
                 can_export_all INTEGER,
                 can_manage_customer_fields INTEGER,
+                scope_override TEXT,
+                can_manage_assignments INTEGER,
+                can_manage_advisor_bindings INTEGER,
+                can_manage_crm_permissions INTEGER,
                 updated_by TEXT,
                 updated_at TEXT NOT NULL
             );
@@ -322,8 +327,15 @@ def init_sqlite_db() -> None:
             """
         )
         permission_columns = {row["name"] for row in conn.execute("PRAGMA table_info(user_permissions)").fetchall()}
-        if "can_manage_customer_fields" not in permission_columns:
-            conn.execute("ALTER TABLE user_permissions ADD COLUMN can_manage_customer_fields INTEGER")
+        for column, definition in {
+            "can_manage_customer_fields": "INTEGER",
+            "scope_override": "TEXT",
+            "can_manage_assignments": "INTEGER",
+            "can_manage_advisor_bindings": "INTEGER",
+            "can_manage_crm_permissions": "INTEGER",
+        }.items():
+            if column not in permission_columns:
+                conn.execute(f"ALTER TABLE user_permissions ADD COLUMN {column} {definition}")
         import_job_columns = {row["name"] for row in conn.execute("PRAGMA table_info(import_jobs)").fetchall()}
         if "updated_count" not in import_job_columns:
             conn.execute("ALTER TABLE import_jobs ADD COLUMN updated_count INTEGER NOT NULL DEFAULT 0")
@@ -459,6 +471,12 @@ class AssignPayload(BaseModel):
     reason: str = Field(min_length=1)
 
 
+class BulkAssignPayload(BaseModel):
+    customerIds: list[str] = Field(min_length=1, max_length=5000)
+    ownerId: str
+    reason: str = Field(min_length=1)
+
+
 class CollaboratorPayload(BaseModel):
     userIds: list[str] = Field(default_factory=list)
 
@@ -495,6 +513,10 @@ class PermissionPayload(BaseModel):
     canImportCustomers: bool | None = None
     canExportAll: bool | None = None
     canManageCustomerFields: bool | None = None
+    crmScopeMode: str | None = None
+    canManageAssignments: bool | None = None
+    canManageAdvisorBindings: bool | None = None
+    canManageCrmPermissions: bool | None = None
 
 
 class CustomerFieldPayload(BaseModel):
@@ -743,14 +765,44 @@ def default_import_permission(user: dict[str, Any]) -> bool:
     return user["rolePermission"] in {"supervisor", "admin", "developer"}
 
 
+def default_customer_scope(user: dict[str, Any]) -> str:
+    return "self" if user["rolePermission"] == "manager" else "team" if user["rolePermission"] == "supervisor" else "all"
+
+
+def default_assignment_permission(user: dict[str, Any]) -> bool:
+    return user["rolePermission"] in {"supervisor", "admin", "developer"}
+
+
+def default_advisor_binding_permission(user: dict[str, Any]) -> bool:
+    return user["rolePermission"] in {"supervisor", "admin", "developer"}
+
+
+def default_crm_permission_management(user: dict[str, Any]) -> bool:
+    return user["rolePermission"] in {"admin", "developer"}
+
+
+def stored_permission(row: Any | None, column: str, default: bool) -> bool:
+    return bool(row[column]) if row and row[column] is not None else default
+
+
 def enrich_user(user: dict[str, Any]) -> dict[str, Any]:
     with db() as conn:
-        row = conn.execute("SELECT can_import_customers, can_export_all, can_manage_customer_fields FROM user_permissions WHERE user_id = ?", (user["id"],)).fetchone()
+        row = conn.execute(
+            """SELECT can_import_customers, can_export_all, can_manage_customer_fields,
+            scope_override, can_manage_assignments, can_manage_advisor_bindings,
+            can_manage_crm_permissions FROM user_permissions WHERE user_id = ?""",
+            (user["id"],),
+        ).fetchone()
     result = dict(user)
-    result["canImportCustomers"] = bool(row["can_import_customers"]) if row and row["can_import_customers"] is not None else default_import_permission(user)
-    result["canExportAll"] = bool(row["can_export_all"]) if row and row["can_export_all"] is not None else user["rolePermission"] in {"admin", "developer"}
-    result["canManageCustomerFields"] = bool(row["can_manage_customer_fields"]) if row and row["can_manage_customer_fields"] is not None else user["rolePermission"] in {"admin", "developer"}
-    result["customerScope"] = "self" if user["rolePermission"] == "manager" else "team" if user["rolePermission"] == "supervisor" else "all"
+    scope_override = str(row["scope_override"] or "") if row else ""
+    result["crmScopeMode"] = scope_override if scope_override in CRM_SCOPE_MODES - {"inherit"} else "inherit"
+    result["customerScope"] = scope_override if scope_override in CRM_SCOPE_MODES - {"inherit"} else default_customer_scope(user)
+    result["canImportCustomers"] = stored_permission(row, "can_import_customers", default_import_permission(user))
+    result["canExportAll"] = stored_permission(row, "can_export_all", user["rolePermission"] in {"admin", "developer"})
+    result["canManageCustomerFields"] = stored_permission(row, "can_manage_customer_fields", user["rolePermission"] in {"admin", "developer"})
+    result["canManageAssignments"] = stored_permission(row, "can_manage_assignments", default_assignment_permission(user))
+    result["canManageAdvisorBindings"] = stored_permission(row, "can_manage_advisor_bindings", default_advisor_binding_permission(user))
+    result["canManageCrmPermissions"] = stored_permission(row, "can_manage_crm_permissions", default_crm_permission_management(user))
     return result
 
 
@@ -772,14 +824,24 @@ def current_user(
 
 
 def require_supervisor(user: dict[str, Any]) -> None:
-    if user["rolePermission"] not in {"supervisor", "admin", "developer"}:
-        raise HTTPException(403, "需要部门主管或更高权限。")
+    if not user["canManageAssignments"]:
+        raise HTTPException(403, "您的账号未开通客户归属与协同管理权限。")
+
+
+def require_advisor_binding_manager(user: dict[str, Any]) -> None:
+    if not user["canManageAdvisorBindings"]:
+        raise HTTPException(403, "您的账号未开通顾问绑定管理权限。")
+
+
+def require_crm_permission_manager(user: dict[str, Any]) -> None:
+    if not user["canManageCrmPermissions"]:
+        raise HTTPException(403, "您的账号未开通 CRM 权限管理权限。")
 
 
 def require_hongan_advisor_permission(user: dict[str, Any], value: Any) -> None:
-    """港安顾问属于外部关系，只允许主管及以上写入。"""
-    if str(value or "").strip() and user["rolePermission"] == "manager":
-        raise HTTPException(403, "港安顾问由部门主管或更高权限维护。")
+    """港安顾问属于外部关系，只允许拥有顾问绑定权限的成员写入。"""
+    if str(value or "").strip() and not user["canManageAdvisorBindings"]:
+        raise HTTPException(403, "港安顾问由具备顾问绑定权限的成员维护。")
 
 
 def sql_date(expression: str) -> str:
@@ -840,8 +902,10 @@ def validate_binding_owner(advisor_id: str | None, advisor_label: str, user: dic
     advisor = platform_user_by_id(clean_id)
     if not advisor or advisor["rolePermission"] != "manager":
         raise HTTPException(422, "关联的骄阳顾问必须是有效的商务经理账号。")
-    if user["rolePermission"] == "supervisor" and advisor["team"] != user["team"]:
-        raise HTTPException(403, "部门主管只能关联本组商务经理。")
+    if user["customerScope"] == "self" and advisor["id"] != user["id"]:
+        raise HTTPException(403, "当前数据范围只能关联本人账号。")
+    if user["customerScope"] == "team" and advisor["team"] != user["team"]:
+        raise HTTPException(403, "当前数据范围只能关联本组商务经理。")
     if advisor_label.strip() and advisor_label.strip() != advisor["name"].strip():
         raise HTTPException(422, "骄阳顾问名称必须与所关联的系统账号一致。")
     return advisor
@@ -1053,26 +1117,30 @@ def audit(conn: sqlite3.Connection, user: dict[str, Any], action: str, entity_ty
 
 
 def owner_for_request(owner_id: str | None, user: dict[str, Any]) -> dict[str, Any]:
-    if user["rolePermission"] == "manager":
+    if not user["canManageAssignments"]:
         return user
-    if not owner_id and user["rolePermission"] in {"admin", "developer"}:
+    if not owner_id and user["customerScope"] == "all":
         return dict(UNASSIGNED_OWNER)
+    if not owner_id:
+        raise HTTPException(422, "请选择当前骄阳负责人。")
     if owner_id == UNASSIGNED_OWNER_ID:
-        if user["rolePermission"] not in {"admin", "developer"}:
-            raise HTTPException(403, "待分配客户池仅限管理员或开发者使用。")
+        if user["customerScope"] != "all":
+            raise HTTPException(403, "全量数据范围才可使用待分配客户池。")
         return dict(UNASSIGNED_OWNER)
-    owner = platform_user_by_id(owner_id or user["id"])
+    owner = platform_user_by_id(owner_id)
     if not owner or owner["rolePermission"] != "manager":
         raise HTTPException(422, "请选择有效的商务经理。")
-    if user["rolePermission"] == "supervisor" and owner["team"] != user["team"]:
-        raise HTTPException(403, "部门主管只能选择本组商务经理。")
+    if user["customerScope"] == "self" and owner["id"] != user["id"]:
+        raise HTTPException(403, "当前数据范围只能选择本人作为负责人。")
+    if user["customerScope"] == "team" and owner["team"] != user["team"]:
+        raise HTTPException(403, "当前数据范围只能选择本组商务经理。")
     return owner
 
 
 def collaborators_for_request(user_ids: list[str], owner: dict[str, Any], user: dict[str, Any]) -> list[dict[str, Any]]:
     requested_ids = list(dict.fromkeys(str(user_id).strip() for user_id in user_ids if str(user_id).strip()))
-    if requested_ids and user["rolePermission"] == "manager":
-        raise HTTPException(403, "协同负责人需要部门主管或更高权限设置。")
+    if requested_ids and not user["canManageAssignments"]:
+        raise HTTPException(403, "协同负责人需要客户归属与协同管理权限。")
     collaborators: list[dict[str, Any]] = []
     for user_id in requested_ids:
         if user_id == owner["id"]:
@@ -1080,8 +1148,10 @@ def collaborators_for_request(user_ids: list[str], owner: dict[str, Any], user: 
         candidate = platform_user_by_id(user_id)
         if not candidate or candidate["rolePermission"] not in {"manager", "supervisor"}:
             raise HTTPException(422, "协同负责人必须是有效的商务经理或部门主管。")
-        if user["rolePermission"] == "supervisor" and candidate["team"] != user["team"]:
-            raise HTTPException(403, "部门主管只能设置本组协同负责人。")
+        if user["customerScope"] == "self" and candidate["id"] != user["id"]:
+            raise HTTPException(403, "当前数据范围只能设置本人为协同负责人。")
+        if user["customerScope"] == "team" and candidate["team"] != user["team"]:
+            raise HTTPException(403, "当前数据范围只能设置本组协同负责人。")
         collaborators.append(candidate)
     return collaborators
 
@@ -1328,20 +1398,20 @@ def meta(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
             customer_params,
         ).fetchall()
     owner_choices = list(available)
-    if user["rolePermission"] in {"admin", "developer"}:
+    if user["canManageAssignments"] and user["customerScope"] == "all":
         owner_choices.insert(0, dict(UNASSIGNED_OWNER))
     return {
         "stages": STAGES, "sources": SOURCES, "followupMethods": FOLLOWUP_METHODS, "owners": available, "collaboratorUsers": collaborator_users,
         "accountStatuses": ACCOUNT_STATUSES, "intentStatuses": INTENT_STATUSES,
         "placementStatuses": PLACEMENT_STATUSES, "batchStatuses": BATCH_STATUSES,
         "batches": [dict(row) for row in batches], "customerFields": [field_dict(row) for row in fields], "ownerChoices": owner_choices,
-        "honganAdvisors": [row["advisor"] for row in hongan_advisors],
+        "honganAdvisors": [row["advisor"] for row in hongan_advisors], "crmScopeModes": ["inherit", "self", "team", "all"],
     }
 
 
 @app.get("/api/advisor-bindings")
 def list_advisor_bindings(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    require_supervisor(user)
+    require_advisor_binding_manager(user)
     users = {item["id"]: item for item in platform_users(True)}
     advisor_order = "lower(hongan_advisor)" if uses_postgres(DATABASE_URL) else "hongan_advisor COLLATE NOCASE"
     with db() as conn:
@@ -1357,7 +1427,7 @@ def list_advisor_bindings(user: dict[str, Any] = Depends(current_user)) -> dict[
 
 @app.post("/api/advisor-bindings", status_code=201)
 def create_advisor_binding(payload: AdvisorBindingPayload, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    require_supervisor(user)
+    require_advisor_binding_manager(user)
     hongan = payload.honganAdvisor.strip()
     jiaoyang = payload.jiaoyangAdvisor.strip()
     validate_advisor_binding_values(payload.customerType, payload.assignmentMode)
@@ -1379,7 +1449,7 @@ def create_advisor_binding(payload: AdvisorBindingPayload, user: dict[str, Any] 
 
 @app.patch("/api/advisor-bindings/{binding_id}")
 def update_advisor_binding(binding_id: str, payload: AdvisorBindingPatch, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    require_supervisor(user)
+    require_advisor_binding_manager(user)
     values = payload.model_dump(exclude_unset=True)
     change_reason = str(values.pop("changeReason", "") or "").strip()
     if not change_reason:
@@ -1604,12 +1674,76 @@ def list_customers(
     return {"items": items, "total": total, "page": page, "pageSize": page_size}
 
 
+@app.get("/api/customer-assignments")
+def list_customer_assignments(
+    owner_id: str = Query("", alias="ownerId"),
+    source_advisor_label: str = Query("", alias="sourceAdvisorLabel"),
+    hongan_advisor: str = Query("", alias="honganAdvisor"),
+    user: dict[str, Any] = Depends(current_user),
+) -> dict[str, Any]:
+    """Provide a focused allocation worklist without widening normal table access."""
+    require_supervisor(user)
+    clause, params = access_clause(user)
+    filters = ["c.archived_at IS NULL", clause]
+    values: list[Any] = list(params)
+    if owner_id:
+        filters.append("c.owner_id = ?")
+        values.append(owner_id)
+    if source_advisor_label:
+        filters.append("c.source_advisor_label = ?")
+        values.append(source_advisor_label)
+    if hongan_advisor:
+        filters.append("c.hongan_advisor = ?")
+        values.append(hongan_advisor)
+    where = " AND ".join(filters)
+    summary_where = " AND ".join(["c.archived_at IS NULL", clause])
+    with db() as conn:
+        owner_groups = conn.execute(
+            f"""SELECT c.owner_id, c.owner_name, c.owner_team, COUNT(*) count
+            FROM customers c WHERE {summary_where}
+            GROUP BY c.owner_id, c.owner_name, c.owner_team
+            ORDER BY COUNT(*) DESC, c.owner_name""",
+            params,
+        ).fetchall()
+        source_groups = conn.execute(
+            f"""SELECT c.source_advisor_label, COUNT(*) count
+            FROM customers c
+            WHERE {where} AND TRIM(c.source_advisor_label) <> ''
+            GROUP BY c.source_advisor_label
+            ORDER BY COUNT(*) DESC, c.source_advisor_label""",
+            values,
+        ).fetchall()
+        hongan_groups = conn.execute(
+            f"""SELECT c.hongan_advisor, COUNT(*) count
+            FROM customers c
+            WHERE {where} AND TRIM(c.hongan_advisor) <> ''
+            GROUP BY c.hongan_advisor
+            ORDER BY COUNT(*) DESC, c.hongan_advisor""",
+            values,
+        ).fetchall()
+        rows = conn.execute(
+            f"""SELECT c.id, c.customer_code, c.name, c.wechat_nickname,
+            c.owner_id, c.owner_name, c.owner_team, c.source_advisor_label,
+            c.hongan_advisor, c.account_status, c.placement_status, c.updated_at
+            FROM customers c WHERE {where}
+            ORDER BY c.updated_at DESC LIMIT 5000""",
+            values,
+        ).fetchall()
+    return {
+        "items": [dict(row) for row in rows],
+        "total": len(rows),
+        "ownerGroups": [dict(row) for row in owner_groups],
+        "sourceAdvisorGroups": [dict(row) for row in source_groups],
+        "honganAdvisorGroups": [dict(row) for row in hongan_groups],
+    }
+
+
 @app.post("/api/customers", status_code=201)
 def create_customer(payload: CustomerPayload, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     require_hongan_advisor_permission(user, payload.hkAdvisor)
     with db() as conn:
         owner = None
-        if not payload.ownerId and user["rolePermission"] != "manager":
+        if not payload.ownerId and user["canManageAssignments"]:
             bound_owner, _ = default_advisor_binding(conn, payload.hkAdvisor, customer_type_for_values(payload.model_dump()))
             owner = bound_owner
         if owner is None:
@@ -1695,8 +1829,8 @@ def update_customer(customer_id: str, payload: CustomerPatch, user: dict[str, An
         current = assert_customer_access(conn, customer_id, user)
         if current["version"] != expected_version:
             raise HTTPException(409, "客户资料已被其他人更新，请刷新后重试。")
-        if "hongan_advisor" in values and user["rolePermission"] == "manager":
-            raise HTTPException(403, "港安顾问属于外部引荐关系，请由部门主管或管理员维护。")
+        if "hongan_advisor" in values and not user["canManageAdvisorBindings"]:
+            raise HTTPException(403, "港安顾问属于外部引荐关系，请由具备顾问绑定权限的成员维护。")
         if "hongan_advisor" in values and values["hongan_advisor"] != current["hongan_advisor"] and not change_reason:
             raise HTTPException(422, "修改港安顾问必须填写变更原因。")
         phone, email = values.get("phone", current["phone"]), values.get("email", current["email"])
@@ -1750,6 +1884,48 @@ def assign_customer(customer_id: str, payload: AssignPayload, user: dict[str, An
         conn.execute("INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (str(uuid4()), customer_id, current["owner_id"], current["owner_name"], current["owner_team"], owner["id"], owner["name"], owner["team"], payload.reason.strip(), user["id"], user["name"], changed_at))
         audit(conn, user, "customer.assigned", "customer", customer_id, {"from": current["owner_id"], "to": owner["id"], "reason": payload.reason})
     return {"ok": True}
+
+
+@app.post("/api/customers/bulk-assign")
+def bulk_assign_customers(payload: BulkAssignPayload, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    require_supervisor(user)
+    customer_ids = list(dict.fromkeys(item.strip() for item in payload.customerIds if item and item.strip()))
+    if not customer_ids:
+        raise HTTPException(422, "请选择至少一位客户。")
+    owner = owner_for_request(payload.ownerId, user)
+    clause, access_params = access_clause(user)
+    marks = ", ".join("?" for _ in customer_ids)
+    changed_at = now_iso()
+    with db() as conn:
+        rows = conn.execute(
+            f"SELECT c.* FROM customers c WHERE c.id IN ({marks}) AND c.archived_at IS NULL AND {clause}",
+            (*customer_ids, *access_params),
+        ).fetchall()
+        if len(rows) != len(customer_ids):
+            raise HTTPException(403, "所选客户中包含您无权调整的记录，请刷新后重试。")
+        changed, unchanged = [], []
+        for current in rows:
+            if current["owner_id"] == owner["id"]:
+                unchanged.append(current["id"])
+                continue
+            conn.execute(
+                "UPDATE customers SET owner_id=?, owner_name=?, owner_team=?, updated_at=?, version=version+1 WHERE id=?",
+                (owner["id"], owner["name"], owner["team"], changed_at, current["id"]),
+            )
+            conn.execute(
+                "INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(uuid4()), current["id"], current["owner_id"], current["owner_name"], current["owner_team"], owner["id"], owner["name"], owner["team"], payload.reason.strip(), user["id"], user["name"], changed_at),
+            )
+            changed.append(current["id"])
+        audit(
+            conn,
+            user,
+            "customer.bulk_assigned",
+            "customer_assignment",
+            owner["id"],
+            {"count": len(changed), "unchangedCount": len(unchanged), "to": owner["id"], "reason": payload.reason.strip(), "customerIds": changed},
+        )
+    return {"ok": True, "assignedCount": len(changed), "unchangedCount": len(unchanged), "owner": owner}
 
 
 @app.post("/api/customers/merge")
@@ -2171,10 +2347,10 @@ def advisor_alias_users(conn: sqlite3.Connection, users_by_name: dict[str, dict[
 def resolve_import_assignment(conn: sqlite3.Connection, row: dict[str, Any], fallback_owner: dict[str, Any], user: dict[str, Any], advisor_users: dict[str, dict[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
     values = dict(row)
     label = values.get("sourceAdvisorLabel", "")
-    if user["rolePermission"] == "manager":
+    if not user["canManageAssignments"]:
         return fallback_owner, values
     matched = [advisor_users[name] for name in split_advisor_label(label) if name in advisor_users] if label else []
-    if user["rolePermission"] == "supervisor":
+    if user["customerScope"] == "team":
         matched = [item for item in matched if item["team"] == user["team"]]
     manager = next((item for item in matched if item["rolePermission"] == "manager"), None)
     owner = fallback_owner
@@ -2182,7 +2358,7 @@ def resolve_import_assignment(conn: sqlite3.Connection, row: dict[str, Any], fal
         bound_owner, _ = default_advisor_binding(conn, values.get("hkAdvisor", values.get("hongan_advisor", "")), customer_type_for_values(values))
         if bound_owner:
             owner = bound_owner
-    if manager and (user["rolePermission"] in {"admin", "developer"} or manager["team"] == user["team"]):
+    if manager and (user["customerScope"] == "all" or manager["team"] == user["team"]):
         owner = manager
     collaborator_ids = list(values.get("collaboratorIds", []) or [])
     collaborator_ids.extend(item["id"] for item in matched if item["id"] != owner["id"])
@@ -2274,14 +2450,14 @@ def import_commit(payload: ImportCommitPayload, user: dict[str, Any] = Depends(c
     mode = str(payload.mode or "append").strip().lower()
     if mode not in {"append", "snapshot"}:
         raise HTTPException(422, "导入模式无效。")
-    if user["rolePermission"] != "manager" and not payload.ownerId:
+    if user["canManageAssignments"] and not payload.ownerId:
         raise HTTPException(422, "请选择未匹配顾问的默认主负责人。")
     owner = owner_for_request(payload.ownerId, user)
     platform_users_all = platform_users(True)
     users_by_name = {item["name"]: item for item in platform_users_all}
     users_by_id = {item["id"]: item for item in platform_users_all}
     if payload.advisorAliasMappings:
-        require_field_manager(user)
+        require_supervisor(user)
     created, updated, conflicts, errors = [], [], [], []
     unchanged_count = 0
     quality = {"placeholderRowsSkipped": 0, "nicknameFallbackRows": 0, "unidentifiedRowsImported": 0, "twMatchedRows": 0, "twNewRows": 0, "twDuplicateRows": 0, "twMissingRows": 0}
@@ -2380,7 +2556,7 @@ def import_template(user: dict[str, Any] = Depends(current_user)):
         "开户状态", "开户券商", "开户日期", "入金金额/USD", "资金流向", "定增意向", "定增推进",
         "意向金额", "到账金额", "实际参与金额", "流失原因", "骄阳顾问", "备注",
     ]
-    if user["rolePermission"] in {"supervisor", "admin", "developer"}:
+    if user["canManageAdvisorBindings"]:
         base_headers.insert(-2, "港安顾问")
     with db() as conn:
         custom_headers = [row["label"] for row in conn.execute("SELECT label FROM customer_fields WHERE active=1 ORDER BY display_order, created_at").fetchall()]
@@ -2394,7 +2570,7 @@ def import_template(user: dict[str, Any] = Depends(current_user)):
 
 @app.get("/api/imports")
 def list_import_jobs(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    require_admin(user)
+    require_crm_permission_manager(user)
     with db() as conn:
         rows = conn.execute("SELECT * FROM import_jobs ORDER BY created_at DESC LIMIT 100").fetchall()
     items = []
@@ -2414,7 +2590,7 @@ def list_import_jobs(user: dict[str, Any] = Depends(current_user)) -> dict[str, 
 
 @app.post("/api/imports/{job_id}/rollback")
 def rollback_import(job_id: str, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    require_admin(user)
+    require_crm_permission_manager(user)
     with db() as conn:
         job = conn.execute("SELECT * FROM import_jobs WHERE id = ?", (job_id,)).fetchone()
         if not job:
@@ -2448,26 +2624,62 @@ def rollback_import(job_id: str, user: dict[str, Any] = Depends(current_user)) -
 
 @app.get("/api/admin/users")
 def admin_users(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    require_admin(user)
+    require_crm_permission_manager(user)
     return {"items": [enrich_user(item) for item in platform_users(True)]}
 
 
 @app.patch("/api/admin/users/{user_id}/permissions")
 def update_permissions(user_id: str, payload: PermissionPayload, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    require_admin(user)
+    require_crm_permission_manager(user)
     target = platform_user_by_id(user_id)
     if not target:
         raise HTTPException(404, "用户不存在。")
+    if payload.crmScopeMode is not None and payload.crmScopeMode not in CRM_SCOPE_MODES:
+        raise HTTPException(422, "CRM 数据范围必须是继承、仅本人、本组或全量。")
     with db() as conn:
-        existing = conn.execute("SELECT can_import_customers, can_export_all, can_manage_customer_fields FROM user_permissions WHERE user_id = ?", (user_id,)).fetchone()
+        existing = conn.execute(
+            """SELECT can_import_customers, can_export_all, can_manage_customer_fields,
+            scope_override, can_manage_assignments, can_manage_advisor_bindings,
+            can_manage_crm_permissions FROM user_permissions WHERE user_id = ?""",
+            (user_id,),
+        ).fetchone()
         import_value = int(payload.canImportCustomers) if payload.canImportCustomers is not None else (existing["can_import_customers"] if existing else None)
         export_value = int(payload.canExportAll) if payload.canExportAll is not None else (existing["can_export_all"] if existing else None)
         fields_value = int(payload.canManageCustomerFields) if payload.canManageCustomerFields is not None else (existing["can_manage_customer_fields"] if existing else None)
-        conn.execute(
-            "INSERT INTO user_permissions(user_id, can_import_customers, can_export_all, can_manage_customer_fields, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET can_import_customers=excluded.can_import_customers, can_export_all=excluded.can_export_all, can_manage_customer_fields=excluded.can_manage_customer_fields, updated_by=excluded.updated_by, updated_at=excluded.updated_at",
-            (user_id, import_value, export_value, fields_value, user["id"], now_iso()),
+        assignment_value = int(payload.canManageAssignments) if payload.canManageAssignments is not None else (existing["can_manage_assignments"] if existing else None)
+        binding_value = int(payload.canManageAdvisorBindings) if payload.canManageAdvisorBindings is not None else (existing["can_manage_advisor_bindings"] if existing else None)
+        permission_value = int(payload.canManageCrmPermissions) if payload.canManageCrmPermissions is not None else (existing["can_manage_crm_permissions"] if existing else None)
+        scope_value = (
+            None if payload.crmScopeMode == "inherit"
+            else payload.crmScopeMode if payload.crmScopeMode is not None
+            else existing["scope_override"] if existing else None
         )
-        audit(conn, user, "permission.updated", "user", user_id, {"canImportCustomers": payload.canImportCustomers, "canExportAll": payload.canExportAll, "canManageCustomerFields": payload.canManageCustomerFields})
+        conn.execute(
+            """INSERT INTO user_permissions(
+            user_id, can_import_customers, can_export_all, can_manage_customer_fields,
+            scope_override, can_manage_assignments, can_manage_advisor_bindings,
+            can_manage_crm_permissions, updated_by, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+            can_import_customers=excluded.can_import_customers,
+            can_export_all=excluded.can_export_all,
+            can_manage_customer_fields=excluded.can_manage_customer_fields,
+            scope_override=excluded.scope_override,
+            can_manage_assignments=excluded.can_manage_assignments,
+            can_manage_advisor_bindings=excluded.can_manage_advisor_bindings,
+            can_manage_crm_permissions=excluded.can_manage_crm_permissions,
+            updated_by=excluded.updated_by, updated_at=excluded.updated_at""",
+            (user_id, import_value, export_value, fields_value, scope_value, assignment_value, binding_value, permission_value, user["id"], now_iso()),
+        )
+        audit(conn, user, "permission.updated", "user", user_id, {
+            "crmScopeMode": payload.crmScopeMode,
+            "canImportCustomers": payload.canImportCustomers,
+            "canExportAll": payload.canExportAll,
+            "canManageCustomerFields": payload.canManageCustomerFields,
+            "canManageAssignments": payload.canManageAssignments,
+            "canManageAdvisorBindings": payload.canManageAdvisorBindings,
+            "canManageCrmPermissions": payload.canManageCrmPermissions,
+        })
     return {"user": enrich_user(target)}
 
 
@@ -2559,7 +2771,7 @@ def update_customer_field_value(customer_id: str, field_id: str, payload: Custom
 
 @app.get("/api/admin/audit")
 def audit_logs(limit: int = Query(100, ge=1, le=500), user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    require_admin(user)
+    require_crm_permission_manager(user)
     with db() as conn:
         rows = conn.execute("SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
     items = []

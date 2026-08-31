@@ -30,10 +30,18 @@ POSTGRES_SCHEMA_STATEMENTS = [
         can_import_customers INTEGER,
         can_export_all INTEGER,
         can_manage_customer_fields INTEGER,
+        scope_override TEXT,
+        can_manage_assignments INTEGER,
+        can_manage_advisor_bindings INTEGER,
+        can_manage_crm_permissions INTEGER,
         updated_by TEXT,
         updated_at TEXT NOT NULL
     )
     """,
+    "ALTER TABLE user_permissions ADD COLUMN IF NOT EXISTS scope_override TEXT",
+    "ALTER TABLE user_permissions ADD COLUMN IF NOT EXISTS can_manage_assignments INTEGER",
+    "ALTER TABLE user_permissions ADD COLUMN IF NOT EXISTS can_manage_advisor_bindings INTEGER",
+    "ALTER TABLE user_permissions ADD COLUMN IF NOT EXISTS can_manage_crm_permissions INTEGER",
     """
     CREATE TABLE IF NOT EXISTS counters (
         counter_key TEXT PRIMARY KEY,
