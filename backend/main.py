@@ -248,6 +248,7 @@ def init_sqlite_db() -> None:
                 owner_name TEXT NOT NULL,
                 total_rows INTEGER NOT NULL,
                 created_count INTEGER NOT NULL,
+                updated_count INTEGER NOT NULL DEFAULT 0,
                 conflict_count INTEGER NOT NULL,
                 error_count INTEGER NOT NULL,
                 imported_by TEXT NOT NULL,
@@ -324,6 +325,8 @@ def init_sqlite_db() -> None:
         if "can_manage_customer_fields" not in permission_columns:
             conn.execute("ALTER TABLE user_permissions ADD COLUMN can_manage_customer_fields INTEGER")
         import_job_columns = {row["name"] for row in conn.execute("PRAGMA table_info(import_jobs)").fetchall()}
+        if "updated_count" not in import_job_columns:
+            conn.execute("ALTER TABLE import_jobs ADD COLUMN updated_count INTEGER NOT NULL DEFAULT 0")
         if "data_quality_json" not in import_job_columns:
             conn.execute("ALTER TABLE import_jobs ADD COLUMN data_quality_json TEXT NOT NULL DEFAULT '{}'")
         if "created_customer_ids_json" not in import_job_columns:
@@ -483,6 +486,7 @@ class ImportCommitPayload(BaseModel):
     filename: str
     ownerId: str | None = None
     rows: list[dict[str, Any]]
+    mode: str = "append"
     advisorAliasMappings: dict[str, str] = Field(default_factory=dict)
     allowUnidentifiedRows: bool = False
 
@@ -1027,8 +1031,10 @@ def potential_identity_matches(conn: sqlite3.Connection, name: str, nickname: st
     exclude = " AND c.id != ?" if exclude_id else ""
     if exclude_id:
         params.append(exclude_id)
+    # The customers table is already one row per customer, so DISTINCT is
+    # unnecessary and breaks PostgreSQL when ordering by a non-selected column.
     rows = conn.execute(
-        f"SELECT DISTINCT c.id, c.customer_code, c.name, c.wechat_nickname, c.owner_name, c.owner_team FROM customers c WHERE c.archived_at IS NULL AND ({' OR '.join(conditions)}){exclude} ORDER BY c.updated_at DESC LIMIT 10",
+        f"SELECT c.id, c.customer_code, c.name, c.wechat_nickname, c.owner_name, c.owner_team FROM customers c WHERE c.archived_at IS NULL AND ({' OR '.join(conditions)}){exclude} ORDER BY c.updated_at DESC LIMIT 10",
         tuple(params),
     ).fetchall()
     return [dict(row) for row in rows]
@@ -1125,6 +1131,59 @@ def add_identifiers(conn: sqlite3.Connection, customer_id: str, phone: str, emai
         conn.execute("INSERT INTO customer_identifiers(customer_id, kind, normalized_value, display_value, created_at) VALUES (?, 'email', ?, ?, ?)", (customer_id, normalize_email(email), email.strip(), now_iso()))
 
 
+def find_customer_by_tw(conn: sqlite3.Connection, tw_code: str) -> dict[str, Any] | None:
+    """Look up a live customer by the broker's canonical TW identifier."""
+    code = normalize_tw_code(tw_code)
+    if not code:
+        return None
+    row = conn.execute(
+        """SELECT c.* FROM customer_identifiers i
+        JOIN customers c ON c.id=i.customer_id
+        WHERE i.kind='tw' AND i.normalized_value=? AND c.archived_at IS NULL""",
+        (code,),
+    ).fetchone()
+    if not row:
+        # Older migrations used TW as the display code before identifiers were added.
+        row = conn.execute("SELECT * FROM customers WHERE customer_code=? AND archived_at IS NULL", (code,)).fetchone()
+    return dict(row) if row else None
+
+
+def add_tw_identifier(conn: sqlite3.Connection, customer_id: str, tw_code: str) -> None:
+    code = normalize_tw_code(tw_code)
+    if not code:
+        return
+    existing = conn.execute(
+        "SELECT customer_id FROM customer_identifiers WHERE kind='tw' AND normalized_value=?",
+        (code,),
+    ).fetchone()
+    if existing and existing["customer_id"] != customer_id:
+        raise HTTPException(409, f"TW 编号 {code} 已绑定到另一位客户，请先人工合并。")
+    if not existing:
+        conn.execute(
+            "INSERT INTO customer_identifiers(customer_id, kind, normalized_value, display_value, created_at) VALUES (?, 'tw', ?, ?, ?)",
+            (customer_id, code, code, now_iso()),
+        )
+
+
+def update_broker_snapshot_customer(conn: sqlite3.Connection, current: dict[str, Any], row: dict[str, Any], tw_code: str, user: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Apply only broker-authoritative fields; preserve internal ownership and workflow."""
+    updates: dict[str, Any] = {}
+    name = str(clean_import_cell(row.get("name", "")) or "").strip()
+    if name and not str(current["name"] or "").strip():
+        updates["name"] = name
+    account_status = str(row.get("accountStatus", "") or "").strip()
+    if account_status in ACCOUNT_STATUSES and account_status != current["account_status"]:
+        updates["account_status"] = account_status
+    if not updates:
+        return {}
+    changes = {key: {"from": current[key], "to": value} for key, value in updates.items()}
+    assignments = ", ".join(f"{key}=?" for key in updates)
+    timestamp = now_iso()
+    conn.execute(f"UPDATE customers SET {assignments}, updated_at=?, version=version+1 WHERE id=?", (*updates.values(), timestamp, current["id"]))
+    audit(conn, user, "customer.broker_snapshot_updated", "customer", current["id"], {"twCode": tw_code, "changes": changes})
+    return changes
+
+
 def create_customer_record(conn: sqlite3.Connection, payload: dict[str, Any], owner: dict[str, Any], user: dict[str, Any]) -> dict[str, Any]:
     require_hongan_advisor_permission(user, payload.get("hkAdvisor", payload.get("hongan_advisor", "")))
     name = str(clean_import_cell(payload.get("name", "")) or "").strip()
@@ -1137,8 +1196,9 @@ def create_customer_record(conn: sqlite3.Connection, payload: dict[str, Any], ow
         raise HTTPException(409, detail={"message": "手机号或邮箱已存在，请人工确认是否合并。", "matches": duplicates})
     collaborators = collaborators_for_request(payload.get("collaboratorIds", payload.get("collaborator_ids", [])) or [], owner, user)
     customer_id, created_at = str(uuid4()), now_iso()
+    tw_code = normalize_tw_code(payload.get("twCode", ""))
     record = {
-        "id": customer_id, "customer_code": next_customer_code(conn), "name": name, "phone": phone, "email": email, "wechat_nickname": nickname,
+        "id": customer_id, "customer_code": tw_code or next_customer_code(conn), "name": name, "phone": phone, "email": email, "wechat_nickname": nickname,
         "company": str(payload.get("company", "")).strip(), "source": str(payload.get("source", "")).strip(),
         "source_detail": str(payload.get("sourceDetail", payload.get("source_detail", ""))).strip(),
         "stage": str(payload.get("stage", "新客户")) or "新客户", "priority": str(payload.get("priority", "普通")) or "普通",
@@ -1169,6 +1229,7 @@ def create_customer_record(conn: sqlite3.Connection, payload: dict[str, Any], ow
         :notes, :created_by, :created_at, :updated_at)""", record,
     )
     add_identifiers(conn, customer_id, phone, email)
+    add_tw_identifier(conn, customer_id, tw_code)
     replace_collaborators(conn, customer_id, collaborators, user)
     save_holding_snapshots(conn, customer_id, payload.get("holdingSnapshots", payload.get("holding_snapshots", [])) or [], user)
     conn.execute("INSERT INTO assignments VALUES (?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)", (str(uuid4()), customer_id, owner["id"], owner["name"], owner["team"], "新建客户", user["id"], user["name"], created_at))
@@ -1805,7 +1866,8 @@ HEADER_ALIASES = {
     "email": ["邮箱", "电子邮箱", "email"], "company": ["公司", "公司名称", "机构", "单位"],
     "source": ["客户来源", "来源", "渠道"], "sourceDetail": ["来源明细", "活动名称", "渠道名称"],
     "stage": ["客户阶段", "当前阶段", "生命周期", "状态"], "priority": ["优先级", "客户级别"],
-    "accountStatus": ["开户状态", "港券开户状态", "证券开户状态"], "accountBroker": ["开户券商", "香港券商", "券商", "开户证券"], "accountOpenedAt": ["开户日期", "注册日期"],
+    "accountStatus": ["开户状态", "是否完成开户", "港券开户状态", "证券开户状态"], "accountBroker": ["开户券商", "香港券商", "券商", "开户证券"], "accountOpenedAt": ["开户日期", "注册日期"],
+    "twCode": ["TW编号", "TW客户编号", "客户唯一编号", "客户编号"],
     "brokerDepositAmount": ["入金金额/USD", "入金金额", "港券入金金额"], "capitalDestination": ["资金流向", "资金去向"],
     "hkAdvisor": ["港安顾问"], "sourceAdvisorLabel": ["骄阳顾问", "商务顾问", "客户顾问"],
     "intentStatus": ["定增意向", "意向状态", "顾问判断"], "placementStatus": ["定增推进", "节点进度", "定增状态"],
@@ -1940,8 +2002,11 @@ def unique_headers(values: list[Any]) -> list[str]:
 
 IMPORT_PLACEHOLDERS = {"", "/", "-", "--", "#NAME?", "#VALUE!", "#REF!"}
 ACCOUNT_STATUS_IMPORT_MAP = {
-    "未开户": "未启动", "提交中": "资料准备", "处理中": "开户审核", "开户失败": "开户失败",
-    "已开户未入金": "已开户", "已开户入金": "已开户", "已开户": "已开户",
+    "未开户": "未启动", "未完成开户": "未启动", "未提交申请": "未启动", "否": "未启动",
+    "提交中": "资料准备", "待初审资料": "资料准备", "待传住址证明": "资料准备", "待审住址证明": "资料准备",
+    "处理中": "开户审核", "待终审": "开户审核",
+    "已开通": "已开户", "已开户": "已开户", "已开户未入金": "已开户", "已开户入金": "已开户", "开户成功": "已开户", "完成开户": "已开户", "已完成开户": "已开户", "是": "已开户",
+    "开户失败": "开户失败", "驳回": "开户失败", "开户资料驳回至客服": "开户失败", "开户资料驳回至客户": "开户失败",
 }
 
 
@@ -1963,6 +2028,24 @@ def normalize_import_date(value: Any) -> str | None:
         return None
     text = str(cleaned).strip().replace("/", "-").replace(".", "-")
     return text if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text) else None
+
+
+def normalize_tw_code(value: Any) -> str:
+    """Return a canonical TW identifier, or an empty string for ordinary text."""
+    match = re.fullmatch(r"\s*(TW\d+)\s*", str(clean_import_cell(value) or ""), re.IGNORECASE)
+    return match.group(1).upper() if match else ""
+
+
+def detect_tw_header(headers: list[str], rows: list[list[Any]]) -> str | None:
+    """Find an explicit TW column, or a column whose values are all TW codes."""
+    explicit = next((header for header in headers if header_alias_matches(header, HEADER_ALIASES["twCode"])), None)
+    if explicit:
+        return explicit
+    for index, header in enumerate(headers):
+        values = [row[index] for row in rows if index < len(row) and clean_import_cell(row[index])]
+        if len(values) >= 3 and all(normalize_tw_code(value) for value in values):
+            return header
+    return None
 
 
 def split_advisor_label(value: Any) -> list[str]:
@@ -1990,6 +2073,11 @@ def detect_holding_snapshots(headers: list[str]) -> list[dict[str, str]]:
 
 
 def import_diagnostics(headers: list[str], rows: list[list[Any]], mapping: dict[str, str]) -> dict[str, Any]:
+    tw_header = detect_tw_header(headers, rows)
+    if tw_header:
+        mapping["twCode"] = tw_header
+        if mapping.get("notes") == tw_header:
+            mapping.pop("notes")
     value_rows = [{headers[index]: (row[index] if index < len(row) else "") for index in range(len(headers))} for row in rows]
     placeholder_count = sum(1 for row in value_rows for value in row.values() if isinstance(value, str) and value.strip().upper() in IMPORT_PLACEHOLDERS - {""})
     name_header = mapping.get("name")
@@ -2006,7 +2094,7 @@ def import_diagnostics(headers: list[str], rows: list[list[Any]], mapping: dict[
     )
     unidentified_rows = sum(
         1 for row in normalized_rows
-        if (str(row.get("name", "")).strip() or str(row.get("wechatNickname", "")).strip()) and not normalize_phone(str(row.get("phone", ""))) and not normalize_email(str(row.get("email", "")))
+        if (str(row.get("name", "")).strip() or str(row.get("wechatNickname", "")).strip()) and not normalize_phone(str(row.get("phone", ""))) and not normalize_email(str(row.get("email", ""))) and not normalize_tw_code(row.get("twCode", ""))
     )
     advisor_header = mapping.get("sourceAdvisorLabel")
     labels = sorted({str(clean_import_cell(row.get(advisor_header, "")) or "") for row in value_rows if clean_import_cell(row.get(advisor_header, ""))}) if advisor_header else []
@@ -2023,18 +2111,29 @@ def import_diagnostics(headers: list[str], rows: list[list[Any]], mapping: dict[
         warnings.append({"code": "unidentified", "message": "以下记录没有手机号和邮箱，无法自动识别重复客户，导入前需要明确确认。", "count": unidentified_rows})
     if unresolved:
         warnings.append({"code": "unresolved_advisor", "message": "以下历史顾问未能匹配当前 MuskZoom 账号，需要管理员后续映射。", "labels": unresolved})
+    if tw_header:
+        warnings.append({"code": "tw_snapshot", "message": "已识别 TW 编号，将按全量快照合并：已有客户更新券商状态，新 TW 才新增。", "header": tw_header})
     snapshots = detect_holding_snapshots(headers)
     if snapshots:
         warnings.append({"code": "holding_snapshots", "message": f"已识别 {len(snapshots)} 个历史持仓快照日期，将作为独立历史记录导入。", "count": len(snapshots)})
     profile = "hongan_master" if mapping.get("hkAdvisor") and mapping.get("sourceAdvisorLabel") and mapping.get("accountStatus") else "standard"
     return {
         "profile": profile, "warnings": warnings, "advisorLabels": labels[:100], "unresolvedAdvisorAliases": unresolved,
-        "holdingSnapshots": snapshots, "dataQuality": {"placeholderCells": placeholder_count, "missingDisplayNameRows": missing_names, "nicknameFallbackRows": nickname_fallback_count, "unidentifiedRows": unidentified_rows},
+        "holdingSnapshots": snapshots, "twHeader": tw_header, "dataQuality": {"placeholderCells": placeholder_count, "missingDisplayNameRows": missing_names, "nicknameFallbackRows": nickname_fallback_count, "unidentifiedRows": unidentified_rows, "hasTwSnapshot": bool(tw_header)},
     }
 
 
 def normalize_import_row(row: dict[str, Any]) -> dict[str, Any]:
     values = {key: clean_import_cell(value) for key, value in row.items()}
+    tw_code = normalize_tw_code(values.get("twCode", ""))
+    if not tw_code:
+        tw_code = next((normalize_tw_code(value) for value in values.values() if normalize_tw_code(value)), "")
+    if tw_code:
+        values["twCode"] = tw_code
+    # Some broker snapshots put the TW identifier in a column named 备注.
+    # Once recognized, it is an identifier rather than a customer note.
+    if tw_code and normalize_tw_code(values.get("notes", "")) == tw_code:
+        values["notes"] = ""
     values["accountOpenedAt"] = normalize_import_date(values.get("accountOpenedAt"))
     account_status = str(values.get("accountStatus", "")).strip()
     if account_status:
@@ -2107,7 +2206,11 @@ def parse_import_file(filename: str, content: bytes) -> tuple[list[str], list[li
             candidates.append((best_score, len(non_empty), name, non_empty))
         if not candidates:
             raise HTTPException(422, "Excel 文件中没有可读取的数据。")
-        _, _, sheet_name, raw_rows = max(candidates, key=lambda item: (item[0], item[1]))
+        # Workbooks often carry a short historical sheet beside the current
+        # full snapshot. Once a sheet has enough recognizable customer headers,
+        # prefer the largest data sheet over a smaller one with one extra label.
+        eligible = [item for item in candidates if item[0] >= 2] or candidates
+        _, _, sheet_name, raw_rows = max(eligible, key=lambda item: (item[1], item[0]))
     else:
         raise HTTPException(422, "目前支持 .xlsx 和 .csv 文件。")
     raw_rows = [[clean_import_cell(value) for value in row] for row in raw_rows if any(value not in (None, "") for value in row)]
@@ -2168,6 +2271,9 @@ def import_commit(payload: ImportCommitPayload, user: dict[str, Any] = Depends(c
         raise HTTPException(403, "您的账号未开通客户导入权限。")
     if len(payload.rows) > IMPORT_ROW_LIMIT:
         raise HTTPException(422, f"单次最多导入 {IMPORT_ROW_LIMIT} 行，请拆分文件。")
+    mode = str(payload.mode or "append").strip().lower()
+    if mode not in {"append", "snapshot"}:
+        raise HTTPException(422, "导入模式无效。")
     if user["rolePermission"] != "manager" and not payload.ownerId:
         raise HTTPException(422, "请选择未匹配顾问的默认主负责人。")
     owner = owner_for_request(payload.ownerId, user)
@@ -2176,8 +2282,11 @@ def import_commit(payload: ImportCommitPayload, user: dict[str, Any] = Depends(c
     users_by_id = {item["id"]: item for item in platform_users_all}
     if payload.advisorAliasMappings:
         require_field_manager(user)
-    created, conflicts, errors = [], [], []
-    quality = {"placeholderRowsSkipped": 0, "nicknameFallbackRows": 0, "unidentifiedRowsImported": 0}
+    created, updated, conflicts, errors = [], [], [], []
+    unchanged_count = 0
+    quality = {"placeholderRowsSkipped": 0, "nicknameFallbackRows": 0, "unidentifiedRowsImported": 0, "twMatchedRows": 0, "twNewRows": 0, "twDuplicateRows": 0, "twMissingRows": 0}
+    has_tw_snapshot = mode == "snapshot" or any(normalize_tw_code(row.get("twCode", "")) for row in payload.rows)
+    seen_tw_codes: set[str] = set()
     with db() as conn:
         if payload.advisorAliasMappings:
             save_advisor_alias_mappings(conn, payload.advisorAliasMappings, user, users_by_id)
@@ -2190,13 +2299,43 @@ def import_commit(payload: ImportCommitPayload, user: dict[str, Any] = Depends(c
             except HTTPException as exc:
                 errors.append({"row": index, "message": str(exc.detail)})
                 continue
+            tw_code = normalize_tw_code(row.get("twCode", ""))
+            if has_tw_snapshot and not tw_code:
+                errors.append({"row": index, "message": "全量快照行缺少有效 TW 编号，未创建客户。"})
+                quality["twMissingRows"] += 1
+                continue
+            if tw_code:
+                if tw_code in seen_tw_codes:
+                    conflicts.append({"row": index, "name": row.get("name", "") or row.get("wechatNickname", "") or tw_code, "detail": "同一文件内 TW 编号重复，已跳过重复行。"})
+                    quality["twDuplicateRows"] += 1
+                    continue
+                seen_tw_codes.add(tw_code)
+                existing = find_customer_by_tw(conn, tw_code)
+                if existing:
+                    conn.execute("SAVEPOINT import_row")
+                    try:
+                        changes = update_broker_snapshot_customer(conn, existing, row, tw_code, user)
+                        add_tw_identifier(conn, existing["id"], tw_code)
+                        conn.execute("RELEASE SAVEPOINT import_row")
+                        quality["twMatchedRows"] += 1
+                        if changes:
+                            updated.append({"row": index, "id": existing["id"], "customerCode": existing["customer_code"], "changes": changes})
+                        else:
+                            unchanged_count += 1
+                        continue
+                    except HTTPException as exc:
+                        conn.execute("ROLLBACK TO SAVEPOINT import_row")
+                        conn.execute("RELEASE SAVEPOINT import_row")
+                        errors.append({"row": index, "message": str(exc.detail)})
+                        continue
+                quality["twNewRows"] += 1
             if not str(row.get("name", "")).strip() and not str(row.get("wechatNickname", "")).strip():
                 errors.append({"row": index, "message": "客户姓名和微信昵称均为空"})
                 quality["placeholderRowsSkipped"] += 1
                 continue
             if not clean_import_cell(raw_row.get("name", "")) and clean_import_cell(raw_row.get("wechatNickname", "")):
                 quality["nicknameFallbackRows"] += 1
-            has_identifier = bool(normalize_phone(str(row.get("phone", "")))) or bool(normalize_email(str(row.get("email", ""))))
+            has_identifier = bool(normalize_phone(str(row.get("phone", "")))) or bool(normalize_email(str(row.get("email", "")))) or bool(tw_code)
             if not has_identifier:
                 if not payload.allowUnidentifiedRows:
                     errors.append({"row": index, "message": "缺少手机号和邮箱；请在导入页确认允许导入无联系方式的历史记录。"})
@@ -2224,12 +2363,12 @@ def import_commit(payload: ImportCommitPayload, user: dict[str, Any] = Depends(c
                 conflicts.append({"row": index, "name": row.get("name", "") or row.get("wechatNickname", ""), "detail": str(exc)})
         job_id = str(uuid4())
         conn.execute(
-            """INSERT INTO import_jobs(id, filename, owner_id, owner_name, total_rows, created_count, conflict_count, error_count, imported_by, imported_by_name, created_at, data_quality_json, created_customer_ids_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (job_id, payload.filename, owner["id"], owner["name"], len(payload.rows), len(created), len(conflicts), len(errors), user["id"], user["name"], now_iso(), json.dumps(quality, ensure_ascii=False), json.dumps([item["id"] for item in created], ensure_ascii=False)),
+            """INSERT INTO import_jobs(id, filename, owner_id, owner_name, total_rows, created_count, updated_count, conflict_count, error_count, imported_by, imported_by_name, created_at, data_quality_json, created_customer_ids_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (job_id, payload.filename, owner["id"], owner["name"], len(payload.rows), len(created), len(updated), len(conflicts), len(errors), user["id"], user["name"], now_iso(), json.dumps({**quality, "unchangedRows": unchanged_count, "mode": "snapshot" if has_tw_snapshot else "append"}, ensure_ascii=False), json.dumps([item["id"] for item in created], ensure_ascii=False)),
         )
-        audit(conn, user, "import.completed", "import_job", job_id, {"created": len(created), "conflicts": len(conflicts), "errors": len(errors), "quality": quality})
-    return {"jobId": job_id, "created": created, "conflicts": conflicts, "errors": errors, "dataQuality": quality}
+        audit(conn, user, "import.completed", "import_job", job_id, {"created": len(created), "updated": len(updated), "unchanged": unchanged_count, "conflicts": len(conflicts), "errors": len(errors), "quality": quality})
+    return {"jobId": job_id, "mode": "snapshot" if has_tw_snapshot else "append", "created": created, "updated": updated, "unchangedCount": unchanged_count, "conflicts": conflicts, "errors": errors, "dataQuality": quality}
 
 
 @app.get("/api/imports/template.csv")

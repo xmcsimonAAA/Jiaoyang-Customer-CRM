@@ -189,6 +189,7 @@ POSTGRES_SCHEMA_STATEMENTS = [
         owner_name TEXT NOT NULL,
         total_rows INTEGER NOT NULL,
         created_count INTEGER NOT NULL,
+        updated_count INTEGER NOT NULL DEFAULT 0,
         conflict_count INTEGER NOT NULL,
         error_count INTEGER NOT NULL,
         imported_by TEXT NOT NULL,
@@ -200,6 +201,7 @@ POSTGRES_SCHEMA_STATEMENTS = [
         rolled_back_by TEXT
     )
     """,
+    "ALTER TABLE import_jobs ADD COLUMN IF NOT EXISTS updated_count INTEGER NOT NULL DEFAULT 0",
     """
     CREATE TABLE IF NOT EXISTS audit_logs (
         id TEXT PRIMARY KEY,

@@ -333,6 +333,64 @@ def test_import_hygiene_uses_wechat_name_and_keeps_unmatched_advisor_unassigned(
     assert customer_id not in {item["id"] for item in missing.json()["items"]}
 
 
+def test_potential_duplicate_query_is_postgres_ordering_compatible():
+    class Cursor:
+        def fetchall(self):
+            return []
+
+    class Connection:
+        sql = ""
+        params = ()
+
+        def execute(self, sql, params):
+            self.sql = sql
+            self.params = params
+            return Cursor()
+
+    conn = Connection()
+    assert crm_main.potential_identity_matches(conn, "同名客户", "", "customer-id") == []
+    assert "SELECT DISTINCT" not in conn.sql
+    assert "ORDER BY c.updated_at DESC" in conn.sql
+
+
+def test_tw_snapshot_updates_status_and_does_not_create_duplicates():
+    admin_headers, _ = login("admin", "admin123")
+    first = client.post(
+        "/api/imports/commit", headers=admin_headers,
+        json={"filename": "券商周报.xlsx", "mode": "snapshot", "ownerId": "unassigned", "allowUnidentifiedRows": True, "rows": [
+            {"twCode": "tw20260828001", "name": "快照客户", "accountStatus": "未开户"},
+        ]},
+    )
+    assert first.status_code == 200, first.text
+    assert len(first.json()["created"]) == 1
+    customer_id = first.json()["created"][0]["id"]
+    assert first.json()["created"][0]["customerCode"] == "TW20260828001"
+
+    second = client.post(
+        "/api/imports/commit", headers=admin_headers,
+        json={"filename": "券商周报-下一周.xlsx", "mode": "snapshot", "ownerId": "unassigned", "allowUnidentifiedRows": True, "rows": [
+            {"twCode": "TW20260828001", "name": "快照客户", "accountStatus": "已开通"},
+        ]},
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["created"] == []
+    assert len(second.json()["updated"]) == 1
+    detail = client.get(f"/api/customers/{customer_id}", headers=admin_headers)
+    assert detail.status_code == 200
+    assert detail.json()["customer"]["account_status"] == "已开户"
+
+    third = client.post(
+        "/api/imports/commit", headers=admin_headers,
+        json={"filename": "券商周报-同一周.xlsx", "mode": "snapshot", "ownerId": "unassigned", "allowUnidentifiedRows": True, "rows": [
+            {"twCode": "TW20260828001", "name": "快照客户", "accountStatus": "已开通"},
+        ]},
+    )
+    assert third.status_code == 200, third.text
+    assert third.json()["created"] == []
+    assert third.json()["updated"] == []
+    assert third.json()["unchangedCount"] == 1
+
+
 def test_import_preview_converts_traditional_chinese_to_simplified():
     admin_headers, _ = login("admin", "admin123")
     payload = {
