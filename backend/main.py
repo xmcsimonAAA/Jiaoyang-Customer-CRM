@@ -2829,7 +2829,7 @@ def import_preview(payload: ImportPreviewPayload, user: dict[str, Any] = Depends
             activity_diagnostics = hongan_activity_match_diagnostics(conn, activity_workbook["rows"])
         counts = activity_diagnostics["counts"]
         warnings = [
-            {"code": "hongan_activity", "message": f"已读取 {activity_workbook['recognizedSheets']} 个活动分表；只会补全唯一匹配的港安顾问，并按原表骄阳顾问分配仍处于待分配的客户。", "count": counts["autoFill"]},
+            {"code": "hongan_activity", "message": f"已读取 {activity_workbook['recognizedSheets']} 个活动分表；只会补全唯一匹配的港安顾问，不会修改骄阳负责人。", "count": counts["autoFill"]},
         ]
         if counts["conflicts"]:
             warnings.append({"code": "hongan_activity_conflict", "message": "港安顾问发生变化或同一客户在不同活动中出现多个顾问，请人工复核。", "count": counts["conflicts"]})
@@ -2878,7 +2878,7 @@ def import_preview(payload: ImportPreviewPayload, user: dict[str, Any] = Depends
 
 def commit_hongan_activity_import(payload: ImportCommitPayload, user: dict[str, Any]) -> dict[str, Any]:
     if not payload.confirmHonganActivity:
-        raise HTTPException(422, "请确认补全港安顾问，并按原表骄阳顾问分配待分配客户，再提交这批活动分表。")
+        raise HTTPException(422, "请确认仅补全港安顾问，再提交这批活动分表。")
     require_advisor_binding_manager(user)
     if not payload.rows:
         raise HTTPException(422, "活动分表中没有可导入的客户记录。")
@@ -2889,13 +2889,8 @@ def commit_hongan_activity_import(payload: ImportCommitPayload, user: dict[str, 
     errors: list[dict[str, Any]] = []
     unchanged_count = 0
     assigned_count = 0
-    platform_users_all = platform_users(True)
-    users_by_name = {item["name"]: item for item in platform_users_all}
-    users_by_id = {item["id"]: item for item in platform_users_all}
     with db() as conn:
         diagnostics = hongan_activity_match_diagnostics(conn, payload.rows, limit=None)
-        advisor_users = advisor_alias_users(conn, users_by_name, users_by_id)
-        advisor_users_normalized = {simplify_text(name).strip().lower(): item for name, item in advisor_users.items()}
         auto_fill_ids = {item["customerId"]: item for item in diagnostics["autoFill"]}
         for customer_id, item in auto_fill_ids.items():
             advisor = str(item.get("targetAdvisor", "") or "").strip()
@@ -2917,73 +2912,21 @@ def commit_hongan_activity_import(payload: ImportCommitPayload, user: dict[str, 
                 errors.append({"name": item.get("name", ""), "message": "客户资料更新失败，请刷新后重试。"})
                 continue
             changes = {"hongan_advisor": {"from": "", "to": advisor}}
-            source_advisors = item.get("sourceAdvisors", [])
-            matched_source = []
-            if len(source_advisors) == 1:
-                matched_source = [advisor_users_normalized.get(simplify_text(name).strip().lower()) for name in split_advisor_label(source_advisors[0])]
-                matched_source = [person for person in matched_source if person and person.get("rolePermission") in {"manager", "supervisor"}]
-            managers = [person for person in matched_source if person.get("rolePermission") == "manager"]
-            if user["canManageAssignments"] and current["owner_id"] == UNASSIGNED_OWNER_ID and managers:
-                target_owner = managers[0]
-                changed_at = now_iso()
-                conn.execute("UPDATE customers SET owner_id=?, owner_name=?, owner_team=?, updated_at=?, version=version+1 WHERE id=?", (target_owner["id"], target_owner["name"], target_owner["team"], changed_at, customer_id))
-                conn.execute("INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (str(uuid4()), customer_id, current["owner_id"], current["owner_name"], current["owner_team"], target_owner["id"], target_owner["name"], target_owner["team"], "根据活动表骄阳顾问自动分配", user["id"], user["name"], changed_at))
-                changes["owner"] = {"from": current["owner_name"], "to": target_owner["name"]}
-                assigned_count += 1
-                for collaborator in matched_source:
-                    if collaborator["id"] == target_owner["id"]:
-                        continue
-                    already = conn.execute("SELECT 1 FROM customer_collaborators WHERE customer_id=? AND user_id=?", (customer_id, collaborator["id"])).fetchone()
-                    if not already:
-                        role = "协同主管" if collaborator["rolePermission"] == "supervisor" else "协同商务经理"
-                        conn.execute("INSERT INTO customer_collaborators(customer_id, user_id, user_name, user_team, collaborator_role, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (customer_id, collaborator["id"], collaborator["name"], collaborator["team"], role, user["id"], changed_at))
             updated.append({"id": customer_id, "customerCode": current["customer_code"], "name": item.get("name", ""), "changes": changes})
-            audit(conn, user, "customer.hongan_advisor_updated_from_activity", "customer", customer_id, {"sourceSheet": item.get("sourceSheet"), "targetAdvisor": advisor, "sourceJiaoyangAdvisor": source_advisors, "assignedOwner": changes.get("owner"), "sourceRows": item.get("rows", 0)})
-        assignment_candidates = diagnostics["autoFill"] + diagnostics["unchanged"]
-        for item in assignment_candidates:
-            customer_id = item.get("customerId")
-            source_advisors = item.get("sourceAdvisors", [])
-            if not customer_id or len(source_advisors) != 1 or not user["canManageAssignments"]:
-                continue
-            matched_source = [advisor_users_normalized.get(simplify_text(name).strip().lower()) for name in split_advisor_label(source_advisors[0])]
-            matched_source = [person for person in matched_source if person and person.get("rolePermission") in {"manager", "supervisor"}]
-            managers = [person for person in matched_source if person.get("rolePermission") == "manager"]
-            if not managers:
-                continue
-            current_owner = conn.execute("SELECT id, owner_id, owner_name, owner_team FROM customers WHERE id=? AND archived_at IS NULL", (customer_id,)).fetchone()
-            if not current_owner or current_owner["owner_id"] != UNASSIGNED_OWNER_ID:
-                continue
-            target_owner = managers[0]
-            changed_at = now_iso()
-            conn.execute("UPDATE customers SET owner_id=?, owner_name=?, owner_team=?, updated_at=?, version=version+1 WHERE id=? AND archived_at IS NULL AND owner_id=?", (target_owner["id"], target_owner["name"], target_owner["team"], changed_at, customer_id, UNASSIGNED_OWNER_ID))
-            conn.execute("INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (str(uuid4()), customer_id, current_owner["owner_id"], current_owner["owner_name"], current_owner["owner_team"], target_owner["id"], target_owner["name"], target_owner["team"], "根据活动表骄阳顾问自动分配", user["id"], user["name"], changed_at))
-            assigned_count += 1
-            updated_item = next((entry for entry in updated if entry["id"] == customer_id), None)
-            if updated_item:
-                updated_item["changes"]["owner"] = {"from": current_owner["owner_name"], "to": target_owner["name"]}
-            else:
-                updated.append({"id": customer_id, "customerCode": item.get("customerCode", ""), "name": item.get("name", ""), "changes": {"owner": {"from": current_owner["owner_name"], "to": target_owner["name"]}}})
-            for collaborator in matched_source:
-                if collaborator["id"] == target_owner["id"]:
-                    continue
-                already = conn.execute("SELECT 1 FROM customer_collaborators WHERE customer_id=? AND user_id=?", (customer_id, collaborator["id"])).fetchone()
-                if not already:
-                    role = "协同主管" if collaborator["rolePermission"] == "supervisor" else "协同商务经理"
-                    conn.execute("INSERT INTO customer_collaborators(customer_id, user_id, user_name, user_team, collaborator_role, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (customer_id, collaborator["id"], collaborator["name"], collaborator["team"], role, user["id"], changed_at))
-            audit(conn, user, "customer.owner_assigned_from_activity", "customer", customer_id, {"sourceJiaoyangAdvisor": source_advisors[0], "owner": target_owner["name"]})
+            audit(conn, user, "customer.hongan_advisor_updated_from_activity", "customer", customer_id, {"sourceSheet": item.get("sourceSheet"), "targetAdvisor": advisor, "sourceJiaoyangAdvisor": item.get("sourceAdvisors", []), "sourceRows": item.get("rows", 0)})
         job_id = str(uuid4())
         job_created_at = datetime.now(timezone.utc).astimezone().isoformat(timespec="microseconds")
-        quality = {"mode": "hongan_activity", "profile": "hongan_activity", "activity": diagnostics, "unchangedRows": unchanged_count, "assignedOwners": assigned_count}
+        quality = {"mode": "hongan_activity", "profile": "hongan_activity", "activity": diagnostics, "unchangedRows": unchanged_count, "assignedOwners": 0}
         conflict_items = diagnostics["conflicts"] + diagnostics["ambiguous"] + diagnostics["unmatched"]
         conn.execute(
             """INSERT INTO import_jobs(id, filename, owner_id, owner_name, total_rows, created_count, updated_count, conflict_count, error_count, imported_by, imported_by_name, created_at, data_quality_json, created_customer_ids_json, updated_customer_ids_json, opened_customer_ids_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (job_id, payload.filename, UNASSIGNED_OWNER_ID, UNASSIGNED_OWNER["name"], len(payload.rows), 0, len(updated), len(conflicts) + len(conflict_items), len(errors), user["id"], user["name"], job_created_at, json.dumps(quality, ensure_ascii=False), "[]", json.dumps([item["id"] for item in updated], ensure_ascii=False), "[]"),
         )
-        audit(conn, user, "import.hongan_activity_completed", "import_job", job_id, {"updated": len(updated), "assigned": assigned_count, "unchanged": unchanged_count, "conflicts": len(conflicts) + len(conflict_items), "errors": len(errors)})
+        audit(conn, user, "import.hongan_activity_completed", "import_job", job_id, {"updated": len(updated), "assigned": 0, "unchanged": unchanged_count, "conflicts": len(conflicts) + len(conflict_items), "errors": len(errors)})
     review_items = [{"name": item.get("name", ""), "detail": "港安顾问信息不一致，未覆盖已有顾问。", "currentAdvisor": item.get("currentAdvisor", ""), "targetAdvisor": item.get("targetAdvisor", "")} for item in diagnostics["conflicts"]]
     review_items.extend({"name": item.get("name", ""), "detail": "同名客户或活动顾问信息不唯一，未自动更新。"} for item in diagnostics["ambiguous"] + diagnostics["unmatched"])
-    return {"jobId": job_id, "mode": "hongan_activity", "profile": "hongan_activity", "created": created, "updated": updated, "assignedCount": assigned_count, "openedCount": 0, "unchangedCount": unchanged_count, "conflicts": conflicts + review_items, "errors": errors, "dataQuality": {"profile": "hongan_activity", "updated": len(updated), "assignedOwners": assigned_count, "unchanged": unchanged_count}}
+    return {"jobId": job_id, "mode": "hongan_activity", "profile": "hongan_activity", "created": created, "updated": updated, "assignedCount": 0, "openedCount": 0, "unchangedCount": unchanged_count, "conflicts": conflicts + review_items, "errors": errors, "dataQuality": {"profile": "hongan_activity", "updated": len(updated), "assignedOwners": 0, "unchanged": unchanged_count}}
 
 
 @app.post("/api/imports/commit")
@@ -3188,8 +3131,43 @@ def rollback_import(job_id: str, user: dict[str, Any] = Depends(current_user)) -
             created_ids = json.loads(job["created_customer_ids_json"] or "[]")
         except json.JSONDecodeError:
             created_ids = []
-        if not created_ids:
+        try:
+            quality = json.loads(job["data_quality_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            quality = {}
+        if not created_ids and quality.get("mode") != "hongan_activity":
             raise HTTPException(422, "该导入记录没有可撤回的客户，可能是系统升级前的历史记录。")
+        if quality.get("mode") == "hongan_activity":
+            restored, protected = [], []
+            timestamp = now_iso()
+            previous_job = conn.execute("SELECT created_at FROM import_jobs WHERE created_at < ? ORDER BY created_at DESC LIMIT 1", (job["created_at"],)).fetchone()
+            previous_job_created_at = previous_job["created_at"] if previous_job else ""
+            try:
+                updated_ids = json.loads(job["updated_customer_ids_json"] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                updated_ids = []
+            for customer_id in updated_ids:
+                customer = conn.execute("SELECT id, customer_code, hongan_advisor, owner_id, owner_name, owner_team, updated_at FROM customers WHERE id=? AND archived_at IS NULL", (customer_id,)).fetchone()
+                if not customer:
+                    continue
+                if str(customer["updated_at"] or "") > str(job["created_at"] or ""):
+                    protected.append({"id": customer_id, "customerCode": customer["customer_code"], "reason": "导入后已有编辑或重新分配"})
+                    continue
+                restored_fields = {}
+                assignment = conn.execute("SELECT from_owner_id, from_owner_name, from_team, to_owner_id FROM assignments WHERE customer_id=? AND changed_by=? AND reason=? AND changed_at>? AND changed_at<=? ORDER BY changed_at DESC LIMIT 1", (customer_id, job["imported_by"], "根据活动表骄阳顾问自动分配", previous_job_created_at, job["created_at"])).fetchone()
+                # Only reverse the legacy automatic assignment when it is still
+                # the current owner. A later manual reassignment must survive.
+                if assignment and customer["owner_id"] == assignment["to_owner_id"] and customer["owner_id"] != assignment["from_owner_id"]:
+                    restored_fields.update({"owner_id": assignment["from_owner_id"], "owner_name": assignment["from_owner_name"], "owner_team": assignment["from_team"]})
+                elif assignment and customer["owner_id"] != assignment["to_owner_id"]:
+                    protected.append({"id": customer_id, "customerCode": customer["customer_code"], "reason": "导入后已有重新分配"})
+                if restored_fields:
+                    setters = ", ".join(f"{key}=?" for key in restored_fields)
+                    conn.execute(f"UPDATE customers SET {setters}, updated_at=?, version=version+1 WHERE id=?", (*restored_fields.values(), timestamp, customer_id))
+                    restored.append({"id": customer_id, "customerCode": customer["customer_code"], "fields": list(restored_fields)})
+            conn.execute("UPDATE import_jobs SET rolled_back_at=?, rolled_back_by=? WHERE id=?", (timestamp, user["id"], job_id))
+            audit(conn, user, "import.rolled_back", "import_job", job_id, {"restored": len(restored), "protected": len(protected), "profile": "hongan_activity"})
+            return {"jobId": job_id, "restored": restored, "archived": [], "protected": protected, "alreadyRolledBack": False}
         archived, protected = [], []
         timestamp = now_iso()
         for customer_id in created_ids:

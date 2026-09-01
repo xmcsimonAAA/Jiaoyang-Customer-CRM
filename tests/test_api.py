@@ -725,16 +725,45 @@ def test_hongan_activity_workbook_updates_only_safe_name_matches():
     commit = client.post("/api/imports/commit", headers=admin_headers, json={"filename": payload["filename"], "importProfile": "hongan_activity", "confirmHonganActivity": True, "rows": body["activityRows"]})
     assert commit.status_code == 200, commit.text
     result = commit.json()
-    assert len(result["updated"]) == 2
-    assert result["assignedCount"] == 2
+    assert len(result["updated"]) == 1
+    assert result["assignedCount"] == 0
     assert any(item["name"] == "活动未匹配" for item in result["conflicts"])
     assert any(item["name"] == "活动重名" for item in result["conflicts"])
     blank_detail = client.get(f"/api/customers/{blank.json()['customer']['id']}", headers=admin_headers).json()["customer"]
     existing_detail = client.get(f"/api/customers/{existing.json()['customer']['id']}", headers=admin_headers).json()["customer"]
     assert blank_detail["hongan_advisor"] == "活动港安甲"
-    assert blank_detail["owner_id"] == "demo-manager"
+    assert blank_detail["owner_id"] == "unassigned"
     assert existing_detail["hongan_advisor"] == "活动港安乙"
-    assert existing_detail["owner_id"] == "demo-manager"
+    assert existing_detail["owner_id"] == "unassigned"
+
+
+def test_hongan_activity_rollback_restores_only_legacy_owner_assignment():
+    admin_headers, _ = login("admin", "admin123")
+    created = client.post("/api/customers", headers=admin_headers, json={"name": "旧逻辑负责人", "hkAdvisor": "正确港安顾问"})
+    assert created.status_code == 201, created.text
+    customer_id = created.json()["customer"]["id"]
+    job_id = "legacy-hongan-rollback-job"
+    job_created_at = "2026-09-01T10:00:01+08:00"
+    changed_at = "2026-09-01T10:00:00+08:00"
+    with crm_main.db() as conn:
+        conn.execute(
+            "UPDATE customers SET owner_id=?, owner_name=?, owner_team=?, updated_at=?, version=version+1 WHERE id=?",
+            ("demo-manager", "演示顾问", "演示一组", changed_at, customer_id),
+        )
+        conn.execute(
+            "INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("legacy-hongan-assignment", customer_id, "unassigned", "待分配", "待分配池", "demo-manager", "演示顾问", "演示一组", "根据活动表骄阳顾问自动分配", "demo-admin", "演示管理员", changed_at),
+        )
+        conn.execute(
+            "INSERT INTO import_jobs(id, filename, owner_id, owner_name, total_rows, created_count, updated_count, conflict_count, error_count, imported_by, imported_by_name, created_at, data_quality_json, created_customer_ids_json, updated_customer_ids_json, opened_customer_ids_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (job_id, "港安活动分表-旧逻辑.xlsx", "unassigned", "待分配", 1, 0, 1, 0, 0, "demo-admin", "演示管理员", job_created_at, json.dumps({"mode": "hongan_activity"}), "[]", json.dumps([customer_id]), "[]"),
+        )
+    rolled_back = client.post(f"/api/imports/{job_id}/rollback", headers=admin_headers)
+    assert rolled_back.status_code == 200, rolled_back.text
+    assert rolled_back.json()["restored"][0]["id"] == customer_id
+    detail = client.get(f"/api/customers/{customer_id}", headers=admin_headers).json()["customer"]
+    assert detail["owner_id"] == "unassigned"
+    assert detail["hongan_advisor"] == "正确港安顾问"
 
 
 def test_custom_fields_permission_grid_values_and_safe_deactivation():
