@@ -517,6 +517,7 @@ class ImportCommitPayload(BaseModel):
     importProfile: str = "standard"
     advisorAliasMappings: dict[str, str] = Field(default_factory=dict)
     allowUnidentifiedRows: bool = False
+    confirmHonganActivity: bool = False
 
 
 class PermissionPayload(BaseModel):
@@ -2170,7 +2171,7 @@ HEADER_ALIASES = {
     "accountStatus": ["开户状态", "是否完成开户", "港券开户状态", "证券开户状态"], "accountBroker": ["开户券商", "香港券商", "券商", "开户证券"], "accountOpenedAt": ["开户日期", "注册日期"],
     "twCode": ["TW编号", "TW客户编号", "客户唯一编号", "客户编号", "客户编码", "客户代码", "客户号"],
     "brokerDepositAmount": ["入金金额/USD", "入金金额", "港券入金金额", "券商账户资产", "客户权益资产", "账户权益资产", "账户资产", "权益资产"], "capitalDestination": ["资金流向", "资金去向"],
-    "hkAdvisor": ["港安顾问"], "sourceAdvisorLabel": ["骄阳顾问", "商务顾问", "客户顾问"],
+    "hkAdvisor": ["港安顾问", "保险经纪人"], "sourceAdvisorLabel": ["骄阳顾问", "商务顾问", "客户顾问"],
     "intentStatus": ["定增意向", "意向状态", "顾问判断"], "placementStatus": ["定增推进", "节点进度", "定增状态"],
     "intentAmount": ["意向金额", "意向额度", "意向额度(USD)"], "fundedAmount": ["到账金额", "到账金额(USD)"],
     "actualAmount": ["实际参与金额", "实际定增", "定增金额"], "lostReason": ["流失原因", "取消原因"],
@@ -2679,6 +2680,133 @@ def parse_import_file(filename: str, content: bytes) -> tuple[list[str], list[li
     return headers, rows, sheet_name
 
 
+HONGAN_ACTIVITY_HEADERS = {
+    "name": ("客户姓名", "客户名称", "真实姓名", "姓名"),
+    "hkAdvisor": ("保险经纪人", "港安顾问"),
+    "accountStatus": ("是否开券商户", "开户状态", "证券开户状态"),
+    "brokerDepositAmount": ("入金金额", "入金金额/USD"),
+    "sourceAdvisorLabel": ("骄阳现场开户人", "骄阳顾问", "商务顾问"),
+    "witness": ("中阳见证人", "见证人"),
+    "customerType": ("客户类型",),
+    "signed": ("是否签署定增协议", "是否签署协议"),
+    "intentStatus": ("是否定有定增意向", "定增意向"),
+    "intentAmount": ("意向定增金额", "意向金额"),
+    "notes": ("备注说明", "备注"),
+}
+
+
+def normalized_activity_name(value: Any) -> str:
+    """Normalize names only for matching; the original display value is retained."""
+    return re.sub(r"[\s\u3000]+", "", str(clean_import_cell(value) or "")).strip().lower()
+
+
+def activity_header_index(headers: list[Any], aliases: tuple[str, ...]) -> int | None:
+    for index, header in enumerate(headers):
+        normalized = re.sub(r"\s+", "", simplify_text(header)).lower()
+        if any(normalized == re.sub(r"\s+", "", simplify_text(alias)).lower() for alias in aliases):
+            return index
+    return None
+
+
+def parse_hongan_activity_workbook(content: bytes) -> dict[str, Any] | None:
+    """Parse every dated Hongan activity sheet, ignoring the Q&A/reference sheet."""
+    sheets = parse_xlsx_without_styles(content)
+    activity_rows: list[dict[str, Any]] = []
+    sheet_stats: list[dict[str, Any]] = []
+    recognized_sheets = 0
+    for sheet_order, (sheet_name, raw_rows) in enumerate(sheets):
+        if simplify_text(sheet_name).strip().lower() in {"q&a", "qa", "常见问题", "参考答复"}:
+            continue
+        non_empty = [[clean_import_cell(value) for value in row] for row in raw_rows if any(clean_import_cell(value) not in (None, "") for value in row)]
+        header_index = next(
+            (index for index, row in enumerate(non_empty[:20])
+             if activity_header_index(row, HONGAN_ACTIVITY_HEADERS["name"]) is not None
+             and activity_header_index(row, HONGAN_ACTIVITY_HEADERS["hkAdvisor"]) is not None),
+            None,
+        )
+        if header_index is None:
+            continue
+        recognized_sheets += 1
+        headers = list(non_empty[header_index])
+        indexes = {field: activity_header_index(headers, aliases) for field, aliases in HONGAN_ACTIVITY_HEADERS.items()}
+        rows_added = 0
+        for source_row, raw_row in enumerate(non_empty[header_index + 1:], start=header_index + 2):
+            def cell(field: str) -> Any:
+                index = indexes.get(field)
+                return raw_row[index] if index is not None and index < len(raw_row) else ""
+
+            name = str(clean_import_cell(cell("name")) or "").strip()
+            if not name or normalized_activity_name(name) in {"序号", "合计", "总计"}:
+                continue
+            advisor = str(clean_import_cell(cell("hkAdvisor")) or "").strip()
+            item = {
+                "name": name,
+                "hkAdvisor": advisor,
+                "accountStatus": ACCOUNT_STATUS_IMPORT_MAP.get(str(clean_import_cell(cell("accountStatus")) or "").strip(), str(clean_import_cell(cell("accountStatus")) or "").strip()),
+                "brokerDepositAmount": clean_import_cell(cell("brokerDepositAmount")) or "",
+                "sourceAdvisorLabel": str(clean_import_cell(cell("sourceAdvisorLabel")) or "").strip(),
+                "witness": str(clean_import_cell(cell("witness")) or "").strip(),
+                "customerType": str(clean_import_cell(cell("customerType")) or "").strip(),
+                "signed": str(clean_import_cell(cell("signed")) or "").strip(),
+                "intentStatus": str(clean_import_cell(cell("intentStatus")) or "").strip(),
+                "intentAmount": clean_import_cell(cell("intentAmount")) or "",
+                "notes": str(clean_import_cell(cell("notes")) or "").strip(),
+                "sourceSheet": simplify_text(sheet_name).strip(),
+                "sourceRow": source_row,
+            }
+            activity_rows.append(item)
+            rows_added += 1
+        sheet_stats.append({"name": simplify_text(sheet_name).strip(), "rows": rows_added})
+    if recognized_sheets < 2 or not activity_rows:
+        return None
+    return {"rows": activity_rows, "sheets": sheet_stats, "recognizedSheets": recognized_sheets}
+
+
+def hongan_activity_match_diagnostics(conn: Any, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    customers = [dict(row) for row in conn.execute(
+        "SELECT id, customer_code, name, wechat_nickname, hongan_advisor FROM customers WHERE archived_at IS NULL"
+    ).fetchall()]
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    for customer in customers:
+        key = normalized_activity_name(customer.get("name", ""))
+        if key:
+            by_name.setdefault(key, []).append(customer)
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        key = normalized_activity_name(row.get("name", ""))
+        if not key:
+            continue
+        group = grouped.setdefault(key, {"name": row.get("name", ""), "advisors": [], "sourceAdvisors": [], "rows": 0, "sourceSheet": row.get("sourceSheet", "")})
+        advisor = str(row.get("hkAdvisor", "") or "").strip()
+        if advisor and advisor not in group["advisors"]:
+            group["advisors"].append(advisor)
+        source_advisor = str(row.get("sourceAdvisorLabel", "") or "").strip()
+        if source_advisor and source_advisor not in group["sourceAdvisors"]:
+            group["sourceAdvisors"].append(source_advisor)
+        group["rows"] += 1
+    result: dict[str, list[dict[str, Any]]] = {key: [] for key in ("autoFill", "unchanged", "conflicts", "ambiguous", "unmatched", "noAdvisor")}
+    for key, group in grouped.items():
+        advisors = group["advisors"]
+        candidates = by_name.get(key, [])
+        summary = {"name": group["name"], "advisors": advisors, "sourceAdvisors": group.get("sourceAdvisors", []), "rows": group["rows"], "sourceSheet": group.get("sourceSheet", "")}
+        if not advisors:
+            result["noAdvisor"].append(summary)
+        elif len(candidates) != 1:
+            result["ambiguous" if len(candidates) > 1 else "unmatched"].append({**summary, "candidateCount": len(candidates)})
+        elif len(advisors) > 1:
+            result["conflicts"].append({**summary, "customerId": candidates[0]["id"], "customerCode": candidates[0]["customer_code"], "currentAdvisor": candidates[0].get("hongan_advisor", "")})
+        else:
+            current = str(candidates[0].get("hongan_advisor", "") or "").strip()
+            target = advisors[0]
+            detail = {**summary, "customerId": candidates[0]["id"], "customerCode": candidates[0]["customer_code"], "currentAdvisor": current, "targetAdvisor": target}
+            result["autoFill" if not current else "unchanged" if simplify_text(current) == simplify_text(target) else "conflicts"].append(detail)
+    return {
+        "totalRows": len(rows), "uniqueNames": len(grouped), "rowsWithAdvisor": sum(item["rows"] for item in grouped.values() if item["advisors"]),
+        "counts": {key: len(value) for key, value in result.items()},
+        **{key: value[:200] for key, value in result.items()},
+    }
+
+
 @app.post("/api/imports/preview")
 def import_preview(payload: ImportPreviewPayload, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     if not user["canImportCustomers"]:
@@ -2689,6 +2817,40 @@ def import_preview(payload: ImportPreviewPayload, user: dict[str, Any] = Depends
         raise HTTPException(422, "文件内容无效。") from exc
     if len(content) > 15 * 1024 * 1024:
         raise HTTPException(413, "文件不能超过 15MB。")
+    try:
+        activity_workbook = parse_hongan_activity_workbook(content) if payload.filename.lower().endswith(".xlsx") else None
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(422, "无法解析该文件，请确认文件未损坏，或另存为新的 .xlsx 后重试。") from exc
+    if activity_workbook:
+        activity_headers = ["客户姓名", "保险经纪人", "是否开券商户", "入金金额", "骄阳现场开户人", "中阳见证人", "客户类型", "是否签署定增协议", "意向定增金额", "备注说明", "来源分表", "来源行"]
+        with db() as conn:
+            activity_diagnostics = hongan_activity_match_diagnostics(conn, activity_workbook["rows"])
+        counts = activity_diagnostics["counts"]
+        warnings = [
+            {"code": "hongan_activity", "message": f"已读取 {activity_workbook['recognizedSheets']} 个活动分表；只会自动补全唯一匹配且当前为空的港安顾问。", "count": counts["autoFill"]},
+        ]
+        if counts["conflicts"]:
+            warnings.append({"code": "hongan_activity_conflict", "message": "港安顾问发生变化或同一客户在不同活动中出现多个顾问，请人工复核。", "count": counts["conflicts"]})
+        if counts["ambiguous"]:
+            warnings.append({"code": "hongan_activity_ambiguous", "message": "同名客户对应多条系统记录，未自动更新。", "count": counts["ambiguous"]})
+        if counts["unmatched"]:
+            warnings.append({"code": "hongan_activity_unmatched", "message": "活动表中的客户暂未在系统找到，未自动新建。", "count": counts["unmatched"]})
+        preview_rows = [{header: row.get({
+            "客户姓名": "name", "保险经纪人": "hkAdvisor", "是否开券商户": "accountStatus", "入金金额": "brokerDepositAmount",
+            "骄阳现场开户人": "sourceAdvisorLabel", "中阳见证人": "witness", "客户类型": "customerType", "是否签署定增协议": "signed",
+            "意向定增金额": "intentAmount", "备注说明": "notes", "来源分表": "sourceSheet", "来源行": "sourceRow",
+        }[header], "") for header in activity_headers} for row in activity_workbook["rows"][:IMPORT_ROW_LIMIT]]
+        return {
+            "headers": activity_headers, "suggestedMapping": {}, "suggestedCustomMapping": {}, "customerFields": [],
+            "rows": preview_rows, "totalRows": len(activity_workbook["rows"]), "truncated": len(activity_workbook["rows"]) > IMPORT_ROW_LIMIT,
+            "activityRows": activity_workbook["rows"][:IMPORT_ROW_LIMIT],
+            "sheetName": f"港安活动分表（{activity_workbook['recognizedSheets']} 张）", "sheetStats": activity_workbook["sheets"],
+            "textNormalization": "繁体中文已统一转换为简体中文", "profile": "hongan_activity", "importProfile": "hongan_activity",
+            "warnings": warnings, "honganActivity": activity_diagnostics,
+            "dataQuality": {"importProfile": "hongan_activity", "hasTwSnapshot": False, "honganAutoFill": counts["autoFill"], "honganUnchanged": counts["unchanged"], "honganConflicts": counts["conflicts"], "honganAmbiguous": counts["ambiguous"], "honganUnmatched": counts["unmatched"]},
+        }
     try:
         headers, raw_rows, sheet_name = parse_import_file(payload.filename, content)
     except HTTPException:
@@ -2714,6 +2876,98 @@ def import_preview(payload: ImportPreviewPayload, user: dict[str, Any] = Depends
     return {"headers": headers, "suggestedMapping": mapping, "suggestedCustomMapping": custom_mapping, "customerFields": [field_dict(row) for row in custom_fields], "rows": preview_rows, "totalRows": len(raw_rows), "truncated": len(raw_rows) > IMPORT_ROW_LIMIT, "sheetName": sheet_name, "textNormalization": "繁体中文已统一转换为简体中文", **diagnostics}
 
 
+def commit_hongan_activity_import(payload: ImportCommitPayload, user: dict[str, Any]) -> dict[str, Any]:
+    if not payload.confirmHonganActivity:
+        raise HTTPException(422, "请确认仅补全港安顾问，再提交这批活动分表。")
+    require_advisor_binding_manager(user)
+    if not payload.rows:
+        raise HTTPException(422, "活动分表中没有可导入的客户记录。")
+    diagnostics: dict[str, Any]
+    created: list[dict[str, Any]] = []
+    updated: list[dict[str, Any]] = []
+    conflicts: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    unchanged_count = 0
+    assigned_count = 0
+    platform_users_all = platform_users(True)
+    users_by_name = {item["name"]: item for item in platform_users_all}
+    users_by_id = {item["id"]: item for item in platform_users_all}
+    with db() as conn:
+        diagnostics = hongan_activity_match_diagnostics(conn, payload.rows)
+        advisor_users = advisor_alias_users(conn, users_by_name, users_by_id)
+        advisor_users_normalized = {simplify_text(name).strip().lower(): item for name, item in advisor_users.items()}
+        auto_fill_ids = {item["customerId"]: item for item in diagnostics["autoFill"]}
+        for customer_id, item in auto_fill_ids.items():
+            advisor = str(item.get("targetAdvisor", "") or "").strip()
+            if not advisor:
+                continue
+            current = conn.execute("SELECT id, customer_code, hongan_advisor, owner_id, owner_name, owner_team FROM customers WHERE id=? AND archived_at IS NULL", (customer_id,)).fetchone()
+            if not current:
+                errors.append({"name": item.get("name", ""), "message": "客户已不存在或已归档，未更新。"})
+                continue
+            if str(current["hongan_advisor"] or "").strip():
+                if simplify_text(str(current["hongan_advisor"])) == simplify_text(advisor):
+                    unchanged_count += 1
+                else:
+                    conflicts.append({"name": item.get("name", ""), "customerCode": current["customer_code"], "currentAdvisor": current["hongan_advisor"], "targetAdvisor": advisor, "detail": "客户资料在预览后发生变化，未覆盖已有顾问。"})
+                continue
+            timestamp = now_iso()
+            update_result = conn.execute("UPDATE customers SET hongan_advisor=?, updated_at=?, version=version+1 WHERE id=? AND archived_at IS NULL AND COALESCE(hongan_advisor, '')=''", (advisor, timestamp, customer_id))
+            if getattr(update_result, "rowcount", 1) != 1:
+                errors.append({"name": item.get("name", ""), "message": "客户资料更新失败，请刷新后重试。"})
+                continue
+            changes = {"hongan_advisor": {"from": "", "to": advisor}}
+            source_advisors = item.get("sourceAdvisors", [])
+            matched_source = []
+            if len(source_advisors) == 1:
+                matched_source = [advisor_users_normalized.get(simplify_text(name).strip().lower()) for name in split_advisor_label(source_advisors[0])]
+                matched_source = [person for person in matched_source if person and person.get("rolePermission") == "manager"]
+            if current["owner_id"] == UNASSIGNED_OWNER_ID and len(matched_source) == 1:
+                target_owner = matched_source[0]
+                changed_at = now_iso()
+                conn.execute("UPDATE customers SET owner_id=?, owner_name=?, owner_team=?, updated_at=?, version=version+1 WHERE id=?", (target_owner["id"], target_owner["name"], target_owner["team"], changed_at, customer_id))
+                conn.execute("INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (str(uuid4()), customer_id, current["owner_id"], current["owner_name"], current["owner_team"], target_owner["id"], target_owner["name"], target_owner["team"], "根据活动表骄阳顾问自动分配", user["id"], user["name"], changed_at))
+                changes["owner"] = {"from": current["owner_name"], "to": target_owner["name"]}
+                assigned_count += 1
+            updated.append({"id": customer_id, "customerCode": current["customer_code"], "name": item.get("name", ""), "changes": changes})
+            audit(conn, user, "customer.hongan_advisor_updated_from_activity", "customer", customer_id, {"sourceSheet": item.get("sourceSheet"), "targetAdvisor": advisor, "sourceJiaoyangAdvisor": source_advisors, "assignedOwner": changes.get("owner"), "sourceRows": item.get("rows", 0)})
+        assignment_candidates = diagnostics["autoFill"] + diagnostics["unchanged"] + diagnostics["conflicts"]
+        for item in assignment_candidates:
+            customer_id = item.get("customerId")
+            source_advisors = item.get("sourceAdvisors", [])
+            if not customer_id or len(source_advisors) != 1:
+                continue
+            matched_source = [advisor_users_normalized.get(simplify_text(name).strip().lower()) for name in split_advisor_label(source_advisors[0])]
+            matched_source = [person for person in matched_source if person and person.get("rolePermission") == "manager"]
+            if len(matched_source) != 1:
+                continue
+            current_owner = conn.execute("SELECT id, owner_id, owner_name, owner_team FROM customers WHERE id=? AND archived_at IS NULL", (customer_id,)).fetchone()
+            if not current_owner or current_owner["owner_id"] != UNASSIGNED_OWNER_ID:
+                continue
+            target_owner = matched_source[0]
+            changed_at = now_iso()
+            conn.execute("UPDATE customers SET owner_id=?, owner_name=?, owner_team=?, updated_at=?, version=version+1 WHERE id=? AND archived_at IS NULL AND owner_id=?", (target_owner["id"], target_owner["name"], target_owner["team"], changed_at, customer_id, UNASSIGNED_OWNER_ID))
+            conn.execute("INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (str(uuid4()), customer_id, current_owner["owner_id"], current_owner["owner_name"], current_owner["owner_team"], target_owner["id"], target_owner["name"], target_owner["team"], "根据活动表骄阳顾问自动分配", user["id"], user["name"], changed_at))
+            assigned_count += 1
+            updated_item = next((entry for entry in updated if entry["id"] == customer_id), None)
+            if updated_item:
+                updated_item["changes"]["owner"] = {"from": current_owner["owner_name"], "to": target_owner["name"]}
+            audit(conn, user, "customer.owner_assigned_from_activity", "customer", customer_id, {"sourceJiaoyangAdvisor": source_advisors[0], "owner": target_owner["name"]})
+        job_id = str(uuid4())
+        job_created_at = datetime.now(timezone.utc).astimezone().isoformat(timespec="microseconds")
+        quality = {"mode": "hongan_activity", "profile": "hongan_activity", "activity": diagnostics, "unchangedRows": unchanged_count, "assignedOwners": assigned_count}
+        conflict_items = diagnostics["conflicts"] + diagnostics["ambiguous"] + diagnostics["unmatched"]
+        conn.execute(
+            """INSERT INTO import_jobs(id, filename, owner_id, owner_name, total_rows, created_count, updated_count, conflict_count, error_count, imported_by, imported_by_name, created_at, data_quality_json, created_customer_ids_json, updated_customer_ids_json, opened_customer_ids_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (job_id, payload.filename, UNASSIGNED_OWNER_ID, UNASSIGNED_OWNER["name"], len(payload.rows), 0, len(updated), len(conflicts) + len(conflict_items), len(errors), user["id"], user["name"], job_created_at, json.dumps(quality, ensure_ascii=False), "[]", json.dumps([item["id"] for item in updated], ensure_ascii=False), "[]"),
+        )
+        audit(conn, user, "import.hongan_activity_completed", "import_job", job_id, {"updated": len(updated), "assigned": assigned_count, "unchanged": unchanged_count, "conflicts": len(conflicts) + len(conflict_items), "errors": len(errors)})
+    review_items = [{"name": item.get("name", ""), "detail": "港安顾问信息不一致，未覆盖已有顾问。", "currentAdvisor": item.get("currentAdvisor", ""), "targetAdvisor": item.get("targetAdvisor", "")} for item in diagnostics["conflicts"]]
+    review_items.extend({"name": item.get("name", ""), "detail": "同名客户或活动顾问信息不唯一，未自动更新。"} for item in diagnostics["ambiguous"] + diagnostics["unmatched"])
+    return {"jobId": job_id, "mode": "hongan_activity", "profile": "hongan_activity", "created": created, "updated": updated, "assignedCount": assigned_count, "openedCount": 0, "unchangedCount": unchanged_count, "conflicts": conflicts + review_items, "errors": errors, "dataQuality": {"profile": "hongan_activity", "updated": len(updated), "assignedOwners": assigned_count, "unchanged": unchanged_count}}
+
+
 @app.post("/api/imports/commit")
 def import_commit(payload: ImportCommitPayload, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     if not user["canImportCustomers"]:
@@ -2724,8 +2978,10 @@ def import_commit(payload: ImportCommitPayload, user: dict[str, Any] = Depends(c
     if mode not in {"append", "snapshot"}:
         raise HTTPException(422, "导入模式无效。")
     profile = str(payload.importProfile or "standard").strip().lower()
-    if profile not in {"standard", "hongan_master", "asset", "holding"}:
+    if profile not in {"standard", "hongan_master", "asset", "holding", "hongan_activity"}:
         profile = "standard"
+    if profile == "hongan_activity":
+        return commit_hongan_activity_import(payload, user)
     if profile == "standard" and payload.rows:
         if any(row.get("holdingSnapshots") for row in payload.rows) and not any(row.get("accountStatus") for row in payload.rows):
             profile = "holding"

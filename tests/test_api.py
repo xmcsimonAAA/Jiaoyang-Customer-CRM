@@ -94,6 +94,31 @@ def xlsx_with_hongan_master_headers() -> bytes:
     return output.getvalue()
 
 
+def xlsx_with_hongan_activity_sheets() -> bytes:
+    workbook = '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="2026.08.26" sheetId="1" r:id="rId1"/><sheet name="2026.08.19" sheetId="2" r:id="rId2"/><sheet name="Q&amp;A" sheetId="3" r:id="rId3"/></sheets></workbook>'
+    relationships = '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet3.xml"/></Relationships>'
+
+    def worksheet(rows: list[list[str]]) -> str:
+        xml_rows = []
+        for row_number, values in enumerate(rows, start=1):
+            cells = "".join(f'<c r="{chr(65 + index)}{row_number}" t="inlineStr"><is><t>{value}</t></is></c>' for index, value in enumerate(values))
+            xml_rows.append(f'<row r="{row_number}">{cells}</row>')
+        return '<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>' + "".join(xml_rows) + "</sheetData></worksheet>"
+
+    header = ["序号", "客户姓名", "是否开券商户", "入金金额", "骄阳现场开户人", "保险经纪人", "中阳见证人"]
+    sheet_one = worksheet([header, ["1", "活动空顾问", "已提交", "", "演示顾问", "活动港安甲", ""], ["2", "活动已有顾问", "已提交", "", "", "活动港安乙", ""]])
+    sheet_two = worksheet([header, ["1", "活动空顾问", "已开户", "", "演示顾问", "活动港安甲", ""], ["2", "活动未匹配", "", "", "", "活动港安丙", ""], ["3", "活动重名", "", "", "", "活动港安丁", ""]])
+    qa = worksheet([["序号", "常见问题"], ["1", "仅供参考"]])
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        archive.writestr("xl/workbook.xml", workbook)
+        archive.writestr("xl/_rels/workbook.xml.rels", relationships)
+        archive.writestr("xl/worksheets/sheet1.xml", sheet_one)
+        archive.writestr("xl/worksheets/sheet2.xml", sheet_two)
+        archive.writestr("xl/worksheets/sheet3.xml", qa)
+    return output.getvalue()
+
+
 def test_customer_lifecycle_visibility_and_permissions():
     manager_headers, manager = login("manager", "manager123")
     second_headers, second = login("manager2", "manager2123")
@@ -678,6 +703,36 @@ def test_xlsx_preview_ignores_broken_styles():
     assert result["sheetName"] == "客户总表"
     assert result["suggestedMapping"] == {"name": "客户姓名", "phone": "手机号"}
     assert result["rows"] == [{"客户姓名": "样式异常客户", "手机号": "13900000000"}]
+
+
+def test_hongan_activity_workbook_updates_only_safe_name_matches():
+    admin_headers, _ = login("admin", "admin123")
+    blank = client.post("/api/customers", headers=admin_headers, json={"name": "活动空顾问"})
+    existing = client.post("/api/customers", headers=admin_headers, json={"name": "活动已有顾问", "hkAdvisor": "活动港安乙"})
+    duplicate_one = client.post("/api/customers", headers=admin_headers, json={"name": "活动重名"})
+    duplicate_two = client.post("/api/customers", headers=admin_headers, json={"name": "活动重名"})
+    assert all(response.status_code == 201 for response in (blank, existing, duplicate_one, duplicate_two))
+    payload = {"filename": "港安活动跟踪.xlsx", "dataBase64": base64.b64encode(xlsx_with_hongan_activity_sheets()).decode()}
+    preview = client.post("/api/imports/preview", headers=admin_headers, json=payload)
+    assert preview.status_code == 200, preview.text
+    body = preview.json()
+    assert body["importProfile"] == "hongan_activity"
+    assert body["totalRows"] == 5
+    assert body["honganActivity"]["counts"]["autoFill"] == 1
+    assert body["honganActivity"]["counts"]["unchanged"] == 1
+    assert body["honganActivity"]["counts"]["unmatched"] == 1
+    assert body["honganActivity"]["counts"]["ambiguous"] == 1
+    commit = client.post("/api/imports/commit", headers=admin_headers, json={"filename": payload["filename"], "importProfile": "hongan_activity", "confirmHonganActivity": True, "rows": body["activityRows"]})
+    assert commit.status_code == 200, commit.text
+    result = commit.json()
+    assert len(result["updated"]) == 1
+    assert any(item["name"] == "活动未匹配" for item in result["conflicts"])
+    assert any(item["name"] == "活动重名" for item in result["conflicts"])
+    blank_detail = client.get(f"/api/customers/{blank.json()['customer']['id']}", headers=admin_headers).json()["customer"]
+    existing_detail = client.get(f"/api/customers/{existing.json()['customer']['id']}", headers=admin_headers).json()["customer"]
+    assert blank_detail["hongan_advisor"] == "活动港安甲"
+    assert blank_detail["owner_id"] == "demo-manager"
+    assert existing_detail["hongan_advisor"] == "活动港安乙"
 
 
 def test_custom_fields_permission_grid_values_and_safe_deactivation():
