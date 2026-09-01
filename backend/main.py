@@ -1649,12 +1649,22 @@ def import_job_customer_ids(job: dict[str, Any], mode: str) -> list[str]:
     return list(dict.fromkeys(customer_ids))
 
 
+def is_hongan_activity_import_job(job: dict[str, Any], quality: dict[str, Any] | None = None) -> bool:
+    """Recognize legacy activity imports created before the profile was persisted."""
+    if (quality or {}).get("mode") == "hongan_activity":
+        return True
+    filename = simplify_text(str(job.get("filename", ""))).strip().lower()
+    return "港安icc" in filename and "客户数据跟踪" in filename
+
+
 def import_job_item(row: Any) -> dict[str, Any]:
     item = dict(row)
     try:
         item["dataQuality"] = json.loads(item.pop("data_quality_json") or "{}")
     except json.JSONDecodeError:
         item["dataQuality"] = {}
+    if is_hongan_activity_import_job(item, item["dataQuality"]):
+        item["dataQuality"] = {**item["dataQuality"], "mode": "hongan_activity", "profile": "hongan_activity", "legacyModeInferred": True}
     item["createdCustomerIds"] = import_job_customer_ids(item, "created")
     item["updatedCustomerIds"] = import_job_customer_ids(item, "updated")
     item["openedCustomerIds"] = import_job_customer_ids(item, "opened")
@@ -3135,6 +3145,8 @@ def rollback_import(job_id: str, user: dict[str, Any] = Depends(current_user)) -
             quality = json.loads(job["data_quality_json"] or "{}")
         except (TypeError, json.JSONDecodeError):
             quality = {}
+        if is_hongan_activity_import_job(dict(job), quality):
+            quality = {**quality, "mode": "hongan_activity", "profile": "hongan_activity"}
         if not created_ids and quality.get("mode") != "hongan_activity":
             raise HTTPException(422, "该导入记录没有可撤回的客户，可能是系统升级前的历史记录。")
         if quality.get("mode") == "hongan_activity":

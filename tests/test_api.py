@@ -869,6 +869,18 @@ def test_import_template_and_safe_rollback():
     assert protected_rollback.json()["protected"][0]["id"] == protected_id
 
 
+def test_legacy_hongan_activity_import_is_labeled_for_safe_rollback():
+    admin_headers, _ = login("admin", "admin123")
+    imported = client.post(
+        "/api/imports/commit", headers=admin_headers,
+        json={"filename": "港安ICC线下沙龙客户数据跟踪.xlsx", "ownerId": "unassigned", "allowUnidentifiedRows": True, "rows": [{"name": "旧港安批次客户"}]},
+    )
+    assert imported.status_code == 200, imported.text
+    job = next(item for item in client.get("/api/imports", headers=admin_headers).json()["items"] if item["id"] == imported.json()["jobId"])
+    assert job["dataQuality"]["mode"] == "hongan_activity"
+    assert job["dataQuality"]["legacyModeInferred"] is True
+
+
 def test_advisor_binding_rules_control_non_placement_defaults_and_manual_placement():
     manager_headers, manager = login("manager", "manager123")
     supervisor_headers, _ = login("supervisor", "supervisor123")
