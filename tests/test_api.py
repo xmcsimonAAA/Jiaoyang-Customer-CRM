@@ -427,6 +427,10 @@ def test_tw_snapshot_updates_status_and_does_not_create_duplicates():
     detail = client.get(f"/api/customers/{customer_id}", headers=admin_headers)
     assert detail.status_code == 200
     assert detail.json()["customer"]["account_status"] == "已开户"
+    assert detail.json()["customer"]["tw_code"] == "TW20260828001"
+    listed = client.get("/api/customers?search=tw20260828001", headers=admin_headers)
+    assert listed.status_code == 200, listed.text
+    assert customer_id in {item["id"] for item in listed.json()["items"]}
 
     third = client.post(
         "/api/imports/commit", headers=admin_headers,
@@ -438,6 +442,82 @@ def test_tw_snapshot_updates_status_and_does_not_create_duplicates():
     assert third.json()["created"] == []
     assert third.json()["updated"] == []
     assert third.json()["unchangedCount"] == 1
+    exported = client.get("/api/export/customers.csv", headers=admin_headers)
+    assert exported.status_code == 200, exported.text
+    export_text = exported.content.decode("utf-8-sig")
+    assert "TW唯一编号（TW）" in export_text
+    assert "TW20260828001" in export_text
+
+
+def test_import_batches_record_deltas_and_support_drilldown_filters():
+    admin_headers, _ = login("admin", "admin123")
+    first = client.post(
+        "/api/imports/commit", headers=admin_headers,
+        json={"filename": "批次-第一周.xlsx", "mode": "snapshot", "ownerId": "unassigned", "allowUnidentifiedRows": True, "rows": [
+            {"twCode": "TW20269999001", "name": "批次客户", "accountStatus": "未开户"},
+        ]},
+    )
+    assert first.status_code == 200, first.text
+    second = client.post(
+        "/api/imports/commit", headers=admin_headers,
+        json={"filename": "批次-第二周.xlsx", "mode": "snapshot", "ownerId": "unassigned", "allowUnidentifiedRows": True, "rows": [
+            {"twCode": "TW20269999001", "name": "批次客户", "accountStatus": "已开户"},
+        ]},
+    )
+    assert second.status_code == 200, second.text
+    second_body = second.json()
+    assert second_body["openedCount"] == 1
+    job = next(item for item in client.get("/api/imports", headers=admin_headers).json()["items"] if item["id"] == second_body["jobId"])
+    assert job["updatedCustomerIds"] == [first.json()["created"][0]["id"]]
+    assert job["openedCustomerIds"] == job["updatedCustomerIds"]
+    filtered = client.get(f"/api/customers?importJobId={second_body['jobId']}&importJobMode=opened", headers=admin_headers)
+    assert filtered.status_code == 200, filtered.text
+    assert filtered.json()["total"] == 1
+    dashboard = client.get("/api/dashboard", headers=admin_headers)
+    assert dashboard.status_code == 200, dashboard.text
+    assert second_body["jobId"] in {job["id"] for job in dashboard.json()["importActivity"]["recentJobs"]}
+
+
+def test_asset_import_updates_existing_tw_custom_field_and_merges_duplicate_rows():
+    admin_headers, _ = login("admin", "admin123")
+    field = client.post(
+        "/api/customer-fields", headers=admin_headers,
+        json={"label": "券商账户资产（USD）", "fieldType": "number", "options": []},
+    )
+    assert field.status_code == 201, field.text
+    field_id = field.json()["field"]["id"]
+    preview = client.post(
+        "/api/imports/preview", headers=admin_headers,
+        json={"filename": "SXY客户信息 20260827.csv", "dataBase64": base64.b64encode("客户编码,客戶姓名,客户权益资产（基币为USD，汇率@7.8）\nTW20260831001,资产客户,100".encode()).decode()},
+    )
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["importProfile"] == "asset"
+    assert preview.json()["suggestedMapping"]["twCode"] == "客户编码"
+    assert preview.json()["suggestedCustomMapping"][field_id] == "客户权益资产（基币为USD，汇率@7.8）"
+    master = client.post(
+        "/api/imports/commit", headers=admin_headers,
+        json={"filename": "主表.xlsx", "mode": "snapshot", "ownerId": "unassigned", "allowUnidentifiedRows": True, "rows": [
+            {"twCode": "TW20260831001", "name": "资产客户", "accountStatus": "已开户"},
+        ]},
+    )
+    assert master.status_code == 200, master.text
+    asset = client.post(
+        "/api/imports/commit", headers=admin_headers,
+        json={"filename": "资产表.xlsx", "importProfile": "asset", "ownerId": "unassigned", "rows": [
+            {"twCode": "TW20260831001", "name": "资产客户", "customValues": {field_id: "100.5"}},
+            {"twCode": "TW20260831001", "name": "资产客户", "customValues": {field_id: "20"}},
+            {"twCode": "#N/A", "name": "无法识别"},
+        ]},
+    )
+    assert asset.status_code == 200, asset.text
+    body = asset.json()
+    assert body["profile"] == "asset"
+    assert len(body["updated"]) == 1
+    assert body["conflicts"] == []
+    assert len(body["errors"]) == 1
+    customer_id = master.json()["created"][0]["id"]
+    detail = client.get(f"/api/customers/{customer_id}", headers=admin_headers).json()["customer"]
+    assert detail["custom_values"][field_id] == "120.5"
 
 
 def test_import_preview_converts_traditional_chinese_to_simplified():

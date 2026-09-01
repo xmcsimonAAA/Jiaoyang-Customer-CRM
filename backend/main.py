@@ -153,6 +153,7 @@ def init_sqlite_db() -> None:
                 created_by TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
+                import_job_id TEXT,
                 archived_at TEXT,
                 merged_into_id TEXT,
                 version INTEGER NOT NULL DEFAULT 1,
@@ -261,6 +262,8 @@ def init_sqlite_db() -> None:
                 created_at TEXT NOT NULL,
                 data_quality_json TEXT NOT NULL DEFAULT '{}',
                 created_customer_ids_json TEXT NOT NULL DEFAULT '[]',
+                updated_customer_ids_json TEXT NOT NULL DEFAULT '[]',
+                opened_customer_ids_json TEXT NOT NULL DEFAULT '[]',
                 rolled_back_at TEXT,
                 rolled_back_by TEXT
             );
@@ -343,6 +346,10 @@ def init_sqlite_db() -> None:
             conn.execute("ALTER TABLE import_jobs ADD COLUMN data_quality_json TEXT NOT NULL DEFAULT '{}'")
         if "created_customer_ids_json" not in import_job_columns:
             conn.execute("ALTER TABLE import_jobs ADD COLUMN created_customer_ids_json TEXT NOT NULL DEFAULT '[]'")
+        if "updated_customer_ids_json" not in import_job_columns:
+            conn.execute("ALTER TABLE import_jobs ADD COLUMN updated_customer_ids_json TEXT NOT NULL DEFAULT '[]'")
+        if "opened_customer_ids_json" not in import_job_columns:
+            conn.execute("ALTER TABLE import_jobs ADD COLUMN opened_customer_ids_json TEXT NOT NULL DEFAULT '[]'")
         if "rolled_back_at" not in import_job_columns:
             conn.execute("ALTER TABLE import_jobs ADD COLUMN rolled_back_at TEXT")
         if "rolled_back_by" not in import_job_columns:
@@ -365,10 +372,12 @@ def init_sqlite_db() -> None:
             "broker_deposit_amount": "REAL NOT NULL DEFAULT 0",
             "capital_destination": "TEXT NOT NULL DEFAULT ''",
             "wechat_nickname": "TEXT NOT NULL DEFAULT ''",
+            "import_job_id": "TEXT",
         }
         for column, definition in migrations.items():
             if column not in customer_columns:
                 conn.execute(f"ALTER TABLE customers ADD COLUMN {column} {definition}")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_customers_import_job ON customers(import_job_id, archived_at)")
 
 
 def init_postgres_db() -> None:
@@ -505,6 +514,7 @@ class ImportCommitPayload(BaseModel):
     ownerId: str | None = None
     rows: list[dict[str, Any]]
     mode: str = "append"
+    importProfile: str = "standard"
     advisorAliasMappings: dict[str, str] = Field(default_factory=dict)
     allowUnidentifiedRows: bool = False
 
@@ -1028,8 +1038,30 @@ def attach_collaborators(conn: sqlite3.Connection, customers: list[dict[str, Any
     return customers
 
 
+def attach_tw_identifiers(conn: sqlite3.Connection, customers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Expose the broker's canonical TW identifier alongside each customer row."""
+    if not customers:
+        return customers
+    customer_map = {item["id"]: item for item in customers}
+    for item in customers:
+        item["tw_code"] = ""
+    placeholders = ",".join("?" for _ in customer_map)
+    rows = conn.execute(
+        f"""SELECT customer_id, display_value, normalized_value
+        FROM customer_identifiers
+        WHERE kind='tw' AND customer_id IN ({placeholders})
+        ORDER BY id""",
+        tuple(customer_map),
+    ).fetchall()
+    for row in rows:
+        customer = customer_map.get(row["customer_id"])
+        if customer and not customer["tw_code"]:
+            customer["tw_code"] = row["display_value"] or row["normalized_value"]
+    return customers
+
+
 def attach_customer_relations(conn: sqlite3.Connection, customers: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return attach_collaborators(conn, attach_custom_values(conn, customers))
+    return attach_collaborators(conn, attach_tw_identifiers(conn, attach_custom_values(conn, customers)))
 
 
 def access_clause(user: dict[str, Any], alias: str = "c") -> tuple[str, tuple[Any, ...]]:
@@ -1174,14 +1206,14 @@ def normalize_snapshot_date(value: Any) -> str:
     return date_value
 
 
-def save_holding_snapshots(conn: sqlite3.Connection, customer_id: str, snapshots: list[dict[str, Any]], user: dict[str, Any]) -> None:
+def save_holding_snapshots(conn: sqlite3.Connection, customer_id: str, snapshots: list[dict[str, Any]], user: dict[str, Any], allow_zero: bool = False) -> None:
     for raw in snapshots:
         try:
             quantity = float(clean_import_cell(raw.get("quantity", 0)) or 0)
             market_value = float(clean_import_cell(raw.get("marketValue", raw.get("market_value", 0))) or 0)
         except (TypeError, ValueError) as exc:
             raise HTTPException(422, "持仓数量和市值必须是数字。") from exc
-        if quantity == 0 and market_value == 0:
+        if quantity == 0 and market_value == 0 and not allow_zero:
             continue
         snapshot_date = normalize_snapshot_date(raw.get("snapshotDate", raw.get("snapshot_date")))
         security_name = str(raw.get("securityName", raw.get("security_name", "二级市场持仓"))).strip() or "二级市场持仓"
@@ -1288,15 +1320,15 @@ def create_customer_record(conn: sqlite3.Connection, payload: dict[str, Any], ow
         "closed_at": payload.get("closedAt", payload.get("closed_at")) or None,
         "hongan_advisor": str(payload.get("hkAdvisor", payload.get("hongan_advisor", ""))).strip(),
         "source_advisor_label": str(payload.get("sourceAdvisorLabel", payload.get("source_advisor_label", ""))).strip(),
-        "notes": str(payload.get("notes", "")).strip(), "created_by": user["id"], "created_at": created_at, "updated_at": created_at,
+        "notes": str(payload.get("notes", "")).strip(), "created_by": user["id"], "created_at": created_at, "updated_at": created_at, "import_job_id": None,
     }
     conn.execute(
         """INSERT INTO customers(id, customer_code, name, phone, email, wechat_nickname, company, source, source_detail, stage, priority, owner_id, owner_name, owner_team,
         account_status, account_broker, account_opened_at, broker_deposit_amount, capital_destination, intent_status, placement_status, target_batch_id, intent_amount, funded_amount, actual_amount, lost_reason, closed_at, hongan_advisor, source_advisor_label,
-        notes, created_by, created_at, updated_at)
+        notes, created_by, created_at, updated_at, import_job_id)
         VALUES (:id, :customer_code, :name, :phone, :email, :wechat_nickname, :company, :source, :source_detail, :stage, :priority, :owner_id, :owner_name, :owner_team,
         :account_status, :account_broker, :account_opened_at, :broker_deposit_amount, :capital_destination, :intent_status, :placement_status, :target_batch_id, :intent_amount, :funded_amount, :actual_amount, :lost_reason, :closed_at, :hongan_advisor, :source_advisor_label,
-        :notes, :created_by, :created_at, :updated_at)""", record,
+        :notes, :created_by, :created_at, :updated_at, :import_job_id)""", record,
     )
     add_identifiers(conn, customer_id, phone, email)
     add_tw_identifier(conn, customer_id, tw_code)
@@ -1568,6 +1600,8 @@ def dashboard(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
             ORDER BY batched DESC, closed DESC, total DESC
             LIMIT 4""", params,
         ).fetchall()
+        can_view_import_history = bool(user["canImportCustomers"] or user["canManageCrmPermissions"])
+        import_rows = conn.execute("SELECT * FROM import_jobs ORDER BY created_at DESC LIMIT 100").fetchall() if can_view_import_history else []
     summary_data = {key: float(summary[key] or 0) if key.endswith("_amount") else int(summary[key] or 0) for key in summary.keys()}
     risk_data = {key: int(risk[key] or 0) for key in risk.keys()}
     quality_data = {key: int(quality[key] or 0) for key in quality.keys()}
@@ -1587,11 +1621,82 @@ def dashboard(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
         "quality": quality_data,
         "activityTrend": activity_trend,
         "teams": [dict(row) for row in teams],
+        "importActivity": import_activity_summary(import_rows) if can_view_import_history else None,
     }
 
 
 def customer_search_terms(value: str) -> list[str]:
     return [term for term in re.split(r"[\s,，;；]+", value.strip()) if term][:6]
+
+
+def import_job_customer_ids(job: dict[str, Any], mode: str) -> list[str]:
+    key = {
+        "created": "created_customer_ids_json",
+        "updated": "updated_customer_ids_json",
+        "opened": "opened_customer_ids_json",
+    }.get(mode)
+    keys = [key] if key else ["created_customer_ids_json", "updated_customer_ids_json"]
+    customer_ids: list[str] = []
+    for item_key in keys:
+        if not item_key:
+            continue
+        try:
+            values = json.loads(job.get(item_key) or "[]")
+        except (TypeError, json.JSONDecodeError):
+            values = []
+        customer_ids.extend(str(value) for value in values if value)
+    return list(dict.fromkeys(customer_ids))
+
+
+def import_job_item(row: Any) -> dict[str, Any]:
+    item = dict(row)
+    try:
+        item["dataQuality"] = json.loads(item.pop("data_quality_json") or "{}")
+    except json.JSONDecodeError:
+        item["dataQuality"] = {}
+    item["createdCustomerIds"] = import_job_customer_ids(item, "created")
+    item["updatedCustomerIds"] = import_job_customer_ids(item, "updated")
+    item["openedCustomerIds"] = import_job_customer_ids(item, "opened")
+    item["openedCount"] = len(item["openedCustomerIds"])
+    item.pop("created_customer_ids_json", None)
+    item.pop("updated_customer_ids_json", None)
+    item.pop("opened_customer_ids_json", None)
+    return item
+
+
+def import_activity_summary(rows: list[Any]) -> dict[str, Any]:
+    """Aggregate true import deltas by week; full snapshots never inflate new-customer counts."""
+    today = datetime.now(timezone.utc).date()
+    first_week = today - timedelta(days=today.weekday() + 7 * 7)
+    buckets = {}
+    for offset in range(8):
+        week_start = first_week + timedelta(days=offset * 7)
+        buckets[week_start.isoformat()] = {
+            "weekStart": week_start.isoformat(), "label": week_start.strftime("%m/%d"),
+            "created": 0, "opened": 0, "updated": 0, "batches": 0,
+        }
+    recent_jobs = []
+    for row in rows:
+        item = import_job_item(row)
+        if item.get("rolled_back_at"):
+            continue
+        try:
+            imported_on = datetime.fromisoformat(str(item["created_at"]).replace("Z", "+00:00")).date()
+        except (KeyError, TypeError, ValueError):
+            continue
+        week_start = imported_on - timedelta(days=imported_on.weekday())
+        bucket = buckets.get(week_start.isoformat())
+        if bucket:
+            bucket["created"] += int(item.get("created_count") or 0)
+            bucket["opened"] += int(item.get("openedCount") or 0)
+            bucket["updated"] += int(item.get("updated_count") or 0)
+            bucket["batches"] += 1
+        recent_jobs.append({
+            "id": item["id"], "filename": item["filename"], "createdAt": item["created_at"],
+            "created": int(item.get("created_count") or 0), "opened": int(item.get("openedCount") or 0),
+            "updated": int(item.get("updated_count") or 0),
+        })
+    return {"weeks": list(buckets.values()), "recentJobs": recent_jobs[:6]}
 
 
 @app.get("/api/customers")
@@ -1600,6 +1705,7 @@ def list_customers(
     workflow: str = "", metric: str = "", batch_id: str = Query("", alias="batchId"), placement_status: str = Query("", alias="placementStatus"),
     account_status: str = Query("", alias="accountStatus"), intent_status: str = Query("", alias="intentStatus"),
     source: str = "", hongan_advisor: str = Query("", alias="honganAdvisor"), contact_state: str = Query("", alias="contactState"),
+    import_job_id: str = Query("", alias="importJobId"), import_job_mode: str = Query("all", alias="importJobMode"),
     page: int = Query(1, ge=1), page_size: int = Query(30, alias="pageSize", ge=1, le=100),
     user: dict[str, Any] = Depends(current_user),
 ) -> dict[str, Any]:
@@ -1610,8 +1716,13 @@ def list_customers(
         filters.append("""(
             c.name LIKE ? OR c.wechat_nickname LIKE ? OR c.phone LIKE ? OR c.email LIKE ? OR c.company LIKE ?
             OR c.customer_code LIKE ? OR c.owner_name LIKE ? OR c.source_advisor_label LIKE ? OR c.hongan_advisor LIKE ?
+            OR EXISTS (
+                SELECT 1 FROM customer_identifiers tw_i
+                WHERE tw_i.customer_id = c.id AND tw_i.kind = 'tw'
+                AND LOWER(tw_i.normalized_value) LIKE LOWER(?)
+            )
         )""")
-        values.extend([f"%{term}%"] * 9)
+        values.extend([f"%{term}%"] * 9 + [f"%{term}%"])
     if stage:
         filters.append("c.stage = ?")
         values.append(stage)
@@ -1660,6 +1771,20 @@ def list_customers(
         filters.append("TRIM(c.phone) = '' AND TRIM(c.email) = '' AND TRIM(c.wechat_nickname) = ''")
     if contact_state == "wechat_only":
         filters.append("TRIM(c.phone) = '' AND TRIM(c.email) = '' AND TRIM(c.wechat_nickname) <> ''")
+    if import_job_id:
+        if not user["canImportCustomers"] and not user["canManageCrmPermissions"]:
+            raise HTTPException(403, "您的账号未开通导入批次查看权限。")
+        if import_job_mode not in {"all", "created", "updated", "opened"}:
+            raise HTTPException(422, "导入批次筛选方式无效。")
+        with db() as conn:
+            job = conn.execute("SELECT * FROM import_jobs WHERE id = ?", (import_job_id,)).fetchone()
+        customer_ids = import_job_customer_ids(dict(job), import_job_mode) if job else []
+        if customer_ids:
+            placeholders = ", ".join("?" for _ in customer_ids)
+            filters.append(f"c.id IN ({placeholders})")
+            values.extend(customer_ids)
+        else:
+            filters.append("1 = 0")
     where = " AND ".join(filters)
     with db() as conn:
         total = conn.execute(f"SELECT COUNT(*) FROM customers c WHERE {where}", values).fetchone()[0]
@@ -2043,8 +2168,8 @@ HEADER_ALIASES = {
     "source": ["客户来源", "来源", "渠道"], "sourceDetail": ["来源明细", "活动名称", "渠道名称"],
     "stage": ["客户阶段", "当前阶段", "生命周期", "状态"], "priority": ["优先级", "客户级别"],
     "accountStatus": ["开户状态", "是否完成开户", "港券开户状态", "证券开户状态"], "accountBroker": ["开户券商", "香港券商", "券商", "开户证券"], "accountOpenedAt": ["开户日期", "注册日期"],
-    "twCode": ["TW编号", "TW客户编号", "客户唯一编号", "客户编号"],
-    "brokerDepositAmount": ["入金金额/USD", "入金金额", "港券入金金额"], "capitalDestination": ["资金流向", "资金去向"],
+    "twCode": ["TW编号", "TW客户编号", "客户唯一编号", "客户编号", "客户编码", "客户代码", "客户号"],
+    "brokerDepositAmount": ["入金金额/USD", "入金金额", "港券入金金额", "券商账户资产", "客户权益资产", "账户权益资产", "账户资产", "权益资产"], "capitalDestination": ["资金流向", "资金去向"],
     "hkAdvisor": ["港安顾问"], "sourceAdvisorLabel": ["骄阳顾问", "商务顾问", "客户顾问"],
     "intentStatus": ["定增意向", "意向状态", "顾问判断"], "placementStatus": ["定增推进", "节点进度", "定增状态"],
     "intentAmount": ["意向金额", "意向额度", "意向额度(USD)"], "fundedAmount": ["到账金额", "到账金额(USD)"],
@@ -2224,16 +2349,41 @@ def detect_tw_header(headers: list[str], rows: list[list[Any]]) -> str | None:
     return None
 
 
+def asset_header_matches(header: Any) -> bool:
+    normalized = simplify_text(header).replace(" ", "").replace("　", "")
+    return "资产" in normalized and ("权益" in normalized or "账户" in normalized)
+
+
+def holding_header_matches(header: Any) -> bool:
+    normalized = simplify_text(header).replace(" ", "").replace("　", "")
+    return "持仓" in normalized and ("数量" in normalized or "股数" in normalized or "市值" in normalized)
+
+
+def inferred_snapshot_date(filename: str = "", headers: list[str] | None = None) -> str:
+    source = " ".join([filename, *list(headers or [])])
+    full_date = re.search(r"(20\d{2})[./-]?(\d{1,2})[./-]?(\d{1,2})", source)
+    if full_date:
+        return f"{int(full_date.group(1)):04d}-{int(full_date.group(2)):02d}-{int(full_date.group(3)):02d}"
+    compact_date = re.search(r"(?<!\d)(\d{2})(\d{2})(?!\d)", source)
+    if compact_date:
+        return f"{datetime.now().year:04d}-{int(compact_date.group(1)):02d}-{int(compact_date.group(2)):02d}"
+    short_date = re.search(r"(?<!\d)(\d{1,2})[./-](\d{1,2})(?!\d)", source)
+    if short_date:
+        return f"{datetime.now().year:04d}-{int(short_date.group(1)):02d}-{int(short_date.group(2)):02d}"
+    return datetime.now().date().isoformat()
+
+
 def split_advisor_label(value: Any) -> list[str]:
     label = str(clean_import_cell(value) or "").strip()
     return [item.strip() for item in re.split(r"[+＋、,，/／;；]+", label) if item.strip()]
 
 
-def detect_holding_snapshots(headers: list[str]) -> list[dict[str, str]]:
-    year_matches = re.findall(r"(20\d{2})[./-]\d{1,2}[./-]\d{1,2}", " ".join(headers))
+def detect_holding_snapshots(headers: list[str], filename: str = "") -> list[dict[str, str]]:
+    year_matches = re.findall(r"(20\d{2})[./-]\d{1,2}[./-]\d{1,2}", " ".join([filename, *headers]))
     if not year_matches:
-        return []
-    year = year_matches[-1]
+        year = str(datetime.now().year)
+    else:
+        year = year_matches[-1]
     grouped: dict[str, dict[str, str]] = {}
     for header in headers:
         match = re.search(r"(?P<month>\d{1,2})[./-](?P<day>\d{1,2}).*(?P<metric>持仓数量|持仓股数|持仓市值)", header)
@@ -2245,10 +2395,22 @@ def detect_holding_snapshots(headers: list[str]) -> list[dict[str, str]]:
             item["marketValueHeader"] = header
         else:
             item["quantityHeader"] = header
+    if not grouped:
+        quantity_header = next((header for header in headers if "持仓" in simplify_text(header) and ("数量" in simplify_text(header) or "股数" in simplify_text(header))), None)
+        market_value_header = next((header for header in headers if "持仓" in simplify_text(header) and "市值" in simplify_text(header)), None)
+        if quantity_header or market_value_header:
+            snapshot_date = inferred_snapshot_date(filename, headers)
+            grouped[snapshot_date] = {
+                "snapshotDate": snapshot_date,
+                "securityName": "二级市场持仓",
+                "sourceLabel": filename or "持仓表导入",
+                **({"quantityHeader": quantity_header} if quantity_header else {}),
+                **({"marketValueHeader": market_value_header} if market_value_header else {}),
+            }
     return [grouped[key] for key in sorted(grouped)]
 
 
-def import_diagnostics(headers: list[str], rows: list[list[Any]], mapping: dict[str, str]) -> dict[str, Any]:
+def import_diagnostics(headers: list[str], rows: list[list[Any]], mapping: dict[str, str], filename: str = "") -> dict[str, Any]:
     tw_header = detect_tw_header(headers, rows)
     if tw_header:
         mapping["twCode"] = tw_header
@@ -2272,10 +2434,29 @@ def import_diagnostics(headers: list[str], rows: list[list[Any]], mapping: dict[
         1 for row in normalized_rows
         if (str(row.get("name", "")).strip() or str(row.get("wechatNickname", "")).strip()) and not normalize_phone(str(row.get("phone", ""))) and not normalize_email(str(row.get("email", ""))) and not normalize_tw_code(row.get("twCode", ""))
     )
+    tw_counts: dict[str, int] = {}
+    for row in normalized_rows:
+        code = normalize_tw_code(row.get("twCode", ""))
+        if code:
+            tw_counts[code] = tw_counts.get(code, 0) + 1
+    duplicate_tw_rows = sum(max(0, count - 1) for count in tw_counts.values())
     advisor_header = mapping.get("sourceAdvisorLabel")
     labels = sorted({str(clean_import_cell(row.get(advisor_header, "")) or "") for row in value_rows if clean_import_cell(row.get(advisor_header, ""))}) if advisor_header else []
     user_names = {item["name"] for item in platform_users(True)}
     unresolved = sorted({name for label in labels for name in split_advisor_label(label) if name not in user_names})
+    snapshots = detect_holding_snapshots(headers, filename)
+    asset_table = any(asset_header_matches(header) for header in headers)
+    holding_table = bool(snapshots) or any(holding_header_matches(header) for header in headers)
+    if holding_table and not mapping.get("accountStatus"):
+        profile = "holding"
+    elif asset_table and not mapping.get("accountStatus"):
+        profile = "asset"
+    else:
+        profile = "hongan_master" if mapping.get("hkAdvisor") and mapping.get("sourceAdvisorLabel") and mapping.get("accountStatus") else "standard"
+    if profile == "asset":
+        # Asset values belong to the dedicated custom field, not the legacy
+        # deposit amount column used by the customer master table.
+        mapping.pop("brokerDepositAmount", None)
     warnings: list[dict[str, Any]] = []
     if placeholder_count:
         warnings.append({"code": "placeholder", "message": "已识别 /、#NAME? 等占位值，导入时会按空值处理。", "count": placeholder_count})
@@ -2288,14 +2469,18 @@ def import_diagnostics(headers: list[str], rows: list[list[Any]], mapping: dict[
     if unresolved:
         warnings.append({"code": "unresolved_advisor", "message": "以下历史顾问未能匹配当前 MuskZoom 账号，需要管理员后续映射。", "labels": unresolved})
     if tw_header:
-        warnings.append({"code": "tw_snapshot", "message": "已识别 TW 编号，将按全量快照合并：已有客户更新券商状态，新 TW 才新增。", "header": tw_header})
-    snapshots = detect_holding_snapshots(headers)
+        message = {
+            "asset": "已识别券商资产表：按 TW 编号更新已有客户的资产字段，不会新建客户。",
+            "holding": "已识别持仓表：按 TW 编号写入持仓快照，不会新建客户。",
+        }.get(profile, "已识别 TW 编号，将按全量快照合并：已有客户更新券商状态，新 TW 才新增。")
+        warnings.append({"code": "tw_snapshot", "message": message, "header": tw_header})
+    if duplicate_tw_rows and profile in {"asset", "holding"}:
+        warnings.append({"code": "duplicate_tw", "message": f"检测到 {duplicate_tw_rows} 行重复 TW；资产或持仓导入时会按 TW 合并后更新。", "count": duplicate_tw_rows})
     if snapshots:
         warnings.append({"code": "holding_snapshots", "message": f"已识别 {len(snapshots)} 个历史持仓快照日期，将作为独立历史记录导入。", "count": len(snapshots)})
-    profile = "hongan_master" if mapping.get("hkAdvisor") and mapping.get("sourceAdvisorLabel") and mapping.get("accountStatus") else "standard"
     return {
-        "profile": profile, "warnings": warnings, "advisorLabels": labels[:100], "unresolvedAdvisorAliases": unresolved,
-        "holdingSnapshots": snapshots, "twHeader": tw_header, "dataQuality": {"placeholderCells": placeholder_count, "missingDisplayNameRows": missing_names, "nicknameFallbackRows": nickname_fallback_count, "unidentifiedRows": unidentified_rows, "hasTwSnapshot": bool(tw_header)},
+        "profile": profile, "importProfile": profile, "warnings": warnings, "advisorLabels": labels[:100], "unresolvedAdvisorAliases": unresolved,
+        "holdingSnapshots": snapshots, "twHeader": tw_header, "dataQuality": {"placeholderCells": placeholder_count, "missingDisplayNameRows": missing_names, "nicknameFallbackRows": nickname_fallback_count, "unidentifiedRows": unidentified_rows, "duplicateTwRows": duplicate_tw_rows, "hasTwSnapshot": bool(tw_header), "importProfile": profile},
     }
 
 
@@ -2366,6 +2551,92 @@ def resolve_import_assignment(conn: sqlite3.Connection, row: dict[str, Any], fal
     return owner, values
 
 
+def numeric_import_value(value: Any) -> float:
+    cleaned = clean_import_cell(value)
+    if cleaned in (None, ""):
+        return 0.0
+    return float(str(cleaned).replace(",", "").replace("$", "").strip())
+
+
+def merge_supplemental_rows(rows: list[dict[str, Any]], profile: str) -> tuple[list[dict[str, Any]], int]:
+    """Collapse repeated TW rows for asset/holding files before updating customers."""
+    if profile not in {"asset", "holding"}:
+        return rows, 0
+    merged: dict[str, dict[str, Any]] = {}
+    prepared: list[dict[str, Any]] = []
+    duplicate_count = 0
+    for raw in rows:
+        normalized = normalize_import_row(raw)
+        code = normalize_tw_code(normalized.get("twCode", ""))
+        if not code:
+            prepared.append(raw)
+            continue
+        if code not in merged:
+            merged[code] = dict(raw)
+            prepared.append(merged[code])
+            continue
+        duplicate_count += 1
+        target = merged[code]
+        if not str(target.get("name", "") or "").strip() and str(raw.get("name", "") or "").strip():
+            target["name"] = raw["name"]
+        target_custom = target.setdefault("customValues", {})
+        source_custom = raw.get("customValues") or {}
+        if profile == "asset":
+            for field_id, value in source_custom.items():
+                if value in (None, ""):
+                    continue
+                try:
+                    target_custom[field_id] = numeric_import_value(target_custom.get(field_id, 0)) + numeric_import_value(value)
+                except (TypeError, ValueError):
+                    target_custom[field_id] = value
+        target_snapshots = target.setdefault("holdingSnapshots", [])
+        for source_snapshot in raw.get("holdingSnapshots") or []:
+            match = next((item for item in target_snapshots if item.get("snapshotDate") == source_snapshot.get("snapshotDate") and item.get("securityName") == source_snapshot.get("securityName")), None)
+            if not match:
+                target_snapshots.append(dict(source_snapshot))
+                continue
+            for key in ("quantity", "marketValue"):
+                try:
+                    match[key] = numeric_import_value(match.get(key, 0)) + numeric_import_value(source_snapshot.get(key, 0))
+                except (TypeError, ValueError):
+                    pass
+    return prepared, duplicate_count
+
+
+def apply_import_supplemental_updates(conn: sqlite3.Connection, customer_id: str, row: dict[str, Any], user: dict[str, Any]) -> bool:
+    """Update custom asset fields and holding snapshots, reporting whether values changed."""
+    changed = False
+    custom_values = row.get("customValues") or {}
+    if custom_values:
+        placeholders = ",".join("?" for _ in custom_values)
+        fields = conn.execute(f"SELECT * FROM customer_fields WHERE id IN ({placeholders})", tuple(custom_values)).fetchall()
+        field_map = {field["id"]: field for field in fields}
+        if len(field_map) != len(custom_values):
+            raise HTTPException(422, "包含不存在的自定义字段，请刷新后重试。")
+        timestamp = now_iso()
+        for field_id, raw_value in custom_values.items():
+            value = normalize_custom_value(field_map[field_id], raw_value)
+            previous = conn.execute("SELECT value_text FROM customer_field_values WHERE customer_id=? AND field_id=?", (customer_id, field_id)).fetchone()
+            if not previous or previous["value_text"] != value:
+                changed = True
+            conn.execute(
+                "INSERT INTO customer_field_values(customer_id, field_id, value_text, updated_by, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(customer_id, field_id) DO UPDATE SET value_text=excluded.value_text, updated_by=excluded.updated_by, updated_at=excluded.updated_at",
+                (customer_id, field_id, value, user["id"], timestamp),
+            )
+    for snapshot in row.get("holdingSnapshots") or []:
+        quantity = float(clean_import_cell(snapshot.get("quantity", 0)) or 0)
+        market_value = float(clean_import_cell(snapshot.get("marketValue", 0)) or 0)
+        if quantity == 0 and market_value == 0:
+            continue
+        snapshot_date = normalize_snapshot_date(snapshot.get("snapshotDate"))
+        security_name = str(snapshot.get("securityName", "二级市场持仓")).strip() or "二级市场持仓"
+        previous = conn.execute("SELECT quantity, market_value FROM customer_holding_snapshots WHERE customer_id=? AND snapshot_date=? AND security_name=?", (customer_id, snapshot_date, security_name)).fetchone()
+        if not previous or float(previous["quantity"]) != quantity or float(previous["market_value"]) != market_value:
+            changed = True
+        save_holding_snapshots(conn, customer_id, [{**snapshot, "snapshotDate": snapshot_date, "securityName": security_name, "quantity": quantity, "marketValue": market_value}], user, allow_zero=True)
+    return changed
+
+
 def parse_import_file(filename: str, content: bytes) -> tuple[list[str], list[list[Any]], str]:
     if filename.lower().endswith(".csv"):
         text = content.decode("utf-8-sig")
@@ -2434,10 +2705,12 @@ def import_preview(payload: ImportPreviewPayload, user: dict[str, Any] = Depends
     custom_mapping = {}
     for field in custom_fields:
         match = next((header for header in headers if simplify_text(header).strip().lower() == simplify_text(field["label"]).strip().lower()), None)
+        if not match and simplify_text(field["label"]).strip() == "券商账户资产（USD）":
+            match = next((header for header in headers if asset_header_matches(header)), None)
         if match:
             custom_mapping[field["id"]] = match
     preview_rows = [{headers[i]: (row[i] if i < len(row) and row[i] is not None else "") for i in range(len(headers))} for row in raw_rows[:IMPORT_ROW_LIMIT]]
-    diagnostics = import_diagnostics(headers, raw_rows[:IMPORT_ROW_LIMIT], mapping)
+    diagnostics = import_diagnostics(headers, raw_rows[:IMPORT_ROW_LIMIT], mapping, payload.filename)
     return {"headers": headers, "suggestedMapping": mapping, "suggestedCustomMapping": custom_mapping, "customerFields": [field_dict(row) for row in custom_fields], "rows": preview_rows, "totalRows": len(raw_rows), "truncated": len(raw_rows) > IMPORT_ROW_LIMIT, "sheetName": sheet_name, "textNormalization": "繁体中文已统一转换为简体中文", **diagnostics}
 
 
@@ -2450,6 +2723,14 @@ def import_commit(payload: ImportCommitPayload, user: dict[str, Any] = Depends(c
     mode = str(payload.mode or "append").strip().lower()
     if mode not in {"append", "snapshot"}:
         raise HTTPException(422, "导入模式无效。")
+    profile = str(payload.importProfile or "standard").strip().lower()
+    if profile not in {"standard", "hongan_master", "asset", "holding"}:
+        profile = "standard"
+    if profile == "standard" and payload.rows:
+        if any(row.get("holdingSnapshots") for row in payload.rows) and not any(row.get("accountStatus") for row in payload.rows):
+            profile = "holding"
+        elif any(row.get("customValues") for row in payload.rows) and not any(row.get("accountStatus") for row in payload.rows):
+            profile = "asset"
     if user["canManageAssignments"] and not payload.ownerId:
         raise HTTPException(422, "请选择未匹配顾问的默认主负责人。")
     owner = owner_for_request(payload.ownerId, user)
@@ -2458,17 +2739,20 @@ def import_commit(payload: ImportCommitPayload, user: dict[str, Any] = Depends(c
     users_by_id = {item["id"]: item for item in platform_users_all}
     if payload.advisorAliasMappings:
         require_supervisor(user)
+    source_row_count = len(payload.rows)
+    import_rows, merged_duplicate_count = merge_supplemental_rows(payload.rows, profile)
     created, updated, conflicts, errors = [], [], [], []
+    updated_customer_ids, opened_customer_ids = [], []
     unchanged_count = 0
-    quality = {"placeholderRowsSkipped": 0, "nicknameFallbackRows": 0, "unidentifiedRowsImported": 0, "twMatchedRows": 0, "twNewRows": 0, "twDuplicateRows": 0, "twMissingRows": 0}
-    has_tw_snapshot = mode == "snapshot" or any(normalize_tw_code(row.get("twCode", "")) for row in payload.rows)
+    quality = {"placeholderRowsSkipped": 0, "nicknameFallbackRows": 0, "unidentifiedRowsImported": 0, "twMatchedRows": 0, "twNewRows": 0, "twDuplicateRows": 0, "twMissingRows": 0, "duplicateTwRowsMerged": merged_duplicate_count}
+    has_tw_snapshot = mode == "snapshot" or any(normalize_tw_code(row.get("twCode", "")) for row in import_rows)
     seen_tw_codes: set[str] = set()
     with db() as conn:
         if payload.advisorAliasMappings:
             save_advisor_alias_mappings(conn, payload.advisorAliasMappings, user, users_by_id)
             audit(conn, user, "advisor_alias_mappings.updated", "advisor_alias_mapping", "import", {"aliases": sorted(payload.advisorAliasMappings)})
         advisor_users = advisor_alias_users(conn, users_by_name, users_by_id)
-        for index, raw_row in enumerate(payload.rows, start=1):
+        for index, raw_row in enumerate(import_rows, start=1):
             row = normalize_import_row(raw_row)
             try:
                 require_hongan_advisor_permission(user, row.get("hkAdvisor", row.get("hongan_advisor", "")))
@@ -2476,6 +2760,33 @@ def import_commit(payload: ImportCommitPayload, user: dict[str, Any] = Depends(c
                 errors.append({"row": index, "message": str(exc.detail)})
                 continue
             tw_code = normalize_tw_code(row.get("twCode", ""))
+            if profile in {"asset", "holding"}:
+                if not tw_code:
+                    errors.append({"row": index, "message": "资产或持仓表缺少有效 TW 编号，未更新客户。"})
+                    quality["twMissingRows"] += 1
+                    continue
+                existing = find_customer_by_tw(conn, tw_code)
+                if not existing:
+                    errors.append({"row": index, "message": f"TW 编号 {tw_code} 未在客户主表找到，未新建客户。"})
+                    continue
+                conn.execute("SAVEPOINT import_row")
+                try:
+                    changes = update_broker_snapshot_customer(conn, existing, row, tw_code, user)
+                    supplemental_changed = apply_import_supplemental_updates(conn, existing["id"], row, user)
+                    add_tw_identifier(conn, existing["id"], tw_code)
+                    conn.execute("RELEASE SAVEPOINT import_row")
+                    quality["twMatchedRows"] += 1
+                    if changes or supplemental_changed:
+                        updated.append({"row": index, "id": existing["id"], "customerCode": existing["customer_code"], "changes": changes or {"supplemental": True}})
+                        updated_customer_ids.append(existing["id"])
+                    else:
+                        unchanged_count += 1
+                    continue
+                except (HTTPException, ValueError) as exc:
+                    conn.execute("ROLLBACK TO SAVEPOINT import_row")
+                    conn.execute("RELEASE SAVEPOINT import_row")
+                    errors.append({"row": index, "message": str(exc.detail) if isinstance(exc, HTTPException) else str(exc)})
+                    continue
             if has_tw_snapshot and not tw_code:
                 errors.append({"row": index, "message": "全量快照行缺少有效 TW 编号，未创建客户。"})
                 quality["twMissingRows"] += 1
@@ -2491,11 +2802,15 @@ def import_commit(payload: ImportCommitPayload, user: dict[str, Any] = Depends(c
                     conn.execute("SAVEPOINT import_row")
                     try:
                         changes = update_broker_snapshot_customer(conn, existing, row, tw_code, user)
+                        supplemental_changed = apply_import_supplemental_updates(conn, existing["id"], row, user)
                         add_tw_identifier(conn, existing["id"], tw_code)
                         conn.execute("RELEASE SAVEPOINT import_row")
                         quality["twMatchedRows"] += 1
-                        if changes:
-                            updated.append({"row": index, "id": existing["id"], "customerCode": existing["customer_code"], "changes": changes})
+                        if changes or supplemental_changed:
+                            updated.append({"row": index, "id": existing["id"], "customerCode": existing["customer_code"], "changes": changes or {"supplemental": True}})
+                            updated_customer_ids.append(existing["id"])
+                            if changes.get("account_status", {}).get("to") == "已开户":
+                                opened_customer_ids.append(existing["id"])
                         else:
                             unchanged_count += 1
                         continue
@@ -2524,6 +2839,8 @@ def import_commit(payload: ImportCommitPayload, user: dict[str, Any] = Depends(c
                 potential_duplicates = potential_identity_matches(conn, record["name"], record["wechat_nickname"], record["id"])
                 conn.execute("RELEASE SAVEPOINT import_row")
                 created.append({"row": index, "id": record["id"], "customerCode": record["customer_code"], "potentialDuplicates": potential_duplicates})
+                if record["account_status"] == "已开户":
+                    opened_customer_ids.append(record["id"])
                 if not has_identifier:
                     quality["unidentifiedRowsImported"] += 1
             except HTTPException as exc:
@@ -2538,13 +2855,20 @@ def import_commit(payload: ImportCommitPayload, user: dict[str, Any] = Depends(c
                 conn.execute("RELEASE SAVEPOINT import_row")
                 conflicts.append({"row": index, "name": row.get("name", "") or row.get("wechatNickname", ""), "detail": str(exc)})
         job_id = str(uuid4())
+        job_created_at = datetime.now(timezone.utc).astimezone().isoformat(timespec="microseconds")
+        created_customer_ids = [item["id"] for item in created]
+        updated_customer_ids = list(dict.fromkeys(updated_customer_ids))
+        opened_customer_ids = list(dict.fromkeys(opened_customer_ids))
         conn.execute(
-            """INSERT INTO import_jobs(id, filename, owner_id, owner_name, total_rows, created_count, updated_count, conflict_count, error_count, imported_by, imported_by_name, created_at, data_quality_json, created_customer_ids_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (job_id, payload.filename, owner["id"], owner["name"], len(payload.rows), len(created), len(updated), len(conflicts), len(errors), user["id"], user["name"], now_iso(), json.dumps({**quality, "unchangedRows": unchanged_count, "mode": "snapshot" if has_tw_snapshot else "append"}, ensure_ascii=False), json.dumps([item["id"] for item in created], ensure_ascii=False)),
+            """INSERT INTO import_jobs(id, filename, owner_id, owner_name, total_rows, created_count, updated_count, conflict_count, error_count, imported_by, imported_by_name, created_at, data_quality_json, created_customer_ids_json, updated_customer_ids_json, opened_customer_ids_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (job_id, payload.filename, owner["id"], owner["name"], source_row_count, len(created), len(updated), len(conflicts), len(errors), user["id"], user["name"], job_created_at, json.dumps({**quality, "unchangedRows": unchanged_count, "mode": profile if profile in {"asset", "holding"} else ("snapshot" if has_tw_snapshot else "append"), "profile": profile}, ensure_ascii=False), json.dumps(created_customer_ids, ensure_ascii=False), json.dumps(updated_customer_ids, ensure_ascii=False), json.dumps(opened_customer_ids, ensure_ascii=False)),
         )
-        audit(conn, user, "import.completed", "import_job", job_id, {"created": len(created), "updated": len(updated), "unchanged": unchanged_count, "conflicts": len(conflicts), "errors": len(errors), "quality": quality})
-    return {"jobId": job_id, "mode": "snapshot" if has_tw_snapshot else "append", "created": created, "updated": updated, "unchangedCount": unchanged_count, "conflicts": conflicts, "errors": errors, "dataQuality": quality}
+        if created_customer_ids:
+            placeholders = ", ".join("?" for _ in created_customer_ids)
+            conn.execute(f"UPDATE customers SET import_job_id = ? WHERE id IN ({placeholders})", (job_id, *created_customer_ids))
+        audit(conn, user, "import.completed", "import_job", job_id, {"created": len(created), "updated": len(updated), "opened": len(opened_customer_ids), "unchanged": unchanged_count, "conflicts": len(conflicts), "errors": len(errors), "quality": quality})
+    return {"jobId": job_id, "mode": "snapshot" if has_tw_snapshot else "append", "profile": profile, "created": created, "updated": updated, "openedCount": len(opened_customer_ids), "unchangedCount": unchanged_count, "conflicts": conflicts, "errors": errors, "dataQuality": {**quality, "profile": profile}}
 
 
 @app.get("/api/imports/template.csv")
@@ -2570,22 +2894,11 @@ def import_template(user: dict[str, Any] = Depends(current_user)):
 
 @app.get("/api/imports")
 def list_import_jobs(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    require_crm_permission_manager(user)
+    if not user["canImportCustomers"] and not user["canManageCrmPermissions"]:
+        raise HTTPException(403, "您的账号未开通导入批次查看权限。")
     with db() as conn:
         rows = conn.execute("SELECT * FROM import_jobs ORDER BY created_at DESC LIMIT 100").fetchall()
-    items = []
-    for row in rows:
-        item = dict(row)
-        try:
-            item["dataQuality"] = json.loads(item.pop("data_quality_json") or "{}")
-        except json.JSONDecodeError:
-            item["dataQuality"] = {}
-        try:
-            item["createdCustomerIds"] = json.loads(item.pop("created_customer_ids_json") or "[]")
-        except json.JSONDecodeError:
-            item["createdCustomerIds"] = []
-        items.append(item)
-    return {"items": items}
+    return {"items": [import_job_item(row) for row in rows]}
 
 
 @app.post("/api/imports/{job_id}/rollback")
@@ -2795,7 +3108,11 @@ def export_customers(user: dict[str, Any] = Depends(current_user)):
             "notes", "created_at", "updated_at",
         ]
         rows = conn.execute(
-            f"SELECT id, {', '.join(export_columns)} FROM customers WHERE archived_at IS NULL ORDER BY updated_at DESC"
+            f"""SELECT c.id,
+            (SELECT COALESCE(NULLIF(display_value, ''), normalized_value)
+             FROM customer_identifiers i WHERE i.customer_id=c.id AND i.kind='tw' ORDER BY i.id LIMIT 1) AS tw_code,
+            {', '.join(f'c.{column}' for column in export_columns)}
+            FROM customers c WHERE c.archived_at IS NULL ORDER BY c.updated_at DESC"""
         ).fetchall()
         fields = conn.execute("SELECT id, label, active FROM customer_fields ORDER BY display_order, created_at").fetchall()
         field_values = conn.execute("SELECT customer_id, field_id, value_text FROM customer_field_values").fetchall()
@@ -2804,14 +3121,14 @@ def export_customers(user: dict[str, Any] = Depends(current_user)):
     output.write("\ufeff")
     writer = csv.writer(output)
     writer.writerow([
-        "客户编号", "姓名", "微信昵称", "手机号", "邮箱", "公司", "来源", "来源明细",
+        "TW唯一编号（TW）", "系统内部编号", "姓名", "微信昵称", "手机号", "邮箱", "公司", "来源", "来源明细",
         "港安顾问（外部引荐）", "原表骄阳顾问", "当前骄阳负责人", "当前负责人团队", "生命周期", "优先级",
         "开户状态", "开户券商", "开户日期", "入金金额/USD", "资金流向", "定增意向", "定增推进",
         "意向金额", "到账金额", "实际参与金额", "流失原因", "备注", "创建时间", "更新时间",
         *[f"{field['label']}{'（已停用）' if not field['active'] else ''}" for field in fields],
     ])
     for row in rows:
-        writer.writerow([*[row[column] for column in export_columns], *[values_lookup.get((row["id"], field["id"]), "") for field in fields]])
+        writer.writerow([row["tw_code"] or "", *[row[column] for column in export_columns], *[values_lookup.get((row["id"], field["id"]), "") for field in fields]])
     from fastapi.responses import Response
     return Response(output.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": "attachment; filename=customers.csv"})
 
