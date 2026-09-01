@@ -106,7 +106,7 @@ def xlsx_with_hongan_activity_sheets() -> bytes:
         return '<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>' + "".join(xml_rows) + "</sheetData></worksheet>"
 
     header = ["序号", "客户姓名", "是否开券商户", "入金金额", "骄阳现场开户人", "保险经纪人", "中阳见证人"]
-    sheet_one = worksheet([header, ["1", "活动空顾问", "已提交", "", "演示顾问", "活动港安甲", ""], ["2", "活动已有顾问", "已提交", "", "", "活动港安乙", ""]])
+    sheet_one = worksheet([header, ["1", "活动空顾问", "已提交", "", "演示顾问", "活动港安甲", ""], ["2", "活动已有顾问", "已提交", "", "演示顾问+演示主管", "活动港安乙", ""]])
     sheet_two = worksheet([header, ["1", "活动空顾问", "已开户", "", "演示顾问", "活动港安甲", ""], ["2", "活动未匹配", "", "", "", "活动港安丙", ""], ["3", "活动重名", "", "", "", "活动港安丁", ""]])
     qa = worksheet([["序号", "常见问题"], ["1", "仅供参考"]])
     output = io.BytesIO()
@@ -725,7 +725,8 @@ def test_hongan_activity_workbook_updates_only_safe_name_matches():
     commit = client.post("/api/imports/commit", headers=admin_headers, json={"filename": payload["filename"], "importProfile": "hongan_activity", "confirmHonganActivity": True, "rows": body["activityRows"]})
     assert commit.status_code == 200, commit.text
     result = commit.json()
-    assert len(result["updated"]) == 1
+    assert len(result["updated"]) == 2
+    assert result["assignedCount"] == 2
     assert any(item["name"] == "活动未匹配" for item in result["conflicts"])
     assert any(item["name"] == "活动重名" for item in result["conflicts"])
     blank_detail = client.get(f"/api/customers/{blank.json()['customer']['id']}", headers=admin_headers).json()["customer"]
@@ -733,6 +734,7 @@ def test_hongan_activity_workbook_updates_only_safe_name_matches():
     assert blank_detail["hongan_advisor"] == "活动港安甲"
     assert blank_detail["owner_id"] == "demo-manager"
     assert existing_detail["hongan_advisor"] == "活动港安乙"
+    assert existing_detail["owner_id"] == "demo-manager"
 
 
 def test_custom_fields_permission_grid_values_and_safe_deactivation():

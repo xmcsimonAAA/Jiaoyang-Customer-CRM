@@ -463,6 +463,7 @@ body { background: #dff08a; padding: 30px; }
 .hongan-import-list > div { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .hongan-import-list span { padding: 4px 7px; border-radius: 7px; color: #66656a; background: #ececea; font-size: 10px; }
 .hongan-import-consent { align-items: flex-start; max-width: 720px; line-height: 1.5; }
+.hongan-import-warnings { margin: 12px 0 0; padding-left: 18px; color: #68676d; font-size: 11px; line-height: 1.6; }
 @media (max-width: 760px) { .hongan-import-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
 @media (max-width: 480px) { .hongan-import-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 
