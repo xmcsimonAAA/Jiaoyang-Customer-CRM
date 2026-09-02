@@ -1747,8 +1747,8 @@ def list_customers(
         filters.append("c.stage = ?")
         values.append(stage)
     if owner_id:
-        filters.append("c.owner_id = ?")
-        values.append(owner_id)
+        filters.append("(c.owner_id = ? OR EXISTS (SELECT 1 FROM customer_collaborators cc_owner_filter WHERE cc_owner_filter.customer_id = c.id AND cc_owner_filter.user_id = ?))")
+        values.extend([owner_id, owner_id])
     if workflow == "account":
         filters.append("c.account_status != '已开户'")
     if workflow == "placement":
@@ -1832,8 +1832,8 @@ def list_customer_assignments(
     filters = ["c.archived_at IS NULL", clause]
     values: list[Any] = list(params)
     if owner_id:
-        filters.append("c.owner_id = ?")
-        values.append(owner_id)
+        filters.append("(c.owner_id = ? OR EXISTS (SELECT 1 FROM customer_collaborators cc_owner_filter WHERE cc_owner_filter.customer_id = c.id AND cc_owner_filter.user_id = ?))")
+        values.extend([owner_id, owner_id])
     if source_advisor_label:
         filters.append("c.source_advisor_label = ?")
         values.append(source_advisor_label)

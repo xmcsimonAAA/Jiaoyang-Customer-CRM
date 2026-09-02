@@ -318,6 +318,10 @@ def test_source_advisor_assignment_sets_primary_and_collaborator_and_searches_bo
     assert visible.status_code == 200, visible.text
     assert customer_id in {item["id"] for item in visible.json()["items"]}
 
+    owner_filter = client.get(f"/api/customers?ownerId={second['id']}", headers=admin_headers)
+    assert owner_filter.status_code == 200, owner_filter.text
+    assert customer_id in {item["id"] for item in owner_filter.json()["items"]}
+
 
 def test_hongan_master_preview_and_import_preserve_relations_and_snapshots():
     admin_headers, _ = login("admin", "admin123")
