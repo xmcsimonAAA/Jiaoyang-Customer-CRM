@@ -1,6 +1,7 @@
 const state = {
   token: localStorage.getItem("jy_customer_token"), user: null, view: "dashboard", meta: null,
   customers: [], customerPage: 1, search: "", workflow: "all", metric: "", stage: "", ownerId: "", accountStatus: "", intentStatus: "", placementStatus: "", source: "", honganAdvisor: "", contactState: "", importJobId: "", importJobMode: "all", importHistoryExpanded: false, detail: null, importPreview: null, dashboardAssistantFocus: false,
+  assignmentOwnerId: "", assignmentSourceAdvisorLabel: "", assignmentHonganAdvisor: "", assignmentSelectedCustomerIds: [],
   viewHistory: [], muskzoomEntryUrl: "https://muskzoom.com",
 };
 const app = document.querySelector("#app");
@@ -331,6 +332,7 @@ function updateAssignmentSelectionUI(root) {
   }
 }
 async function renderCustomerAssignments(content) {
+  if (!Array.isArray(state.assignmentSelectedCustomerIds)) state.assignmentSelectedCustomerIds = [];
   const query = new URLSearchParams({ownerId: state.assignmentOwnerId, sourceAdvisorLabel: state.assignmentSourceAdvisorLabel, honganAdvisor: state.assignmentHonganAdvisor});
   const data = await api(`/api/customer-assignments?${query}`);
   const visibleIds = new Set(data.items.map((item) => item.id));

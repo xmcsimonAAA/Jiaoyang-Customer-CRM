@@ -2646,6 +2646,9 @@ def source_advisor_matches(label: Any, advisor_users: dict[str, dict[str, Any]],
         if not person or not person.get("active") or person.get("rolePermission") not in {"manager", "supervisor"}:
             unmatched.append(raw_name)
             continue
+        if user["customerScope"] == "self" and person.get("id") != user["id"]:
+            unmatched.append(raw_name)
+            continue
         if user["customerScope"] == "team" and person.get("team") != user["team"]:
             unmatched.append(raw_name)
             continue
