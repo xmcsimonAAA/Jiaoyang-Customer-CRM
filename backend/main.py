@@ -486,6 +486,10 @@ class BulkAssignPayload(BaseModel):
     reason: str = Field(min_length=1)
 
 
+class SourceAdvisorAssignmentPayload(BaseModel):
+    onlyUnassigned: bool = True
+
+
 class CollaboratorPayload(BaseModel):
     userIds: list[str] = Field(default_factory=list)
 
@@ -1728,12 +1732,17 @@ def list_customers(
             c.name LIKE ? OR c.wechat_nickname LIKE ? OR c.phone LIKE ? OR c.email LIKE ? OR c.company LIKE ?
             OR c.customer_code LIKE ? OR c.owner_name LIKE ? OR c.source_advisor_label LIKE ? OR c.hongan_advisor LIKE ?
             OR EXISTS (
+                SELECT 1 FROM customer_collaborators cc_search
+                WHERE cc_search.customer_id = c.id
+                AND (cc_search.user_name LIKE ? OR cc_search.user_id LIKE ?)
+            )
+            OR EXISTS (
                 SELECT 1 FROM customer_identifiers tw_i
                 WHERE tw_i.customer_id = c.id AND tw_i.kind = 'tw'
                 AND LOWER(tw_i.normalized_value) LIKE LOWER(?)
             )
         )""")
-        values.extend([f"%{term}%"] * 9 + [f"%{term}%"])
+        values.extend([f"%{term}%"] * 11 + [f"%{term}%"])
     if stage:
         filters.append("c.stage = ?")
         values.append(stage)
@@ -1865,9 +1874,10 @@ def list_customer_assignments(
             ORDER BY c.updated_at DESC LIMIT 5000""",
             values,
         ).fetchall()
+        items = attach_collaborators(conn, [dict(row) for row in rows])
     return {
-        "items": [dict(row) for row in rows],
-        "total": len(rows),
+        "items": items,
+        "total": len(items),
         "ownerGroups": [dict(row) for row in owner_groups],
         "sourceAdvisorGroups": [dict(row) for row in source_groups],
         "honganAdvisorGroups": [dict(row) for row in hongan_groups],
@@ -2062,6 +2072,69 @@ def bulk_assign_customers(payload: BulkAssignPayload, user: dict[str, Any] = Dep
             {"count": len(changed), "unchangedCount": len(unchanged), "to": owner["id"], "reason": payload.reason.strip(), "customerIds": changed},
         )
     return {"ok": True, "assignedCount": len(changed), "unchangedCount": len(unchanged), "owner": owner}
+
+
+@app.post("/api/customer-assignments/apply-source-advisors")
+def apply_source_advisor_assignments(payload: SourceAdvisorAssignmentPayload, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    """Allocate unassigned customers from the ordered historical advisor label."""
+    require_supervisor(user)
+    clause, access_params = access_clause(user)
+    filters = ["c.archived_at IS NULL", "TRIM(c.source_advisor_label) <> ''", clause]
+    if payload.onlyUnassigned:
+        filters.append("c.owner_id = ?")
+        query_params: tuple[Any, ...] = (*access_params, UNASSIGNED_OWNER_ID)
+    else:
+        query_params = access_params
+    where = " AND ".join(filters)
+    platform_users_all = platform_users(True)
+    users_by_name = {item["name"]: item for item in platform_users_all}
+    users_by_id = {item["id"]: item for item in platform_users_all}
+    assigned: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = []
+    changed_at = now_iso()
+    with db() as conn:
+        advisor_users = advisor_alias_users(conn, users_by_name, users_by_id)
+        rows = conn.execute(
+            f"SELECT c.* FROM customers c WHERE {where} ORDER BY c.created_at, c.id",
+            query_params,
+        ).fetchall()
+        for current in rows:
+            matched, missing = source_advisor_matches(current["source_advisor_label"], advisor_users, user)
+            if missing:
+                unresolved.append({"id": current["id"], "name": current["name"] or current["wechat_nickname"], "sourceAdvisorLabel": current["source_advisor_label"], "unmatched": missing, "reason": "历史顾问未完整匹配，未自动分配；请先补充账号或别名映射"})
+                continue
+            managers = [person for person in matched if person["rolePermission"] == "manager"]
+            if not managers:
+                unresolved.append({"id": current["id"], "name": current["name"] or current["wechat_nickname"], "sourceAdvisorLabel": current["source_advisor_label"], "unmatched": split_advisor_label(current["source_advisor_label"]), "reason": "未找到可作为当前负责人的商务经理账号"})
+                continue
+            owner = managers[0]
+            collaborators = [person for person in matched if person["id"] != owner["id"]]
+            if payload.onlyUnassigned and current["owner_id"] != UNASSIGNED_OWNER_ID:
+                skipped.append({"id": current["id"], "name": current["name"] or current["wechat_nickname"], "reason": "已有当前负责人，未覆盖"})
+                continue
+            conn.execute(
+                "UPDATE customers SET owner_id=?, owner_name=?, owner_team=?, updated_at=?, version=version+1 WHERE id=?",
+                (owner["id"], owner["name"], owner["team"], changed_at, current["id"]),
+            )
+            conn.execute(
+                "INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(uuid4()), current["id"], current["owner_id"], current["owner_name"], current["owner_team"], owner["id"], owner["name"], owner["team"], "按原表骄阳顾问自动分配", user["id"], user["name"], changed_at),
+            )
+            replace_collaborators(conn, current["id"], collaborators, user)
+            audit(conn, user, "customer.assigned_from_source_advisor", "customer", current["id"], {"from": current["owner_id"], "to": owner["id"], "sourceAdvisorLabel": current["source_advisor_label"], "collaboratorIds": [person["id"] for person in collaborators], "unmatched": missing})
+            assigned.append({"id": current["id"], "name": current["name"] or current["wechat_nickname"], "owner": owner["name"], "collaborators": [person["name"] for person in collaborators], "sourceAdvisorLabel": current["source_advisor_label"]})
+    return {
+        "ok": True,
+        "assignedCount": len(assigned),
+        "collaboratorCount": sum(1 for item in assigned if item["collaborators"]),
+        "skippedAssignedCount": len(skipped),
+        "unresolvedCount": len(unresolved),
+        "assigned": assigned,
+        "skipped": skipped[:100],
+        "unresolved": unresolved[:100],
+        "onlyUnassigned": payload.onlyUnassigned,
+    }
 
 
 @app.post("/api/customers/merge")
@@ -2560,6 +2633,26 @@ def resolve_import_assignment(conn: sqlite3.Connection, row: dict[str, Any], fal
     collaborator_ids.extend(item["id"] for item in matched if item["id"] != owner["id"])
     values["collaboratorIds"] = list(dict.fromkeys(collaborator_ids))
     return owner, values
+
+
+def source_advisor_matches(label: Any, advisor_users: dict[str, dict[str, Any]], user: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
+    """Resolve an ordered historical advisor label into active CRM users."""
+    normalized_users = {simplify_text(name).strip().casefold(): person for name, person in advisor_users.items()}
+    matched: list[dict[str, Any]] = []
+    unmatched: list[str] = []
+    seen_ids: set[str] = set()
+    for raw_name in split_advisor_label(label):
+        person = normalized_users.get(simplify_text(raw_name).strip().casefold())
+        if not person or not person.get("active") or person.get("rolePermission") not in {"manager", "supervisor"}:
+            unmatched.append(raw_name)
+            continue
+        if user["customerScope"] == "team" and person.get("team") != user["team"]:
+            unmatched.append(raw_name)
+            continue
+        if person["id"] not in seen_ids:
+            matched.append(person)
+            seen_ids.add(person["id"])
+    return matched, unmatched
 
 
 def numeric_import_value(value: Any) -> float:

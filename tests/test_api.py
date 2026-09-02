@@ -293,6 +293,32 @@ def test_collaborators_extend_visibility_and_holding_snapshots():
     assert after_snapshot.json()["holdingSnapshots"][0]["market_value"] == 850
 
 
+def test_source_advisor_assignment_sets_primary_and_collaborator_and_searches_both():
+    admin_headers, _ = login("admin", "admin123")
+    second_headers, second = login("manager2", "manager2123")
+    created = client.post(
+        "/api/customers", headers=admin_headers,
+        json={"name": "历史双顾问客户", "ownerId": "unassigned", "sourceAdvisorLabel": "演示顾问+演示顾问二"},
+    )
+    assert created.status_code == 201, created.text
+    customer_id = created.json()["customer"]["id"]
+
+    applied = client.post("/api/customer-assignments/apply-source-advisors", headers=admin_headers, json={})
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["assignedCount"] >= 1
+    assert applied.json()["collaboratorCount"] >= 1
+
+    detail = client.get(f"/api/customers/{customer_id}", headers=admin_headers)
+    assert detail.status_code == 200, detail.text
+    customer = detail.json()["customer"]
+    assert customer["owner_name"] == "演示顾问"
+    assert {person["id"] for person in customer["collaborators"]} == {second["id"]}
+
+    visible = client.get("/api/customers?search=演示顾问二", headers=second_headers)
+    assert visible.status_code == 200, visible.text
+    assert customer_id in {item["id"] for item in visible.json()["items"]}
+
+
 def test_hongan_master_preview_and_import_preserve_relations_and_snapshots():
     admin_headers, _ = login("admin", "admin123")
     manager_headers, manager = login("manager", "manager123")
