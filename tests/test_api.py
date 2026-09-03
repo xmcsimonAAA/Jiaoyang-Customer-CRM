@@ -620,6 +620,13 @@ def test_pinyin_holding_preview_writes_only_unique_customer_matches():
     customer_id = master.json()["created"][0]["id"]
     detail = client.get(f"/api/customers/{customer_id}", headers=admin_headers).json()
     assert detail["holdingSnapshots"][0]["quantity"] == 155
+    reviews = client.get("/api/import-reviews", headers=admin_headers)
+    assert reviews.status_code == 200, reviews.text
+    review = next(item for item in reviews.json()["items"] if item["profile"] == "holding_pinyin")
+    resolved = client.post(f"/api/import-reviews/{review['id']}/resolve", headers=admin_headers, json={"action": "apply", "customerId": master.json()["created"][1]["id"]})
+    assert resolved.status_code == 200, resolved.text
+    remaining = client.get("/api/import-reviews", headers=admin_headers).json()["items"]
+    assert all(item["id"] != review["id"] for item in remaining)
 
 
 def test_import_preview_converts_traditional_chinese_to_simplified():

@@ -210,6 +210,7 @@ POSTGRES_SCHEMA_STATEMENTS = [
         created_customer_ids_json TEXT NOT NULL DEFAULT '[]',
         updated_customer_ids_json TEXT NOT NULL DEFAULT '[]',
         opened_customer_ids_json TEXT NOT NULL DEFAULT '[]',
+        review_items_json TEXT NOT NULL DEFAULT '[]',
         rolled_back_at TEXT,
         rolled_back_by TEXT
     )
@@ -217,6 +218,7 @@ POSTGRES_SCHEMA_STATEMENTS = [
     "ALTER TABLE import_jobs ADD COLUMN IF NOT EXISTS updated_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE import_jobs ADD COLUMN IF NOT EXISTS updated_customer_ids_json TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE import_jobs ADD COLUMN IF NOT EXISTS opened_customer_ids_json TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE import_jobs ADD COLUMN IF NOT EXISTS review_items_json TEXT NOT NULL DEFAULT '[]'",
     """
     CREATE TABLE IF NOT EXISTS audit_logs (
         id TEXT PRIMARY KEY,

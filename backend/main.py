@@ -269,6 +269,7 @@ def init_sqlite_db() -> None:
                 created_customer_ids_json TEXT NOT NULL DEFAULT '[]',
                 updated_customer_ids_json TEXT NOT NULL DEFAULT '[]',
                 opened_customer_ids_json TEXT NOT NULL DEFAULT '[]',
+                review_items_json TEXT NOT NULL DEFAULT '[]',
                 rolled_back_at TEXT,
                 rolled_back_by TEXT
             );
@@ -355,6 +356,8 @@ def init_sqlite_db() -> None:
             conn.execute("ALTER TABLE import_jobs ADD COLUMN updated_customer_ids_json TEXT NOT NULL DEFAULT '[]'")
         if "opened_customer_ids_json" not in import_job_columns:
             conn.execute("ALTER TABLE import_jobs ADD COLUMN opened_customer_ids_json TEXT NOT NULL DEFAULT '[]'")
+        if "review_items_json" not in import_job_columns:
+            conn.execute("ALTER TABLE import_jobs ADD COLUMN review_items_json TEXT NOT NULL DEFAULT '[]'")
         if "rolled_back_at" not in import_job_columns:
             conn.execute("ALTER TABLE import_jobs ADD COLUMN rolled_back_at TEXT")
         if "rolled_back_by" not in import_job_columns:
@@ -528,6 +531,13 @@ class ImportCommitPayload(BaseModel):
     allowUnidentifiedRows: bool = False
     confirmHonganActivity: bool = False
     confirmPinyinHolding: bool = False
+
+
+class ImportReviewResolvePayload(BaseModel):
+    action: str = "ignore"
+    customerId: str | None = None
+    honganAdvisor: str | None = None
+    note: str = ""
 
 
 class PermissionPayload(BaseModel):
@@ -1679,10 +1689,50 @@ def import_job_item(row: Any) -> dict[str, Any]:
     item["updatedCustomerIds"] = import_job_customer_ids(item, "updated")
     item["openedCustomerIds"] = import_job_customer_ids(item, "opened")
     item["openedCount"] = len(item["openedCustomerIds"])
+    try:
+        item["reviewItems"] = json.loads(item.pop("review_items_json") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        item["reviewItems"] = []
+    item["pendingReviewCount"] = sum(1 for review in item["reviewItems"] if review.get("status", "pending") == "pending")
     item.pop("created_customer_ids_json", None)
     item.pop("updated_customer_ids_json", None)
     item.pop("opened_customer_ids_json", None)
     return item
+
+
+def make_import_review_item(profile: str, category: str, item: dict[str, Any], raw_row: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Persist a small, actionable copy of an import exception for later review."""
+    review = {key: value for key, value in dict(item).items() if value not in (None, "")}
+    review.update({"id": str(uuid4()), "profile": profile, "category": category, "status": "pending", "createdAt": now_iso()})
+    if raw_row is not None:
+        review["rawRow"] = raw_row
+    return review
+
+
+def parse_import_review_items(job: Any) -> list[dict[str, Any]]:
+    try:
+        value = job["review_items_json"] if isinstance(job, (dict, sqlite3.Row)) else None
+        parsed = json.loads(value or "[]")
+    except (TypeError, KeyError, json.JSONDecodeError):
+        parsed = []
+    return parsed if isinstance(parsed, list) else []
+
+
+def legacy_import_review_items(job: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expose diagnostics from older Hongan jobs until they are resolved once."""
+    try:
+        quality = json.loads(job.get("data_quality_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        quality = {}
+    activity = quality.get("activity") or {}
+    result = []
+    for category in ("conflicts", "ambiguous", "unmatched"):
+        label = {"conflicts": "conflict", "ambiguous": "ambiguous", "unmatched": "unmatched"}[category]
+        for entry in activity.get(category, []):
+            review = make_import_review_item("hongan_activity", label, entry)
+            review["id"] = f"legacy-{job['id']}-{label}-{entry.get('name', '')}-{entry.get('sourceSheet', '')}"
+            result.append(review)
+    return result
 
 
 def import_activity_summary(rows: list[Any]) -> dict[str, Any]:
@@ -3100,6 +3150,9 @@ def commit_hongan_activity_import(payload: ImportCommitPayload, user: dict[str, 
     assigned_count = 0
     with db() as conn:
         diagnostics = hongan_activity_match_diagnostics(conn, payload.rows, limit=None)
+        review_items = [make_import_review_item("hongan_activity", "conflict", item) for item in diagnostics["conflicts"]]
+        review_items.extend(make_import_review_item("hongan_activity", "ambiguous", item) for item in diagnostics["ambiguous"])
+        review_items.extend(make_import_review_item("hongan_activity", "unmatched", item) for item in diagnostics["unmatched"])
         auto_fill_ids = {item["customerId"]: item for item in diagnostics["autoFill"]}
         for customer_id, item in auto_fill_ids.items():
             advisor = str(item.get("targetAdvisor", "") or "").strip()
@@ -3128,9 +3181,9 @@ def commit_hongan_activity_import(payload: ImportCommitPayload, user: dict[str, 
         quality = {"mode": "hongan_activity", "profile": "hongan_activity", "activity": diagnostics, "unchangedRows": unchanged_count, "assignedOwners": 0}
         conflict_items = diagnostics["conflicts"] + diagnostics["ambiguous"] + diagnostics["unmatched"]
         conn.execute(
-            """INSERT INTO import_jobs(id, filename, owner_id, owner_name, total_rows, created_count, updated_count, conflict_count, error_count, imported_by, imported_by_name, created_at, data_quality_json, created_customer_ids_json, updated_customer_ids_json, opened_customer_ids_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (job_id, payload.filename, UNASSIGNED_OWNER_ID, UNASSIGNED_OWNER["name"], len(payload.rows), 0, len(updated), len(conflicts) + len(conflict_items), len(errors), user["id"], user["name"], job_created_at, json.dumps(quality, ensure_ascii=False), "[]", json.dumps([item["id"] for item in updated], ensure_ascii=False), "[]"),
+            """INSERT INTO import_jobs(id, filename, owner_id, owner_name, total_rows, created_count, updated_count, conflict_count, error_count, imported_by, imported_by_name, created_at, data_quality_json, created_customer_ids_json, updated_customer_ids_json, opened_customer_ids_json, review_items_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (job_id, payload.filename, UNASSIGNED_OWNER_ID, UNASSIGNED_OWNER["name"], len(payload.rows), 0, len(updated), len(conflicts) + len(conflict_items), len(errors), user["id"], user["name"], job_created_at, json.dumps(quality, ensure_ascii=False), "[]", json.dumps([item["id"] for item in updated], ensure_ascii=False), "[]", json.dumps(review_items, ensure_ascii=False, default=str)),
         )
         audit(conn, user, "import.hongan_activity_completed", "import_job", job_id, {"updated": len(updated), "assigned": 0, "unchanged": unchanged_count, "conflicts": len(conflicts) + len(conflict_items), "errors": len(errors)})
     review_items = [{"name": item.get("name", ""), "detail": "港安顾问信息不一致，未覆盖已有顾问。", "currentAdvisor": item.get("currentAdvisor", ""), "targetAdvisor": item.get("targetAdvisor", "")} for item in diagnostics["conflicts"]]
@@ -3145,6 +3198,15 @@ def commit_pinyin_holding_import(payload: ImportCommitPayload, user: dict[str, A
         raise HTTPException(422, "拼音持仓表中没有可导入的客户记录。")
     with db() as conn:
         diagnostics = pinyin_holding_match_diagnostics(conn, payload.rows, limit=None)
+        review_items = []
+        for category in ("ambiguous", "unmatched"):
+            for item in diagnostics[category]:
+                raw_row = payload.rows[int(item["row"]) - 1] if int(item.get("row", 0)) <= len(payload.rows) else {}
+                review = make_import_review_item("holding_pinyin", category, item, raw_row)
+                snapshots = raw_row.get("holdingSnapshots") or []
+                if snapshots:
+                    review["snapshot"] = snapshots[0]
+                review_items.append(review)
         matched_by_row = {item["row"]: item for item in diagnostics["matched"]}
         created: list[dict[str, Any]] = []
         updated: list[dict[str, Any]] = []
@@ -3177,9 +3239,9 @@ def commit_pinyin_holding_import(payload: ImportCommitPayload, user: dict[str, A
         conflicts = [{"row": item["row"], "name": item["pinyinName"], "detail": "拼音对应多个客户，未写入持仓。", "candidates": item["candidates"]} for item in diagnostics["ambiguous"]]
         conflicts.extend({"row": item["row"], "name": item["pinyinName"], "detail": "拼音未匹配客户，未写入持仓。"} for item in diagnostics["unmatched"])
         conn.execute(
-            """INSERT INTO import_jobs(id, filename, owner_id, owner_name, total_rows, created_count, updated_count, conflict_count, error_count, imported_by, imported_by_name, created_at, data_quality_json, created_customer_ids_json, updated_customer_ids_json, opened_customer_ids_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (job_id, payload.filename, UNASSIGNED_OWNER_ID, UNASSIGNED_OWNER["name"], len(payload.rows), 0, len(updated), len(conflicts), len(errors), user["id"], user["name"], job_created_at, json.dumps(quality, ensure_ascii=False), "[]", json.dumps([item["id"] for item in updated], ensure_ascii=False), "[]"),
+            """INSERT INTO import_jobs(id, filename, owner_id, owner_name, total_rows, created_count, updated_count, conflict_count, error_count, imported_by, imported_by_name, created_at, data_quality_json, created_customer_ids_json, updated_customer_ids_json, opened_customer_ids_json, review_items_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (job_id, payload.filename, UNASSIGNED_OWNER_ID, UNASSIGNED_OWNER["name"], len(payload.rows), 0, len(updated), len(conflicts), len(errors), user["id"], user["name"], job_created_at, json.dumps(quality, ensure_ascii=False), "[]", json.dumps([item["id"] for item in updated], ensure_ascii=False), "[]", json.dumps(review_items, ensure_ascii=False, default=str)),
         )
         audit(conn, user, "import.pinyin_holding_completed", "import_job", job_id, {"updated": len(updated), "unchanged": unchanged_count, "conflicts": len(conflicts), "errors": len(errors)})
     return {"jobId": job_id, "mode": "holding_pinyin", "profile": "holding_pinyin", "created": created, "updated": updated, "openedCount": 0, "unchangedCount": unchanged_count, "conflicts": conflicts, "errors": errors, "dataQuality": quality}
@@ -3334,10 +3396,16 @@ def import_commit(payload: ImportCommitPayload, user: dict[str, Any] = Depends(c
         created_customer_ids = [item["id"] for item in created]
         updated_customer_ids = list(dict.fromkeys(updated_customer_ids))
         opened_customer_ids = list(dict.fromkeys(opened_customer_ids))
+        review_items = []
+        for category, entries in (("conflict", conflicts), ("error", errors)):
+            for item in entries:
+                row_number = int(item.get("row", 0) or 0)
+                raw_row = import_rows[row_number - 1] if 1 <= row_number <= len(import_rows) else None
+                review_items.append(make_import_review_item(profile, category, item, raw_row))
         conn.execute(
-            """INSERT INTO import_jobs(id, filename, owner_id, owner_name, total_rows, created_count, updated_count, conflict_count, error_count, imported_by, imported_by_name, created_at, data_quality_json, created_customer_ids_json, updated_customer_ids_json, opened_customer_ids_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (job_id, payload.filename, owner["id"], owner["name"], source_row_count, len(created), len(updated), len(conflicts), len(errors), user["id"], user["name"], job_created_at, json.dumps({**quality, "unchangedRows": unchanged_count, "mode": profile if profile in {"asset", "holding"} else ("snapshot" if has_tw_snapshot else "append"), "profile": profile}, ensure_ascii=False), json.dumps(created_customer_ids, ensure_ascii=False), json.dumps(updated_customer_ids, ensure_ascii=False), json.dumps(opened_customer_ids, ensure_ascii=False)),
+            """INSERT INTO import_jobs(id, filename, owner_id, owner_name, total_rows, created_count, updated_count, conflict_count, error_count, imported_by, imported_by_name, created_at, data_quality_json, created_customer_ids_json, updated_customer_ids_json, opened_customer_ids_json, review_items_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (job_id, payload.filename, owner["id"], owner["name"], source_row_count, len(created), len(updated), len(conflicts), len(errors), user["id"], user["name"], job_created_at, json.dumps({**quality, "unchangedRows": unchanged_count, "mode": profile if profile in {"asset", "holding"} else ("snapshot" if has_tw_snapshot else "append"), "profile": profile}, ensure_ascii=False), json.dumps(created_customer_ids, ensure_ascii=False), json.dumps(updated_customer_ids, ensure_ascii=False), json.dumps(opened_customer_ids, ensure_ascii=False), json.dumps(review_items, ensure_ascii=False, default=str)),
         )
         if created_customer_ids:
             placeholders = ", ".join("?" for _ in created_customer_ids)
@@ -3374,6 +3442,101 @@ def list_import_jobs(user: dict[str, Any] = Depends(current_user)) -> dict[str, 
     with db() as conn:
         rows = conn.execute("SELECT * FROM import_jobs ORDER BY created_at DESC LIMIT 100").fetchall()
     return {"items": [import_job_item(row) for row in rows]}
+
+
+def import_review_access(user: dict[str, Any]) -> None:
+    if not user["canImportCustomers"] and not user["canManageCrmPermissions"]:
+        raise HTTPException(403, "您的账号未开通导入复核权限。")
+
+
+@app.get("/api/import-reviews")
+def list_import_reviews(include_resolved: bool = Query(default=False), user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    """Return one cross-batch queue for import conflicts and unmatched rows."""
+    import_review_access(user)
+    items: list[dict[str, Any]] = []
+    with db() as conn:
+        jobs = conn.execute("SELECT * FROM import_jobs ORDER BY created_at DESC LIMIT 200").fetchall()
+        for job in jobs:
+            job_dict = dict(job)
+            reviews = parse_import_review_items(job_dict)
+            if not reviews:
+                reviews = legacy_import_review_items(job_dict)
+            try:
+                job_quality = json.loads(job_dict.get("data_quality_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                job_quality = {}
+            for review in reviews:
+                if not include_resolved and review.get("status", "pending") != "pending":
+                    continue
+                items.append({
+                    **review,
+                    "jobId": job_dict["id"],
+                    "filename": job_dict["filename"],
+                    "importedAt": job_dict["created_at"],
+                    "importedBy": job_dict["imported_by_name"],
+                    "profile": review.get("profile") or job_quality.get("profile") or "standard",
+                })
+    category_labels = {"conflict": "冲突", "error": "错误", "ambiguous": "同名待确认", "unmatched": "未匹配"}
+    for item in items:
+        item["categoryLabel"] = category_labels.get(item.get("category"), item.get("category", "待复核"))
+        item["canApply"] = item.get("profile") in {"holding_pinyin", "hongan_activity", "asset", "holding"}
+    pending = sum(1 for item in items if item.get("status", "pending") == "pending")
+    return {"items": items[:1000], "total": len(items), "pendingCount": pending}
+
+
+@app.post("/api/import-reviews/{review_id}/resolve")
+def resolve_import_review(review_id: str, payload: ImportReviewResolvePayload, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    """Resolve a queued exception by safely linking it or marking it handled."""
+    import_review_access(user)
+    action = str(payload.action or "").strip().lower()
+    if action not in {"apply", "ignore"}:
+        raise HTTPException(422, "复核操作无效。")
+    with db() as conn:
+        jobs = conn.execute("SELECT * FROM import_jobs ORDER BY created_at DESC LIMIT 500").fetchall()
+        found_job, reviews, target = None, None, None
+        for job in jobs:
+            job_dict = dict(job)
+            parsed = parse_import_review_items(job_dict) or legacy_import_review_items(job_dict)
+            candidate = next((item for item in parsed if item.get("id") == review_id), None)
+            if candidate:
+                found_job, reviews, target = job, parsed, candidate
+                break
+        if not found_job or target is None:
+            raise HTTPException(404, "待复核记录不存在，可能已被处理。")
+        if target.get("status") != "pending":
+            return {"reviewId": review_id, "status": target.get("status")}
+        profile = str(target.get("profile") or "standard")
+        customer = None
+        if action == "apply":
+            if not payload.customerId:
+                raise HTTPException(422, "确认并入前请选择要关联的客户。")
+            customer = assert_customer_access(conn, payload.customerId, user)
+            if profile == "hongan_activity":
+                require_advisor_binding_manager(user)
+                advisor = str(payload.honganAdvisor or target.get("targetAdvisor") or ((target.get("advisors") or [""])[0]) or "").strip()
+                if not advisor:
+                    raise HTTPException(422, "这条记录没有可确认的港安顾问。")
+                conn.execute("UPDATE customers SET hongan_advisor=?, updated_at=?, version=version+1 WHERE id=?", (advisor, now_iso(), customer["id"]))
+                audit(conn, user, "import_review.hongan_advisor_applied", "customer", customer["id"], {"reviewId": review_id, "advisor": advisor})
+            elif profile in {"holding_pinyin", "asset", "holding"}:
+                raw_row = target.get("rawRow") or {}
+                snapshots = target.get("snapshot") and [target["snapshot"]] or raw_row.get("holdingSnapshots") or []
+                if snapshots:
+                    save_holding_snapshots(conn, customer["id"], snapshots, user, allow_zero=True)
+                elif profile in {"asset", "holding"}:
+                    apply_import_supplemental_updates(conn, customer["id"], raw_row, user)
+                else:
+                    raise HTTPException(422, "这条记录没有可写入的持仓数据。")
+                audit(conn, user, "import_review.holding_applied", "customer", customer["id"], {"reviewId": review_id, "profile": profile})
+            else:
+                raise HTTPException(422, "这类冲突需要先在客户详情中手动修改，再标记为已处理。")
+        target["status"] = "resolved" if action == "apply" else "ignored"
+        target["resolvedAt"] = now_iso()
+        target["resolvedBy"] = user["id"]
+        target["resolutionNote"] = str(payload.note or "").strip()[:500]
+        conn.execute("UPDATE import_jobs SET review_items_json=? WHERE id=?", (json.dumps(reviews, ensure_ascii=False, default=str), found_job["id"]))
+        audit(conn, user, f"import_review.{target['status']}", "import_review", review_id, {"jobId": found_job["id"], "customerId": payload.customerId or ""})
+    return {"reviewId": review_id, "status": target["status"], "customerId": payload.customerId}
 
 
 @app.post("/api/imports/{job_id}/rollback")
