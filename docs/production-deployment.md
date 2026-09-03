@@ -169,6 +169,20 @@ The same two secrets must be configured in MuskZoom's server environment under t
 customer-specific names. The customer module then caches the identity list for at most
 60 seconds, while every browser entry requires a new short-lived one-time SSO token.
 
+For later code updates, pull the reviewed commit and restart the service. If
+`requirements.txt` changed, install dependencies before restarting:
+
+```bash
+sudo -u jycrm git -C /opt/jy-customer pull --ff-only
+sudo -u jycrm /opt/jy-customer/.venv/bin/pip install -r /opt/jy-customer/requirements.txt
+sudo systemctl restart jy-customer.service
+curl --fail https://crm.muskzoom.com/api/health
+```
+
+The pinyin holding importer uses the `pypinyin` dependency. It identifies
+`name`/`qty` workbooks, previews unique and ambiguous matches, and only writes
+the unique matches after an explicit confirmation in the CRM.
+
 ## 8. Acceptance and cutover
 
 Before sharing the entry with staff, validate all of the following:

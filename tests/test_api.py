@@ -119,6 +119,22 @@ def xlsx_with_hongan_activity_sheets() -> bytes:
     return output.getvalue()
 
 
+def xlsx_with_pinyin_holding() -> bytes:
+    workbook = '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="SXY SH 20260828" sheetId="1" r:id="rId1"/></sheets></workbook>'
+    relationships = '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>'
+    worksheet = '''<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>
+    <row r="1"><c r="A1" t="inlineStr"><is><t>name</t></is></c><c r="B1" t="inlineStr"><is><t>qty</t></is></c></row>
+    <row r="2"><c r="A2" t="inlineStr"><is><t>CE SHI PI PEI KE HU JIA</t></is></c><c r="B2"><v>155</v></c></row>
+    <row r="3"><c r="A3" t="inlineStr"><is><t>CE SHI ZHONG MING KE HU</t></is></c><c r="B3"><v>12</v></c></row>
+    </sheetData></worksheet>'''
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        archive.writestr("xl/workbook.xml", workbook)
+        archive.writestr("xl/_rels/workbook.xml.rels", relationships)
+        archive.writestr("xl/worksheets/sheet1.xml", worksheet)
+    return output.getvalue()
+
+
 def test_customer_lifecycle_visibility_and_permissions():
     manager_headers, manager = login("manager", "manager123")
     second_headers, second = login("manager2", "manager2123")
@@ -573,6 +589,37 @@ def test_asset_import_updates_existing_tw_custom_field_and_merges_duplicate_rows
     customer_id = master.json()["created"][0]["id"]
     detail = client.get(f"/api/customers/{customer_id}", headers=admin_headers).json()["customer"]
     assert detail["custom_values"][field_id] == "120.5"
+
+
+def test_pinyin_holding_preview_writes_only_unique_customer_matches():
+    admin_headers, _ = login("admin", "admin123")
+    master = client.post(
+        "/api/imports/commit", headers=admin_headers,
+        json={"filename": "客户主表.xlsx", "mode": "snapshot", "ownerId": "unassigned", "allowUnidentifiedRows": True, "rows": [
+            {"twCode": "TW20990801001", "name": "测试匹配客户甲", "accountStatus": "已开通"},
+            {"twCode": "TW20990801002", "name": "测试重名客户", "accountStatus": "已开通"},
+            {"twCode": "TW20990801003", "name": "测试重名客户", "accountStatus": "已开通"},
+        ]},
+    )
+    assert master.status_code == 200, master.text
+    payload = {"filename": "SXY SH 20260828.xlsx", "dataBase64": base64.b64encode(xlsx_with_pinyin_holding()).decode()}
+    preview = client.post("/api/imports/preview", headers=admin_headers, json=payload)
+    assert preview.status_code == 200, preview.text
+    body = preview.json()
+    assert body["importProfile"] == "holding_pinyin"
+    assert body["holdingSnapshots"][0]["snapshotDate"] == "2026-08-28"
+    assert body["pinyinHolding"]["counts"] == {"matched": 1, "ambiguous": 1, "unmatched": 0}
+    rows = [{"name": row["name"], "holdingQuantity": row["qty"], "holdingSnapshots": [{"snapshotDate": "2026-08-28", "securityName": "中阳证券持仓", "sourceLabel": payload["filename"], "quantity": row["qty"], "marketValue": 0}]} for row in body["rows"]]
+    denied = client.post("/api/imports/commit", headers=admin_headers, json={"filename": payload["filename"], "importProfile": "holding_pinyin", "rows": rows})
+    assert denied.status_code == 422
+    commit = client.post("/api/imports/commit", headers=admin_headers, json={"filename": payload["filename"], "importProfile": "holding_pinyin", "confirmPinyinHolding": True, "rows": rows})
+    assert commit.status_code == 200, commit.text
+    result = commit.json()
+    assert len(result["updated"]) == 1
+    assert len(result["conflicts"]) == 1
+    customer_id = master.json()["created"][0]["id"]
+    detail = client.get(f"/api/customers/{customer_id}", headers=admin_headers).json()
+    assert detail["holdingSnapshots"][0]["quantity"] == 155
 
 
 def test_import_preview_converts_traditional_chinese_to_simplified():

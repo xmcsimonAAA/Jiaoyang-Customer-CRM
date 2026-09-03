@@ -11,6 +11,7 @@ import re
 import secrets
 import sqlite3
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 import zipfile
@@ -26,6 +27,10 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from opencc import OpenCC
 from pydantic import BaseModel, Field
+try:
+    from pypinyin import lazy_pinyin
+except ImportError:  # Optional until the production venv installs updated requirements.
+    lazy_pinyin = None
 
 from backend.database import connection as database_connection
 from backend.database import uses_postgres
@@ -522,6 +527,7 @@ class ImportCommitPayload(BaseModel):
     advisorAliasMappings: dict[str, str] = Field(default_factory=dict)
     allowUnidentifiedRows: bool = False
     confirmHonganActivity: bool = False
+    confirmPinyinHolding: bool = False
 
 
 class PermissionPayload(BaseModel):
@@ -2443,6 +2449,78 @@ def holding_header_matches(header: Any) -> bool:
     return "持仓" in normalized and ("数量" in normalized or "股数" in normalized or "市值" in normalized)
 
 
+def normalized_pinyin_name(value: Any) -> str:
+    """Create a comparison key for broker pinyin names without altering display names."""
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    if lazy_pinyin is not None:
+        text = "".join(lazy_pinyin(simplify_text(text)))
+    return re.sub(r"[^a-z0-9]", "", text.casefold())
+
+
+def is_pinyin_name(value: Any) -> bool:
+    text = str(clean_import_cell(value) or "").strip()
+    if not text or len(normalized_pinyin_name(text)) < 3:
+        return False
+    return bool(re.fullmatch(r"[A-Za-z][A-Za-z .,'’\-]*", text)) or bool(re.search(r"[\u3400-\u9fff]", text))
+
+
+def pinyin_holding_match_diagnostics(conn: Any, rows: list[dict[str, Any]], limit: int | None = 200) -> dict[str, Any]:
+    """Match broker pinyin holding rows only when exactly one active TW customer agrees."""
+    customers = [dict(row) for row in conn.execute(
+        """SELECT c.id, c.customer_code, c.name, i.display_value tw_code
+        FROM customers c JOIN customer_identifiers i ON i.customer_id=c.id AND i.kind='tw'
+        WHERE c.archived_at IS NULL"""
+    ).fetchall()]
+    by_pinyin: dict[str, list[dict[str, Any]]] = {}
+    for customer in customers:
+        key = normalized_pinyin_name(customer.get("name", ""))
+        if key:
+            by_pinyin.setdefault(key, []).append(customer)
+    result: dict[str, list[dict[str, Any]]] = {key: [] for key in ("matched", "ambiguous", "unmatched")}
+    for row_index, row in enumerate(rows, start=1):
+        pinyin_name = str(row.get("name", "") or "").strip()
+        key = normalized_pinyin_name(pinyin_name)
+        candidates = by_pinyin.get(key, [])
+        item = {
+            "row": row_index,
+            "pinyinName": pinyin_name,
+            "quantity": row.get("holdingQuantity", 0),
+        }
+        if len(candidates) == 1:
+            customer = candidates[0]
+            result["matched"].append({**item, "customerId": customer["id"], "customerCode": customer["customer_code"], "customerName": customer["name"], "twCode": customer["tw_code"]})
+        elif candidates:
+            result["ambiguous"].append({**item, "candidates": [{"customerId": customer["id"], "customerCode": customer["customer_code"], "customerName": customer["name"], "twCode": customer["tw_code"]} for customer in candidates]})
+        else:
+            result["unmatched"].append(item)
+    return {
+        "totalRows": len(rows),
+        "counts": {key: len(value) for key, value in result.items()},
+        **{key: value if limit is None else value[:limit] for key, value in result.items()},
+    }
+
+
+def detect_pinyin_holding_table(headers: list[str], rows: list[list[Any]]) -> tuple[str, str] | None:
+    if detect_tw_header(headers, rows):
+        return None
+    quantity_header = next((header for header in headers if simplify_text(header).strip().lower() in {"qty", "quantity", "shares", "shareqty"}), None)
+    name_header = next((header for header in headers if simplify_text(header).strip().lower() in {"name", "customername", "clientname"}), None)
+    if not name_header or not quantity_header:
+        return None
+    name_index, quantity_index = headers.index(name_header), headers.index(quantity_header)
+    pairs = [(row[name_index], row[quantity_index] if quantity_index < len(row) else "") for row in rows if name_index < len(row) and clean_import_cell(row[name_index])]
+    values = [pair[0] for pair in pairs]
+    quantities = [pair[1] for pair in pairs]
+    pinyin_like_count = sum(1 for value in values if is_pinyin_name(value) and bool(re.fullmatch(r"[A-Za-z][A-Za-z .,'’\-]*", str(value).strip())))
+    if len(values) < 2 or len(values) != len(quantities) or pinyin_like_count / len(values) < 0.8 or not all(is_pinyin_name(value) for value in values):
+        return None
+    try:
+        [numeric_import_value(value) for value in quantities]
+    except (TypeError, ValueError):
+        return None
+    return name_header, quantity_header
+
+
 def inferred_snapshot_date(filename: str = "", headers: list[str] | None = None) -> str:
     source = " ".join([filename, *list(headers or [])])
     full_date = re.search(r"(20\d{2})[./-]?(\d{1,2})[./-]?(\d{1,2})", source)
@@ -2963,6 +3041,31 @@ def import_preview(payload: ImportPreviewPayload, user: dict[str, Any] = Depends
         raise
     except Exception as exc:
         raise HTTPException(422, "无法解析该文件，请确认文件未损坏，或另存为新的 .xlsx 后重试。") from exc
+    pinyin_holding_columns = detect_pinyin_holding_table(headers, raw_rows)
+    if pinyin_holding_columns:
+        name_header, quantity_header = pinyin_holding_columns
+        pinyin_rows = [
+            {"name": clean_import_cell(row[headers.index(name_header)]), "holdingQuantity": clean_import_cell(row[headers.index(quantity_header)])}
+            for row in raw_rows if headers.index(name_header) < len(row) and str(clean_import_cell(row[headers.index(name_header)]) or "").strip()
+        ]
+        snapshot_date = inferred_snapshot_date(payload.filename, headers)
+        with db() as conn:
+            diagnostics = pinyin_holding_match_diagnostics(conn, pinyin_rows)
+        counts = diagnostics["counts"]
+        warnings = [{"code": "pinyin_holding", "message": f"已识别拼音持仓表：将按 {snapshot_date} 写入持仓快照，不会新建客户或修改客户资料。", "count": counts["matched"]}]
+        if counts["ambiguous"]:
+            warnings.append({"code": "pinyin_ambiguous", "message": "部分拼音对应多个同音客户，已暂停自动匹配，请人工确认。", "count": counts["ambiguous"]})
+        if counts["unmatched"]:
+            warnings.append({"code": "pinyin_unmatched", "message": "部分拼音暂未找到客户，已暂停自动匹配，请核对拼写或补充 TW 编号。", "count": counts["unmatched"]})
+        preview_rows = [{name_header: row["name"], quantity_header: row["holdingQuantity"]} for row in pinyin_rows[:IMPORT_ROW_LIMIT]]
+        return {
+            "headers": headers, "suggestedMapping": {"name": name_header, "holdingQuantity": quantity_header}, "suggestedCustomMapping": {}, "customerFields": [],
+            "rows": preview_rows, "totalRows": len(pinyin_rows), "truncated": len(pinyin_rows) > IMPORT_ROW_LIMIT, "sheetName": sheet_name,
+            "textNormalization": "中文客户姓名会转换为拼音进行候选匹配，原始拼音仅用于比对", "profile": "holding_pinyin", "importProfile": "holding_pinyin",
+            "holdingSnapshots": [{"snapshotDate": snapshot_date, "securityName": "中阳证券持仓", "sourceLabel": payload.filename, "quantityHeader": quantity_header}],
+            "warnings": warnings, "pinyinHolding": diagnostics,
+            "dataQuality": {"importProfile": "holding_pinyin", "hasTwSnapshot": False, "pinyinMatched": counts["matched"], "pinyinAmbiguous": counts["ambiguous"], "pinyinUnmatched": counts["unmatched"]},
+        }
     mapping = {}
     for field, aliases in HEADER_ALIASES.items():
         match = next((header for header in headers if header_alias_matches(header, aliases)), None)
@@ -3035,6 +3138,53 @@ def commit_hongan_activity_import(payload: ImportCommitPayload, user: dict[str, 
     return {"jobId": job_id, "mode": "hongan_activity", "profile": "hongan_activity", "created": created, "updated": updated, "assignedCount": 0, "openedCount": 0, "unchangedCount": unchanged_count, "conflicts": conflicts + review_items, "errors": errors, "dataQuality": {"profile": "hongan_activity", "updated": len(updated), "assignedOwners": 0, "unchanged": unchanged_count}}
 
 
+def commit_pinyin_holding_import(payload: ImportCommitPayload, user: dict[str, Any]) -> dict[str, Any]:
+    if not payload.confirmPinyinHolding:
+        raise HTTPException(422, "请确认仅写入唯一匹配的拼音持仓记录，再提交。")
+    if not payload.rows:
+        raise HTTPException(422, "拼音持仓表中没有可导入的客户记录。")
+    with db() as conn:
+        diagnostics = pinyin_holding_match_diagnostics(conn, payload.rows, limit=None)
+        matched_by_row = {item["row"]: item for item in diagnostics["matched"]}
+        created: list[dict[str, Any]] = []
+        updated: list[dict[str, Any]] = []
+        unchanged_count = 0
+        errors: list[dict[str, Any]] = []
+        for index, raw_row in enumerate(payload.rows, start=1):
+            matched = matched_by_row.get(index)
+            if not matched:
+                continue
+            snapshots = raw_row.get("holdingSnapshots") or []
+            if not snapshots:
+                errors.append({"row": index, "message": "未识别到持仓快照日期或数量，未更新。"})
+                continue
+            customer_id = matched["customerId"]
+            before = [dict(row) for row in conn.execute("SELECT snapshot_date, security_name, quantity, market_value FROM customer_holding_snapshots WHERE customer_id=?", (customer_id,)).fetchall()]
+            try:
+                save_holding_snapshots(conn, customer_id, snapshots, user)
+            except HTTPException as exc:
+                errors.append({"row": index, "message": str(exc.detail)})
+                continue
+            after = [dict(row) for row in conn.execute("SELECT snapshot_date, security_name, quantity, market_value FROM customer_holding_snapshots WHERE customer_id=?", (customer_id,)).fetchall()]
+            if before == after:
+                unchanged_count += 1
+            else:
+                updated.append({"row": index, "id": customer_id, "customerCode": matched["customerCode"], "changes": {"holdingSnapshot": True}})
+                audit(conn, user, "customer.pinyin_holding_snapshot_saved", "customer", customer_id, {"twCode": matched["twCode"], "pinyinName": matched["pinyinName"]})
+        job_id = str(uuid4())
+        job_created_at = datetime.now(timezone.utc).astimezone().isoformat(timespec="microseconds")
+        quality = {"mode": "holding_pinyin", "profile": "holding_pinyin", "pinyin": diagnostics["counts"], "unchangedRows": unchanged_count}
+        conflicts = [{"row": item["row"], "name": item["pinyinName"], "detail": "拼音对应多个客户，未写入持仓。", "candidates": item["candidates"]} for item in diagnostics["ambiguous"]]
+        conflicts.extend({"row": item["row"], "name": item["pinyinName"], "detail": "拼音未匹配客户，未写入持仓。"} for item in diagnostics["unmatched"])
+        conn.execute(
+            """INSERT INTO import_jobs(id, filename, owner_id, owner_name, total_rows, created_count, updated_count, conflict_count, error_count, imported_by, imported_by_name, created_at, data_quality_json, created_customer_ids_json, updated_customer_ids_json, opened_customer_ids_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (job_id, payload.filename, UNASSIGNED_OWNER_ID, UNASSIGNED_OWNER["name"], len(payload.rows), 0, len(updated), len(conflicts), len(errors), user["id"], user["name"], job_created_at, json.dumps(quality, ensure_ascii=False), "[]", json.dumps([item["id"] for item in updated], ensure_ascii=False), "[]"),
+        )
+        audit(conn, user, "import.pinyin_holding_completed", "import_job", job_id, {"updated": len(updated), "unchanged": unchanged_count, "conflicts": len(conflicts), "errors": len(errors)})
+    return {"jobId": job_id, "mode": "holding_pinyin", "profile": "holding_pinyin", "created": created, "updated": updated, "openedCount": 0, "unchangedCount": unchanged_count, "conflicts": conflicts, "errors": errors, "dataQuality": quality}
+
+
 @app.post("/api/imports/commit")
 def import_commit(payload: ImportCommitPayload, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     if not user["canImportCustomers"]:
@@ -3045,10 +3195,12 @@ def import_commit(payload: ImportCommitPayload, user: dict[str, Any] = Depends(c
     if mode not in {"append", "snapshot"}:
         raise HTTPException(422, "导入模式无效。")
     profile = str(payload.importProfile or "standard").strip().lower()
-    if profile not in {"standard", "hongan_master", "asset", "holding", "hongan_activity"}:
+    if profile not in {"standard", "hongan_master", "asset", "holding", "holding_pinyin", "hongan_activity"}:
         profile = "standard"
     if profile == "hongan_activity":
         return commit_hongan_activity_import(payload, user)
+    if profile == "holding_pinyin":
+        return commit_pinyin_holding_import(payload, user)
     if profile == "standard" and payload.rows:
         if any(row.get("holdingSnapshots") for row in payload.rows) and not any(row.get("accountStatus") for row in payload.rows):
             profile = "holding"
