@@ -1709,6 +1709,15 @@ def make_import_review_item(profile: str, category: str, item: dict[str, Any], r
     return review
 
 
+def attach_legacy_review_metadata(review: dict[str, Any]) -> dict[str, Any]:
+    """Give older activity diagnostics the same source context as new reviews."""
+    if review.get("profile") != "hongan_activity":
+        return review
+    if review.get("category") == "conflict":
+        review.setdefault("targetAdvisor", (review.get("advisors") or [""])[0] if review.get("advisors") else "")
+    return review
+
+
 def parse_import_review_items(job: Any) -> list[dict[str, Any]]:
     try:
         value = job["review_items_json"] if isinstance(job, (dict, sqlite3.Row)) else None
@@ -1731,7 +1740,7 @@ def legacy_import_review_items(job: dict[str, Any]) -> list[dict[str, Any]]:
         for entry in activity.get(category, []):
             review = make_import_review_item("hongan_activity", label, entry)
             review["id"] = f"legacy-{job['id']}-{label}-{entry.get('name', '')}-{entry.get('sourceSheet', '')}"
-            result.append(review)
+            result.append(attach_legacy_review_metadata(review))
     return result
 
 
@@ -2998,7 +3007,10 @@ def parse_hongan_activity_workbook(content: bytes) -> dict[str, Any] | None:
 
 def hongan_activity_match_diagnostics(conn: Any, rows: list[dict[str, Any]], limit: int | None = 200) -> dict[str, Any]:
     customers = [dict(row) for row in conn.execute(
-        "SELECT id, customer_code, name, wechat_nickname, hongan_advisor FROM customers WHERE archived_at IS NULL"
+        """SELECT c.id, c.customer_code, c.name, c.wechat_nickname, c.hongan_advisor,
+        (SELECT i.display_value FROM customer_identifiers i
+         WHERE i.customer_id = c.id AND i.kind = 'tw' ORDER BY i.id LIMIT 1) AS tw_code
+        FROM customers c WHERE c.archived_at IS NULL"""
     ).fetchall()]
     by_name: dict[str, list[dict[str, Any]]] = {}
     for customer in customers:
@@ -3026,7 +3038,16 @@ def hongan_activity_match_diagnostics(conn: Any, rows: list[dict[str, Any]], lim
         if not advisors:
             result["noAdvisor"].append(summary)
         elif len(candidates) != 1:
-            result["ambiguous" if len(candidates) > 1 else "unmatched"].append({**summary, "candidateCount": len(candidates)})
+            candidate_items = [{
+                "customerId": candidate["id"],
+                "customerCode": candidate.get("customer_code", ""),
+                "customerName": candidate.get("name", ""),
+                "twCode": candidate.get("tw_code", "") or "",
+                "currentAdvisor": candidate.get("hongan_advisor", "") or "",
+            } for candidate in candidates]
+            result["ambiguous" if len(candidates) > 1 else "unmatched"].append({
+                **summary, "candidateCount": len(candidates), "candidates": candidate_items,
+            })
         elif len(advisors) > 1:
             result["conflicts"].append({**summary, "customerId": candidates[0]["id"], "customerCode": candidates[0]["customer_code"], "currentAdvisor": candidates[0].get("hongan_advisor", "")})
         else:
@@ -3489,7 +3510,7 @@ def resolve_import_review(review_id: str, payload: ImportReviewResolvePayload, u
     """Resolve a queued exception by safely linking it or marking it handled."""
     import_review_access(user)
     action = str(payload.action or "").strip().lower()
-    if action not in {"apply", "ignore"}:
+    if action not in {"apply", "keep", "ignore"}:
         raise HTTPException(422, "复核操作无效。")
     with db() as conn:
         jobs = conn.execute("SELECT * FROM import_jobs ORDER BY created_at DESC LIMIT 500").fetchall()
@@ -3530,7 +3551,7 @@ def resolve_import_review(review_id: str, payload: ImportReviewResolvePayload, u
                 audit(conn, user, "import_review.holding_applied", "customer", customer["id"], {"reviewId": review_id, "profile": profile})
             else:
                 raise HTTPException(422, "这类冲突需要先在客户详情中手动修改，再标记为已处理。")
-        target["status"] = "resolved" if action == "apply" else "ignored"
+        target["status"] = "resolved" if action in {"apply", "keep"} else "ignored"
         target["resolvedAt"] = now_iso()
         target["resolvedBy"] = user["id"]
         target["resolutionNote"] = str(payload.note or "").strip()[:500]

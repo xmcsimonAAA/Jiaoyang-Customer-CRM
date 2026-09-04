@@ -69,6 +69,11 @@ body { background: #dff08a; padding: 30px; }
 .review-category.unmatched, .review-category.error { color: #9a5555; background: #fbe8e8; }
 .review-actions { display: flex; justify-content: flex-end; gap: 6px; flex-wrap: wrap; }
 .review-actions .secondary-btn { min-height: 30px; padding: 6px 10px; font-size: 10px; }
+.review-heading-actions { display: flex; align-items: center; gap: 10px; }
+.review-heading-actions .secondary-btn { min-height: 30px; padding: 6px 11px; font-size: 10px; }
+.review-status { display: inline-block; margin-left: 7px; padding: 3px 6px; border-radius: 5px; color: #4d7a68; background: #e7f5ee; font-size: 9px; }
+.review-status.ignored { color: #77767b; background: #efefed; }
+.review-row.is-reviewed { opacity: .72; }
 .review-resolver-modal { max-width: 560px; }
 .review-resolver-note { margin-bottom: 15px; padding: 10px 12px; border-radius: 8px; color: #66656a; background: #f4f4f2; font-size: 11px; line-height: 1.5; }
 .review-search-row { display: flex; gap: 8px; }
@@ -80,6 +85,30 @@ body { background: #dff08a; padding: 30px; }
 .review-customer-option small { color: #7e7d83; font-size: 10px; }
 @media (max-width: 840px) { .review-table-head { display: none; } .review-row { grid-template-columns: 1fr 1fr; } .review-row > div:nth-child(3) { grid-column: 1 / -1; } .review-actions { justify-content: flex-start; } }
 @media (max-width: 520px) { .review-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } .review-row { grid-template-columns: 1fr; gap: 9px; } .review-row > div:nth-child(3) { grid-column: auto; } }
+
+.review-guide { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; margin: 18px 0 10px; }
+.review-guide > div { display: grid; gap: 5px; min-height: 72px; padding: 12px 13px; border: 1px solid #e4e4e2; border-radius: 10px; background: #fbfbfa; }
+.review-guide b { color: #343338; font-size: 11px; }
+.review-guide span { color: #77767b; font-size: 10px; line-height: 1.5; }
+.review-record-button { display: block; width: 100%; padding: 0; border: 0; color: inherit; background: transparent; text-align: left; cursor: pointer; }
+.review-record-button:hover strong { color: #566b1e; text-decoration: underline; text-underline-offset: 3px; }
+.review-resolver-modal { width: min(640px, 100%); }
+.review-resolver-note { display: grid; gap: 4px; }
+.review-resolver-note strong { color: #4f631d; font-size: 11px; }
+.review-resolver-note span { color: #4d4c52; }
+.review-resolver-note small { color: #85848a; font-size: 10px; }
+.review-comparison { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin: 0 0 15px; }
+.review-comparison > div { display: grid; gap: 5px; padding: 11px 12px; border: 1px solid #e6e5e2; border-radius: 9px; background: #fafaf9; }
+.review-comparison > div:last-child { border-color: #d7e6a1; background: #f7fbdc; }
+.review-comparison span { color: #85848a; font-size: 10px; }
+.review-comparison strong { color: #303036; font-size: 13px; }
+.review-source-detail { margin: 0 0 15px; padding: 9px 11px; border-left: 3px solid #d9f34f; color: #76757b; background: #f7f7f5; font-size: 10px; line-height: 1.55; }
+.review-candidate-heading { margin: 3px 0 7px; color: #77767b; font-size: 10px; font-weight: 700; }
+.review-customer-option > span { display: grid; gap: 3px; min-width: 0; }
+.review-customer-option > small { flex: 0 0 auto; margin-left: 10px; color: #85848a; font-size: 10px; }
+.review-advisor-field { margin-top: 15px; }
+@media (max-width: 840px) { .review-guide { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 520px) { .review-guide { grid-template-columns: 1fr; } .review-comparison { grid-template-columns: 1fr; } .review-heading-actions { align-items: flex-end; flex-direction: column; gap: 6px; } .review-resolver-modal .modal-footer { align-items: stretch; flex-wrap: wrap; } .review-resolver-modal .modal-footer .primary-btn,.review-resolver-modal .modal-footer #review-keep { flex: 1 1 100%; } }
 .flux-shell .component-grid { width: 100%; grid-template-columns: repeat(4,minmax(0,1fr)); }
 .flux-shell .component-card { min-width: 0; }
 @media (max-width:1180px) { .flux-shell .component-grid { grid-template-columns: repeat(2,minmax(0,1fr)); } }
