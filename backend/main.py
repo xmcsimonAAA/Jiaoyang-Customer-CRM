@@ -3531,7 +3531,12 @@ def resolve_import_review(review_id: str, payload: ImportReviewResolvePayload, u
         if action == "apply":
             if not payload.customerId:
                 raise HTTPException(422, "确认并入前请选择要关联的客户。")
-            customer = assert_customer_access(conn, payload.customerId, user)
+            try:
+                customer = assert_customer_access(conn, payload.customerId, user)
+            except HTTPException as exc:
+                if exc.status_code == 404 and user.get("customerScope") != "all":
+                    raise HTTPException(403, "当前 CRM 数据范围不是全量客户，无法处理其他负责人的记录。请在权限设置中将该账号改为“全量客户”后重试。") from exc
+                raise
             if profile == "hongan_activity":
                 require_advisor_binding_manager(user)
                 advisor = str(payload.honganAdvisor or target.get("targetAdvisor") or ((target.get("advisors") or [""])[0]) or "").strip()

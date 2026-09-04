@@ -87,6 +87,7 @@ body { background: #dff08a; padding: 30px; }
 @media (max-width: 520px) { .review-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } .review-row { grid-template-columns: 1fr; gap: 9px; } .review-row > div:nth-child(3) { grid-column: auto; } }
 
 .review-guide { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; margin: 18px 0 10px; }
+.review-scope-warning { margin: 14px 0; padding: 10px 12px; border: 1px solid #efd3a8; border-radius: 9px; color: #8a612d; background: #fff8ed; font-size: 11px; line-height: 1.5; }
 .review-guide > div { display: grid; gap: 5px; min-height: 72px; padding: 12px 13px; border: 1px solid #e4e4e2; border-radius: 10px; background: #fbfbfa; }
 .review-guide b { color: #343338; font-size: 11px; }
 .review-guide span { color: #77767b; font-size: 10px; line-height: 1.5; }
