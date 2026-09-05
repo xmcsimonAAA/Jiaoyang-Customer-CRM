@@ -629,6 +629,44 @@ def test_pinyin_holding_preview_writes_only_unique_customer_matches():
     assert all(item["id"] != review["id"] for item in remaining)
 
 
+def test_import_wizard_lists_workbook_tabs_and_estimates_changes_without_writing():
+    admin_headers, _ = login("admin", "admin123")
+    workbook_payload = {
+        "filename": "港安活动记录.xlsx",
+        "dataBase64": base64.b64encode(xlsx_with_hongan_activity_sheets()).decode(),
+    }
+    catalog = client.post("/api/imports/workbook", headers=admin_headers, json=workbook_payload)
+    assert catalog.status_code == 200, catalog.text
+    assert [sheet["name"] for sheet in catalog.json()["sheets"]] == ["2026.08.26", "2026.08.19", "Q&A"]
+
+    one_sheet = client.post(
+        "/api/imports/preview", headers=admin_headers,
+        json={**workbook_payload, "sheetName": "2026.08.19"},
+    )
+    assert one_sheet.status_code == 200, one_sheet.text
+    assert one_sheet.json()["importProfile"] == "hongan_activity"
+    assert one_sheet.json()["sheetName"] == "2026.08.19"
+    assert one_sheet.json()["honganActivity"]["totalRows"] == 3
+
+    before = client.get("/api/customers", headers=admin_headers).json()["total"]
+    impact = client.post(
+        "/api/imports/impact", headers=admin_headers,
+        json={
+            "filename": "客户快照.xlsx · 客户表", "mode": "snapshot", "importProfile": "standard",
+            "rows": [
+                {"twCode": "TW20991234001", "name": "已有快照客户", "accountStatus": "已开户"},
+                {"twCode": "TW20991234002", "name": "预计新增客户", "accountStatus": "未开户"},
+                {"name": "缺少编号客户"},
+            ],
+        },
+    )
+    assert impact.status_code == 200, impact.text
+    counts = impact.json()["counts"]
+    assert counts["new"] == 2
+    assert counts["missingTw"] == 1
+    assert client.get("/api/customers", headers=admin_headers).json()["total"] == before
+
+
 def test_import_preview_converts_traditional_chinese_to_simplified():
     admin_headers, _ = login("admin", "admin123")
     payload = {

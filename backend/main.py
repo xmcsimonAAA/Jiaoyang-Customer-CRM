@@ -519,6 +519,12 @@ class MergePayload(BaseModel):
 class ImportPreviewPayload(BaseModel):
     filename: str
     dataBase64: str
+    sheetName: str | None = None
+
+
+class ImportWorkbookPayload(BaseModel):
+    filename: str
+    dataBase64: str
 
 
 class ImportCommitPayload(BaseModel):
@@ -531,6 +537,10 @@ class ImportCommitPayload(BaseModel):
     allowUnidentifiedRows: bool = False
     confirmHonganActivity: bool = False
     confirmPinyinHolding: bool = False
+
+
+class ImportImpactPayload(ImportCommitPayload):
+    """Read-only estimate for the final step of the import wizard."""
 
 
 class ImportReviewResolvePayload(BaseModel):
@@ -2881,7 +2891,66 @@ def apply_import_supplemental_updates(conn: sqlite3.Connection, customer_id: str
     return changed
 
 
-def parse_import_file(filename: str, content: bytes) -> tuple[list[str], list[list[Any]], str]:
+def prepare_import_sheet(sheet_name: str, raw_rows: list[list[Any]], allow_generic_header: bool = False) -> tuple[list[str], list[list[Any]], str]:
+    """Normalize one worksheet into headers and data rows for preview/import."""
+    raw_rows = [[clean_import_cell(value) for value in row] for row in raw_rows if any(value not in (None, "") for value in row)]
+    if not raw_rows:
+        raise HTTPException(422, "工作表中没有可读取的数据。")
+    header_index = max(range(min(30, len(raw_rows))), key=lambda i: header_match_score(raw_rows[i]))
+    if not allow_generic_header and header_match_score(raw_rows[header_index]) == 0:
+        raise HTTPException(422, "工作表没有可识别的表头。")
+    header_values = list(raw_rows[header_index])
+    data_index = header_index + 1
+    if data_index < len(raw_rows) and is_secondary_header(raw_rows[data_index]):
+        secondary = list(raw_rows[data_index])
+        width = max(len(header_values), len(secondary))
+        header_values += [""] * (width - len(header_values))
+        secondary += [""] * (width - len(secondary))
+        header_values = [secondary[index] if str(secondary[index] or "").strip() else header_values[index] for index in range(width)]
+        data_index += 1
+    headers = unique_headers(header_values)
+    rows = [list(row) + [None] * (len(headers) - len(row)) for row in raw_rows[data_index:]]
+    return headers, rows, simplify_text(sheet_name)
+
+
+def workbook_preview_sheets(filename: str, content: bytes) -> list[dict[str, Any]]:
+    """Return every readable worksheet for the generic import wizard."""
+    if filename.lower().endswith(".csv"):
+        source_sheets = [("CSV 数据", list(csv.reader(io.StringIO(content.decode("utf-8-sig")))))]
+    elif filename.lower().endswith(".xlsx"):
+        source_sheets = parse_xlsx_without_styles(content)
+    else:
+        raise HTTPException(422, "目前支持 .xlsx 和 .csv 文件。")
+    result: list[dict[str, Any]] = []
+    for sheet_name, raw_rows in source_sheets:
+        non_empty = [list(row) for row in raw_rows if any(value not in (None, "") for value in row)]
+        if not non_empty:
+            continue
+        try:
+            headers, rows, normalized_name = prepare_import_sheet(sheet_name, non_empty, allow_generic_header=True)
+        except HTTPException:
+            continue
+        mapping: dict[str, str] = {}
+        for field, aliases in HEADER_ALIASES.items():
+            match = next((header for header in headers if header_alias_matches(header, aliases)), None)
+            if match:
+                mapping[field] = match
+        values = [{headers[index]: (row[index] if index < len(row) and row[index] is not None else "") for index in range(len(headers))} for row in rows]
+        result.append({
+            "name": normalized_name,
+            "headers": headers,
+            "rows": values[:24],
+            "totalRows": len(values),
+            "suggestedMapping": mapping,
+            "twHeader": detect_tw_header(headers, rows),
+            "headerMatchScore": header_match_score(non_empty[max(range(min(30, len(non_empty))), key=lambda i: header_match_score(non_empty[i]))]),
+        })
+    if not result:
+        raise HTTPException(422, "文件中没有可读取的数据。")
+    return result
+
+
+def parse_import_file(filename: str, content: bytes, selected_sheet: str | None = None) -> tuple[list[str], list[list[Any]], str]:
     if filename.lower().endswith(".csv"):
         text = content.decode("utf-8-sig")
         raw_rows = list(csv.reader(io.StringIO(text)))
@@ -2900,27 +2969,17 @@ def parse_import_file(filename: str, content: bytes) -> tuple[list[str], list[li
         # Workbooks often carry a short historical sheet beside the current
         # full snapshot. Once a sheet has enough recognizable customer headers,
         # prefer the largest data sheet over a smaller one with one extra label.
-        eligible = [item for item in candidates if item[0] >= 2] or candidates
-        _, _, sheet_name, raw_rows = max(eligible, key=lambda item: (item[1], item[0]))
+        if selected_sheet:
+            selected = next((item for item in candidates if simplify_text(item[2]) == simplify_text(selected_sheet)), None)
+            if not selected:
+                raise HTTPException(422, "没有找到所选工作表，请重新选择文件。")
+            _, _, sheet_name, raw_rows = selected
+        else:
+            eligible = [item for item in candidates if item[0] >= 2] or candidates
+            _, _, sheet_name, raw_rows = max(eligible, key=lambda item: (item[1], item[0]))
     else:
         raise HTTPException(422, "目前支持 .xlsx 和 .csv 文件。")
-    raw_rows = [[clean_import_cell(value) for value in row] for row in raw_rows if any(value not in (None, "") for value in row)]
-    sheet_name = simplify_text(sheet_name)
-    if not raw_rows:
-        raise HTTPException(422, "文件中没有可读取的数据。")
-    header_index = max(range(min(30, len(raw_rows))), key=lambda i: header_match_score(raw_rows[i]))
-    header_values = list(raw_rows[header_index])
-    data_index = header_index + 1
-    if data_index < len(raw_rows) and is_secondary_header(raw_rows[data_index]):
-        secondary = list(raw_rows[data_index])
-        width = max(len(header_values), len(secondary))
-        header_values += [""] * (width - len(header_values))
-        secondary += [""] * (width - len(secondary))
-        header_values = [secondary[index] if str(secondary[index] or "").strip() else header_values[index] for index in range(width)]
-        data_index += 1
-    headers = unique_headers(header_values)
-    rows = [list(row) + [None] * (len(headers) - len(row)) for row in raw_rows[data_index:]]
-    return headers, rows, sheet_name
+    return prepare_import_sheet(sheet_name, raw_rows, allow_generic_header=True)
 
 
 HONGAN_ACTIVITY_HEADERS = {
@@ -2951,13 +3010,17 @@ def activity_header_index(headers: list[Any], aliases: tuple[str, ...]) -> int |
     return None
 
 
-def parse_hongan_activity_workbook(content: bytes) -> dict[str, Any] | None:
+def parse_hongan_activity_workbook(content: bytes, selected_sheets: list[str] | None = None) -> dict[str, Any] | None:
     """Parse every dated Hongan activity sheet, ignoring the Q&A/reference sheet."""
     sheets = parse_xlsx_without_styles(content)
+    selected = {simplify_text(name).strip() for name in selected_sheets or [] if str(name).strip()}
     activity_rows: list[dict[str, Any]] = []
     sheet_stats: list[dict[str, Any]] = []
     recognized_sheets = 0
     for sheet_order, (sheet_name, raw_rows) in enumerate(sheets):
+        normalized_sheet_name = simplify_text(sheet_name).strip()
+        if selected and normalized_sheet_name not in selected:
+            continue
         if simplify_text(sheet_name).strip().lower() in {"q&a", "qa", "常见问题", "参考答复"}:
             continue
         non_empty = [[clean_import_cell(value) for value in row] for row in raw_rows if any(clean_import_cell(value) not in (None, "") for value in row)]
@@ -2999,8 +3062,13 @@ def parse_hongan_activity_workbook(content: bytes) -> dict[str, Any] | None:
             }
             activity_rows.append(item)
             rows_added += 1
-        sheet_stats.append({"name": simplify_text(sheet_name).strip(), "rows": rows_added})
-    if recognized_sheets < 2 or not activity_rows:
+        sheet_stats.append({"name": normalized_sheet_name, "rows": rows_added})
+    if not activity_rows:
+        return None
+    # A single-sheet customer master can contain the same two columns. Treat
+    # it as an activity sheet only when it has multiple tabs or a date-like
+    # activity tab name.
+    if recognized_sheets < 2 and not any(re.search(r"20\d{2}[./-]\d{1,2}[./-]\d{1,2}", item.get("name", "")) for item in sheet_stats):
         return None
     return {"rows": activity_rows, "sheets": sheet_stats, "recognizedSheets": recognized_sheets}
 
@@ -3062,18 +3130,41 @@ def hongan_activity_match_diagnostics(conn: Any, rows: list[dict[str, Any]], lim
     }
 
 
-@app.post("/api/imports/preview")
-def import_preview(payload: ImportPreviewPayload, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    if not user["canImportCustomers"]:
-        raise HTTPException(403, "您的账号未开通客户导入权限。")
+def decode_import_upload(filename: str, data_base64: str) -> bytes:
     try:
-        content = base64.b64decode(payload.dataBase64, validate=True)
+        content = base64.b64decode(data_base64, validate=True)
     except Exception as exc:
         raise HTTPException(422, "文件内容无效。") from exc
     if len(content) > 15 * 1024 * 1024:
         raise HTTPException(413, "文件不能超过 15MB。")
+    if not filename.lower().endswith((".xlsx", ".csv")):
+        raise HTTPException(422, "目前支持 .xlsx 和 .csv 文件。")
+    return content
+
+
+@app.post("/api/imports/workbook")
+def import_workbook(payload: ImportWorkbookPayload, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    """Step one of the import wizard: inspect all worksheet tabs without importing."""
+    if not user["canImportCustomers"]:
+        raise HTTPException(403, "您的账号未开通客户导入权限。")
+    content = decode_import_upload(payload.filename, payload.dataBase64)
     try:
-        activity_workbook = parse_hongan_activity_workbook(content) if payload.filename.lower().endswith(".xlsx") else None
+        sheets = workbook_preview_sheets(payload.filename, content)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(422, "无法读取工作簿，请确认文件未损坏，或另存为新的 .xlsx 后重试。") from exc
+    return {"filename": payload.filename, "sheets": sheets, "textNormalization": "繁体中文已统一转换为简体中文"}
+
+
+@app.post("/api/imports/preview")
+def import_preview(payload: ImportPreviewPayload, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    if not user["canImportCustomers"]:
+        raise HTTPException(403, "您的账号未开通客户导入权限。")
+    content = decode_import_upload(payload.filename, payload.dataBase64)
+    try:
+        selected_sheets = [payload.sheetName] if payload.sheetName else None
+        activity_workbook = parse_hongan_activity_workbook(content, selected_sheets) if payload.filename.lower().endswith(".xlsx") else None
     except HTTPException:
         raise
     except Exception as exc:
@@ -3101,13 +3192,13 @@ def import_preview(payload: ImportPreviewPayload, user: dict[str, Any] = Depends
             "headers": activity_headers, "suggestedMapping": {}, "suggestedCustomMapping": {}, "customerFields": [],
             "rows": preview_rows, "totalRows": len(activity_workbook["rows"]), "truncated": len(activity_workbook["rows"]) > IMPORT_ROW_LIMIT,
             "activityRows": activity_workbook["rows"][:IMPORT_ROW_LIMIT],
-            "sheetName": f"港安活动分表（{activity_workbook['recognizedSheets']} 张）", "sheetStats": activity_workbook["sheets"],
+            "sheetName": simplify_text(payload.sheetName).strip() if payload.sheetName else f"港安活动分表（{activity_workbook['recognizedSheets']} 张）", "sheetStats": activity_workbook["sheets"],
             "textNormalization": "繁体中文已统一转换为简体中文", "profile": "hongan_activity", "importProfile": "hongan_activity",
             "warnings": warnings, "honganActivity": activity_diagnostics,
             "dataQuality": {"importProfile": "hongan_activity", "hasTwSnapshot": False, "honganAutoFill": counts["autoFill"], "honganUnchanged": counts["unchanged"], "honganConflicts": counts["conflicts"], "honganAmbiguous": counts["ambiguous"], "honganUnmatched": counts["unmatched"]},
         }
     try:
-        headers, raw_rows, sheet_name = parse_import_file(payload.filename, content)
+        headers, raw_rows, sheet_name = parse_import_file(payload.filename, content, payload.sheetName)
     except HTTPException:
         raise
     except Exception as exc:
@@ -3266,6 +3357,92 @@ def commit_pinyin_holding_import(payload: ImportCommitPayload, user: dict[str, A
         )
         audit(conn, user, "import.pinyin_holding_completed", "import_job", job_id, {"updated": len(updated), "unchanged": unchanged_count, "conflicts": len(conflicts), "errors": len(errors)})
     return {"jobId": job_id, "mode": "holding_pinyin", "profile": "holding_pinyin", "created": created, "updated": updated, "openedCount": 0, "unchangedCount": unchanged_count, "conflicts": conflicts, "errors": errors, "dataQuality": quality}
+
+
+@app.post("/api/imports/impact")
+def import_impact(payload: ImportImpactPayload, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    """Estimate the write result after a user has chosen columns and row filters."""
+    if not user["canImportCustomers"]:
+        raise HTTPException(403, "您的账号未开通客户导入权限。")
+    if len(payload.rows) > IMPORT_ROW_LIMIT:
+        raise HTTPException(422, f"单次最多导入 {IMPORT_ROW_LIMIT} 行，请拆分文件。")
+    profile = str(payload.importProfile or "standard").strip().lower()
+    if profile not in {"standard", "hongan_master", "asset", "holding"}:
+        raise HTTPException(422, "请使用已识别的专用导入方式预览此工作表。")
+    mode = str(payload.mode or "append").strip().lower()
+    import_rows, duplicate_merge_count = merge_supplemental_rows(payload.rows, profile)
+    has_tw_snapshot = mode == "snapshot" or any(normalize_tw_code(row.get("twCode", "")) for row in import_rows)
+    counts = {
+        "new": 0, "update": 0, "unchanged": 0, "needsConfirmation": 0,
+        "missingIdentity": 0, "missingTw": 0, "unknownTw": 0, "potentialDuplicate": 0,
+        "duplicateTw": 0, "filteredRows": len(payload.rows), "mergedRows": duplicate_merge_count,
+    }
+    samples: dict[str, list[dict[str, Any]]] = {key: [] for key in ("new", "update", "needsConfirmation", "missingTw", "unknownTw", "potentialDuplicate")}
+
+    def add_sample(kind: str, index: int, row: dict[str, Any], **extra: Any) -> None:
+        if len(samples.get(kind, [])) >= 8:
+            return
+        samples[kind].append({
+            "row": index,
+            "name": str(row.get("name") or row.get("wechatNickname") or row.get("twCode") or "未命名客户"),
+            **extra,
+        })
+
+    seen_tw_codes: set[str] = set()
+    with db() as conn:
+        for index, raw_row in enumerate(import_rows, start=1):
+            row = normalize_import_row(raw_row)
+            tw_code = normalize_tw_code(row.get("twCode", ""))
+            if profile in {"asset", "holding"}:
+                if not tw_code:
+                    counts["missingTw"] += 1
+                    add_sample("missingTw", index, row, detail="资产或持仓更新必须使用 TW 编号")
+                    continue
+                existing = find_customer_by_tw(conn, tw_code)
+                if not existing:
+                    counts["unknownTw"] += 1
+                    add_sample("unknownTw", index, row, twCode=tw_code, detail="主客户表没有这个 TW 编号")
+                    continue
+                counts["update"] += 1
+                add_sample("update", index, row, customerCode=existing["customer_code"], twCode=tw_code)
+                continue
+            if has_tw_snapshot and not tw_code:
+                counts["missingTw"] += 1
+                add_sample("missingTw", index, row, detail="全量快照的每一行都必须有 TW 编号")
+                continue
+            if tw_code:
+                if tw_code in seen_tw_codes:
+                    counts["duplicateTw"] += 1
+                    continue
+                seen_tw_codes.add(tw_code)
+                existing = find_customer_by_tw(conn, tw_code)
+                if existing:
+                    counts["update"] += 1
+                    add_sample("update", index, row, customerCode=existing["customer_code"], twCode=tw_code)
+                    continue
+            display_name = str(row.get("name", "") or row.get("wechatNickname", "")).strip()
+            if not display_name:
+                counts["missingIdentity"] += 1
+                continue
+            has_contact = bool(normalize_phone(str(row.get("phone", "")))) or bool(normalize_email(str(row.get("email", ""))))
+            potential = duplicate_matches(conn, str(row.get("phone", "")), str(row.get("email", ""))) if has_contact else []
+            if potential:
+                counts["potentialDuplicate"] += 1
+                add_sample("potentialDuplicate", index, row, detail="手机号或邮箱与系统现有客户重复", candidates=potential[:2])
+                continue
+            if not has_contact and not tw_code and not payload.allowUnidentifiedRows:
+                counts["needsConfirmation"] += 1
+                add_sample("needsConfirmation", index, row, detail="缺少手机号、邮箱和 TW 编号，需要确认后才能写入")
+                continue
+            counts["new"] += 1
+            add_sample("new", index, row, twCode=tw_code)
+    return {
+        "profile": profile,
+        "mode": "snapshot" if has_tw_snapshot else "append",
+        "counts": counts,
+        "samples": samples,
+        "message": "这是基于当前客户表的只读估算。确认导入时会再次校验，避免并发修改造成误写。",
+    }
 
 
 @app.post("/api/imports/commit")

@@ -614,7 +614,73 @@ function openQuickCustomerForm() {
   if (!canManageHonganAdvisor) document.querySelector("#quick-customer-form [name=hkAdvisor]")?.closest(".field")?.remove();
   document.querySelector("#quick-customer-form").addEventListener("submit", async (event) => { event.preventDefault(); const values = Object.fromEntries(new FormData(event.currentTarget)); for (const key of ["intentAmount", "fundedAmount", "actualAmount"]) values[key] = Number(values[key] || 0); values.targetBatchId = values.targetBatchId || null; values.customValues = Object.fromEntries([...event.currentTarget.querySelectorAll("[data-custom-input]")].map((input) => [input.dataset.customInput,input.value])); try { const result = await api("/api/customers", {method:"POST", body: JSON.stringify(values)}); state.meta = await api("/api/meta"); closeModal(); toast(result.potentialDuplicates?.length ? `客户已保存，发现 ${result.potentialDuplicates.length} 条同名或同昵称记录，请主管确认` : "客户已进入数据表"); await navigate(state.view === "imports" ? "customers" : state.view); } catch (err) { toast(err.message); } });
 }
-async function openQuickFollowForm(selectedCustomerId = "") { if (!state.customers.length) { const data = await api("/api/customers?pageSize=100"); state.customers = data.items; } const customerOptions = state.customers.length ? state.customers.map((row) => `<option value="${esc(row.id)}" ${selectedCustomerId === row.id ? "selected" : ""}>${esc(row.name || row.wechat_nickname || row.customer_code)} · ${esc(row.customer_code)}</option>`).join("") : `<option value="">暂无可跟进客户</option>`; openModal(`<div class="modal"><div class="modal-header"><h3>写今日跟进</h3><button class="close-btn" data-close>×</button></div><form id="quick-follow-form"><div class="modal-body"><div class="field"><label>客户 *</label><select name="customerId" required>${customerOptions}</select></div><div class="form-grid"><div class="field"><label>沟通方式</label><select name="method">${state.meta.followupMethods.map((v) => `<option>${v}</option>`).join("")}</select></div><div class="field"><label>跟进后阶段</label><select name="stageAfter">${state.meta.stages.map((v) => `<option>${esc(v)}</option>`).join("")}</select></div></div><div class="field"><label>沟通内容 *</label><textarea name="content" required placeholder="记录客户反馈、资金进度和下一步动作"></textarea></div><div class="form-grid"><div class="field"><label>沟通结果</label><input name="outcome"></div><div class="field"><label>下一步动作</label><input name="nextAction"></div><div class="field"><label>下次跟进时间</label><input name="nextFollowupAt" type="datetime-local"></div></div></div><div class="modal-footer"><button class="secondary-btn" type="button" data-close>取消</button><button class="primary-btn">保存跟进</button></div></form></div>`); document.querySelector("#quick-follow-form").addEventListener("submit", async (event) => { event.preventDefault(); const values = Object.fromEntries(new FormData(event.currentTarget)); const customerId = values.customerId; delete values.customerId; values.nextFollowupAt = values.nextFollowupAt || null; try { await api(`/api/customers/${customerId}/followups`, {method:"POST", body: JSON.stringify(values)}); closeModal(); toast("跟进已保存"); await navigate("followups"); } catch (err) { toast(err.message); } }); }
+async function openQuickFollowForm(selectedCustomerId = "") {
+  if (!state.customers.length) {
+    const data = await api("/api/customers?page=1&pageSize=20");
+    state.customers = data.items || [];
+  }
+  let initialCustomer = state.customers.find((row) => row.id === selectedCustomerId) || null;
+  if (selectedCustomerId && !initialCustomer) {
+    try {
+      const detail = await api(`/api/customers/${encodeURIComponent(selectedCustomerId)}`);
+      initialCustomer = detail.customer || null;
+      if (initialCustomer) state.customers = [initialCustomer, ...state.customers.filter((row) => row.id !== initialCustomer.id)];
+    } catch { /* The picker can still search within the user's visible customers. */ }
+  }
+  openModal(`<div class="modal"><div class="modal-header"><h3>写今日跟进</h3><button class="close-btn" data-close>×</button></div><form id="quick-follow-form"><div class="modal-body"><div class="field"><label>客户 *</label><div class="follow-customer-picker"><div class="follow-search-row"><input id="follow-customer-search-input" type="search" autocomplete="off" placeholder="搜索姓名、TW 编号、手机号或微信昵称" aria-label="搜索客户"><button class="secondary-btn" type="button" id="follow-customer-search">搜索</button></div><p class="follow-search-hint">先搜索，再点击结果选择客户；最多展示 20 条匹配记录。</p><div id="follow-customer-selected" class="follow-customer-selected" hidden></div><div id="follow-customer-results" class="follow-customer-results" aria-live="polite"></div><input type="hidden" id="follow-customer-id" name="customerId" value="${esc(initialCustomer?.id || selectedCustomerId)}"></div></div><div class="form-grid"><div class="field"><label>沟通方式</label><select name="method">${state.meta.followupMethods.map((v) => `<option>${esc(v)}</option>`).join("")}</select></div><div class="field"><label>跟进后阶段</label><select name="stageAfter">${state.meta.stages.map((v) => `<option>${esc(v)}</option>`).join("")}</select></div></div><div class="field"><label>沟通内容 *</label><textarea name="content" required placeholder="记录客户反馈、资金进度和下一步动作"></textarea></div><div class="form-grid"><div class="field"><label>沟通结果</label><input name="outcome"></div><div class="field"><label>下一步动作</label><input name="nextAction"></div><div class="field"><label>下次跟进时间</label><input name="nextFollowupAt" type="datetime-local"></div></div></div><div class="modal-footer"><button class="secondary-btn" type="button" data-close>取消</button><button class="primary-btn">保存跟进</button></div></form></div>`);
+  const searchInput = document.querySelector("#follow-customer-search-input");
+  const searchButton = document.querySelector("#follow-customer-search");
+  const selectedNode = document.querySelector("#follow-customer-selected");
+  const resultsNode = document.querySelector("#follow-customer-results");
+  const customerIdInput = document.querySelector("#follow-customer-id");
+  let selected = initialCustomer;
+  let currentRows = state.customers.slice(0, 20);
+  const labelFor = (row) => customerDisplayName(row) || row.wechat_nickname || row.customer_code || "未命名客户";
+  const metaFor = (row) => [row.tw_code ? `TW ${row.tw_code}` : row.customer_code, row.owner_name || "待分配"].filter(Boolean).join(" · ");
+  const renderSelected = () => {
+    if (!selected) {
+      selectedNode.hidden = true;
+      selectedNode.innerHTML = "";
+      customerIdInput.value = "";
+      return;
+    }
+    customerIdInput.value = selected.id;
+    selectedNode.hidden = false;
+    selectedNode.innerHTML = `<div><small>已选择客户</small><strong>${esc(labelFor(selected))}</strong><span>${esc(metaFor(selected))}</span></div><button type="button" class="secondary-btn" data-follow-customer-clear>更换</button>`;
+    selectedNode.querySelector("[data-follow-customer-clear]").addEventListener("click", () => { selected = null; renderSelected(); searchInput.focus(); });
+  };
+  const renderResults = (rows) => {
+    currentRows = rows || [];
+    resultsNode.innerHTML = currentRows.length ? currentRows.map((row) => `<button type="button" class="follow-customer-option ${selected?.id === row.id ? "selected" : ""}" data-follow-customer="${esc(row.id)}"><span><strong>${esc(labelFor(row))}</strong><small>${esc(metaFor(row) || "无编号信息")}</small></span><span class="follow-customer-use">选择</span></button>`).join("") : `<div class="follow-customer-empty">没有找到可见客户，请换姓名、TW 编号或手机号试试。</div>`;
+    resultsNode.querySelectorAll("[data-follow-customer]").forEach((button) => button.addEventListener("click", () => {
+      selected = currentRows.find((row) => row.id === button.dataset.followCustomer) || null;
+      renderSelected();
+      renderResults(currentRows);
+    }));
+  };
+  const searchCustomers = async () => {
+    const query = searchInput.value.trim();
+    if (!query) { renderResults(state.customers.slice(0, 20)); return; }
+    searchButton.disabled = true;
+    try {
+      const data = await api(`/api/customers?search=${encodeURIComponent(query)}&page=1&pageSize=20`);
+      renderResults(data.items || []);
+    } catch (err) { toast(err.message); } finally { searchButton.disabled = false; }
+  };
+  renderSelected();
+  renderResults(currentRows);
+  searchButton.addEventListener("click", searchCustomers);
+  searchInput.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); searchCustomers(); } });
+  document.querySelector("#quick-follow-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const values = Object.fromEntries(new FormData(event.currentTarget));
+    const customerId = values.customerId;
+    if (!customerId) { toast("请先搜索并选择客户"); searchInput.focus(); return; }
+    delete values.customerId;
+    values.nextFollowupAt = values.nextFollowupAt || null;
+    try { await api(`/api/customers/${customerId}/followups`, {method:"POST", body: JSON.stringify(values)}); closeModal(); toast("跟进已保存"); await navigate("followups"); } catch (err) { toast(err.message); }
+  });
+}
 
 function openDetail(id) { api(`/api/customers/${encodeURIComponent(id)}`).then((data) => { state.detail = data; lockPageScroll(); renderDrawer(); renderCustomerRelations(); }).catch((err) => toast(err.message)); }
 function lockPageScroll() {
@@ -838,3 +904,271 @@ function openImportReviewResolver(item) {
 }
 
 async function resolveImportReview(reviewId, action, customerId = "", honganAdvisor = "") { try { await api(`/api/import-reviews/${encodeURIComponent(reviewId)}/resolve`, {method:"POST", body: JSON.stringify({action, customerId: customerId || null, honganAdvisor: honganAdvisor || null})}); closeModal(); const message = action === "apply" ? "已采用导入值并写入" : action === "keep" ? "已保留系统值并完成复核" : "已暂不处理"; toast(message); await renderImportReviews(document.querySelector("#content")); } catch (err) { toast(err.message); } }
+
+/* Import wizard: upload is read-only until the final confirmation for each sheet. */
+const IMPORT_RECIPE_STORAGE_KEY = "jy_customer_import_recipes_v1";
+const WIZARD_CORE_FIELDS = [
+  ["name", "客户姓名"], ["twCode", "TW 唯一编号"], ["wechatNickname", "微信昵称"], ["phone", "手机号"], ["email", "邮箱"],
+  ["company", "公司"], ["source", "客户来源"], ["sourceDetail", "来源明细"], ["stage", "客户阶段"], ["priority", "优先级"],
+  ["accountStatus", "开户状态"], ["accountBroker", "开户券商"], ["accountOpenedAt", "开户日期"], ["brokerDepositAmount", "入金金额"],
+  ["capitalDestination", "资金流向"], ["intentStatus", "定增意向"], ["placementStatus", "定增推进"], ["intentAmount", "意向金额"],
+  ["fundedAmount", "到账金额"], ["actualAmount", "实际参与金额"], ["lostReason", "流失原因"], ["hkAdvisor", "港安顾问"],
+  ["sourceAdvisorLabel", "原表骄阳顾问（历史标签）"], ["notes", "备注"],
+];
+
+function importRecipes() { try { const items = JSON.parse(localStorage.getItem(IMPORT_RECIPE_STORAGE_KEY) || "[]"); return Array.isArray(items) ? items : []; } catch { return []; } }
+function saveImportRecipes(items) { localStorage.setItem(IMPORT_RECIPE_STORAGE_KEY, JSON.stringify(items.slice(0, 24))); }
+function wizardSheetKey(preview) { return (preview.headers || []).map((header) => String(header).trim()).join("\u001f"); }
+function wizardCurrentSheet() { const wizard = state.importWizard; return wizard?.selectedSheets?.[wizard.currentIndex] || ""; }
+function wizardPreview() { return state.importWizard?.previews?.[wizardCurrentSheet()] || null; }
+function wizardWorkspace() { return document.querySelector("#import-workspace"); }
+function wizardTargetOptions(preview, selected = "") {
+  const customFields = (preview.customerFields || []).map((field) => [`custom:${field.id}`, `自定义字段：${field.label}`]);
+  return [["", "不导入"], ...WIZARD_CORE_FIELDS, ...customFields].map(([value, label]) => `<option value="${esc(value)}" ${selected === value ? "selected" : ""}>${esc(label)}</option>`).join("");
+}
+function wizardDefaultConfig(preview) {
+  const sourceMap = {};
+  (preview.headers || []).forEach((header) => {
+    const core = Object.entries(preview.suggestedMapping || {}).find(([, source]) => source === header)?.[0];
+    const custom = Object.entries(preview.suggestedCustomMapping || {}).find(([, source]) => source === header)?.[0];
+    sourceMap[header] = core || (custom ? `custom:${custom}` : "");
+  });
+  return {sourceMap, filterMode: "all", filterHeader: "", filterValue: "", allowUnidentifiedRows: false, ownerId: "unassigned"};
+}
+function wizardConfig(preview) {
+  const wizard = state.importWizard;
+  const sheetName = wizardCurrentSheet();
+  if (!wizard.configs[sheetName]) wizard.configs[sheetName] = wizardDefaultConfig(preview);
+  return wizard.configs[sheetName];
+}
+function wizardReadConfig() {
+  const preview = wizardPreview();
+  if (!preview) return null;
+  const config = wizardConfig(preview);
+  const map = {};
+  document.querySelectorAll("[data-wizard-source]").forEach((select) => { map[select.dataset.wizardSource] = select.value; });
+  if (Object.keys(map).length) config.sourceMap = map;
+  const filterMode = document.querySelector("#wizard-filter-mode");
+  const filterHeader = document.querySelector("#wizard-filter-header");
+  const filterValue = document.querySelector("#wizard-filter-value");
+  const owner = document.querySelector("#wizard-default-owner");
+  const allowUnidentified = document.querySelector("#wizard-allow-unidentified");
+  if (filterMode) config.filterMode = filterMode.value;
+  if (filterHeader) config.filterHeader = filterHeader.value;
+  if (filterValue) config.filterValue = filterValue.value;
+  if (owner) config.ownerId = owner.value;
+  if (allowUnidentified) config.allowUnidentifiedRows = allowUnidentified.checked;
+  return config;
+}
+function wizardRows(preview, config) {
+  const filtered = (preview.rows || []).filter((raw) => {
+    if (config.filterMode === "non_empty") return String(raw[config.filterHeader] ?? "").trim() !== "";
+    if (config.filterMode === "equals") return String(raw[config.filterHeader] ?? "").trim() === String(config.filterValue || "").trim();
+    return true;
+  });
+  return filtered.map((raw) => {
+    const row = {customValues: {}};
+    Object.entries(config.sourceMap || {}).forEach(([source, target]) => {
+      if (!target) return;
+      if (target.startsWith("custom:")) row.customValues[target.slice(7)] = raw[source];
+      else row[target] = raw[source];
+    });
+    if (!Object.keys(row.customValues).length) delete row.customValues;
+    const snapshots = (preview.holdingSnapshots || []).map((snapshot) => ({
+      snapshotDate: snapshot.snapshotDate, securityName: snapshot.securityName, sourceLabel: snapshot.sourceLabel,
+      quantity: Number(String(raw[snapshot.quantityHeader] ?? "").replaceAll(",", "")) || 0,
+      marketValue: Number(String(raw[snapshot.marketValueHeader] ?? "").replaceAll(",", "")) || 0,
+    })).filter((snapshot) => snapshot.quantity || snapshot.marketValue);
+    if (snapshots.length) row.holdingSnapshots = snapshots;
+    return row;
+  });
+}
+function wizardPayload(preview, config) {
+  const rows = wizardRows(preview, config);
+  const profile = preview.importProfile || preview.profile || "standard";
+  const mode = profile === "standard" && rows.some((row) => String(row.twCode || "").trim()) ? "snapshot" : "append";
+  return {filename: `${state.importWizard.file.name} · ${preview.sheetName}`, ownerId: config.ownerId, rows, mode, importProfile: profile, allowUnidentifiedRows: config.allowUnidentifiedRows};
+}
+function renderBulkImport() {
+  const workspace = wizardWorkspace();
+  if (!workspace) return;
+  state.importWizard = null;
+  workspace.innerHTML = `<div class="section-header"><div><h3>批量导入向导</h3><span class="hint">先选择工作表与字段，再查看预计变更，最后确认写入。</span></div><button class="secondary-btn" id="download-import-template">下载导入模板</button></div><div class="section-body"><div class="import-wizard-intro"><span>1</span><div><strong>选择工作表</strong><small>一个 Excel 可以挑选多个标签页；每个标签页会单独核对和入库。</small></div><span>2</span><div><strong>选择字段与记录</strong><small>不需要的列和行不会被上传。</small></div><span>3</span><div><strong>查看变更后确认</strong><small>任何数据写入前都先展示预计新增、更新与待确认。</small></div></div><div class="dropzone"><strong>选择 Excel 或 CSV 文件</strong><span class="hint">支持 .xlsx / .csv，单个工作表最多 5,000 行。</span><label class="primary-btn import-file-button"><input type="file" id="import-file" accept=".xlsx,.csv">选择文件</label></div><div id="bulk-preview"></div></div>`;
+  workspace.querySelector("#import-file").addEventListener("change", handleImportFile);
+  workspace.querySelector("#download-import-template")?.addEventListener("click", downloadImportTemplate);
+}
+async function handleImportFile(event) {
+  const file = event.target.files?.[0];
+  if (!file) return;
+  const previewRoot = document.querySelector("#bulk-preview");
+  previewRoot.innerHTML = `<div class="empty">正在读取 ${esc(file.name)} 的工作表...</div>`;
+  try {
+    const buffer = await file.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    let binary = "";
+    for (let index = 0; index < bytes.length; index += 1) binary += String.fromCharCode(bytes[index]);
+    const dataBase64 = btoa(binary);
+    const workbook = await api("/api/imports/workbook", {method: "POST", body: JSON.stringify({filename: file.name, dataBase64})});
+    const defaultSheets = workbook.sheets.filter((sheet) => Object.keys(sheet.suggestedMapping || {}).length > 0).map((sheet) => sheet.name);
+    state.importWizard = {file, dataBase64, workbook, selectedSheets: defaultSheets, currentIndex: 0, previews: {}, configs: {}, results: []};
+    renderWizardSheetPicker();
+  } catch (err) {
+    previewRoot.innerHTML = `<div class="result-box error-text">${esc(err.message)}</div>`;
+  }
+}
+function renderWizardSheetPicker() {
+  const wizard = state.importWizard;
+  const workspace = wizardWorkspace();
+  if (!wizard || !workspace) return;
+  const sheets = wizard.workbook.sheets || [];
+  workspace.querySelector(".section-body").innerHTML = `<div class="wizard-step-header"><div><span class="wizard-kicker">步骤 1 / 3</span><h4>选择本次要导入的工作表</h4><p>默认勾选了识别到客户字段的工作表。说明页、汇总页或本次不需要的数据不要勾选。</p></div><span class="hint">${esc(wizard.file.name)}</span></div><div class="sheet-picker">${sheets.map((sheet, index) => { const selected = wizard.selectedSheets.includes(sheet.name); const fields = Object.values(sheet.suggestedMapping || {}).slice(0, 5).map((value) => esc(value)).join("、"); return `<label class="sheet-choice ${selected ? "selected" : ""}"><input type="checkbox" data-wizard-sheet="${esc(sheet.name)}" ${selected ? "checked" : ""}><span class="sheet-choice-index">${index + 1}</span><span class="sheet-choice-copy"><strong>${esc(sheet.name)}</strong><small>${sheet.totalRows} 行 · ${fields ? `识别到 ${fields}` : "未识别常用客户字段，请谨慎选择"}</small></span>${sheet.twHeader ? `<span class="sheet-signal">含 TW</span>` : ""}</label>`; }).join("")}</div><div class="wizard-footer"><button class="secondary-btn" id="wizard-reset-file">重新选择文件</button><button class="primary-btn" id="wizard-start-sheets">设置已选工作表</button></div>`;
+  workspace.querySelectorAll("[data-wizard-sheet]").forEach((input) => input.addEventListener("change", () => {
+    wizard.selectedSheets = [...workspace.querySelectorAll("[data-wizard-sheet]:checked")].map((node) => node.dataset.wizardSheet);
+    input.closest(".sheet-choice")?.classList.toggle("selected", input.checked);
+  }));
+  workspace.querySelector("#wizard-reset-file")?.addEventListener("click", renderBulkImport);
+  workspace.querySelector("#wizard-start-sheets")?.addEventListener("click", async () => {
+    if (!wizard.selectedSheets.length) { toast("请至少选择一个需要导入的工作表"); return; }
+    wizard.currentIndex = 0;
+    await renderWizardSheetConfiguration();
+  });
+}
+async function renderWizardSheetConfiguration() {
+  const wizard = state.importWizard;
+  const sheetName = wizardCurrentSheet();
+  const workspace = wizardWorkspace();
+  if (!wizard || !sheetName || !workspace) return;
+  workspace.querySelector(".section-body").innerHTML = `<div class="empty">正在读取“${esc(sheetName)}”...</div>`;
+  try {
+    if (!wizard.previews[sheetName]) wizard.previews[sheetName] = await api("/api/imports/preview", {method: "POST", body: JSON.stringify({filename: wizard.file.name, dataBase64: wizard.dataBase64, sheetName})});
+    const preview = wizardPreview();
+    if (["hongan_activity", "holding_pinyin"].includes(preview.importProfile)) renderWizardSpecialSheet(preview);
+    else renderWizardGenericSheet(preview);
+  } catch (err) {
+    workspace.querySelector(".section-body").innerHTML = `<div class="result-box error-text">${esc(err.message)}</div><div class="wizard-footer"><button class="secondary-btn" id="wizard-back-sheets">返回工作表选择</button></div>`;
+    workspace.querySelector("#wizard-back-sheets")?.addEventListener("click", renderWizardSheetPicker);
+  }
+}
+function wizardProgressMarkup(preview) {
+  const wizard = state.importWizard;
+  return `<div class="wizard-progress"><span>工作表 ${wizard.currentIndex + 1} / ${wizard.selectedSheets.length}</span><strong>${esc(preview.sheetName || wizardCurrentSheet())}</strong><small>${preview.totalRows || 0} 行</small></div>`;
+}
+function renderWizardGenericSheet(preview) {
+  const workspace = wizardWorkspace();
+  const config = wizardConfig(preview);
+  const ownerChoices = state.meta.ownerChoices || state.meta.owners || [];
+  const ownerControl = state.user.canManageAssignments ? `<label class="wizard-owner"><span>未匹配客户的负责人</span><select id="wizard-default-owner">${ownerChoices.map((owner) => `<option value="${esc(owner.id)}" ${config.ownerId === owner.id ? "selected" : ""}>${esc(owner.name)}${owner.team ? ` · ${esc(owner.team)}` : ""}</option>`).join("")}</select></label>` : "";
+  const sourceRows = (preview.headers || []).map((header) => `<label class="wizard-column-row"><span><b>${esc(header)}</b></span><select data-wizard-source="${esc(header)}">${wizardTargetOptions(preview, config.sourceMap[header] || "")}</select></label>`).join("");
+  const profileLabel = preview.importProfile === "asset" ? "券商资产更新" : preview.importProfile === "holding" ? "持仓快照更新" : preview.profile === "hongan_master" ? "港安客户总表" : "客户资料导入";
+  const sample = (preview.rows || []).slice(0, 4);
+  workspace.querySelector(".section-body").innerHTML = `${wizardProgressMarkup(preview)}<div class="wizard-step-header"><div><span class="wizard-kicker">步骤 2 / 3</span><h4>选择要写入的列与记录</h4><p><b>${esc(profileLabel)}</b>。身份匹配优先使用 TW 编号；没有 TW 时不会自动合并同名客户。</p></div><span class="import-profile">${esc(profileLabel)}</span></div><section class="wizard-rule-panel"><div><div><strong>记录筛选</strong><small>只把满足条件的行送入预览，其余行完全不会导入。</small></div><div class="wizard-filter-controls"><select id="wizard-filter-mode"><option value="all" ${config.filterMode === "all" ? "selected" : ""}>全部行</option><option value="non_empty" ${config.filterMode === "non_empty" ? "selected" : ""}>仅某列有值</option><option value="equals" ${config.filterMode === "equals" ? "selected" : ""}>仅某列等于指定值</option></select><select id="wizard-filter-header"><option value="">选择筛选列</option>${(preview.headers || []).map((header) => `<option value="${esc(header)}" ${config.filterHeader === header ? "selected" : ""}>${esc(header)}</option>`).join("")}</select><input id="wizard-filter-value" value="${esc(config.filterValue)}" placeholder="例如：是" ${config.filterMode === "equals" ? "" : "disabled"}></div></section><section class="wizard-mapping"><header><div><strong>列映射</strong><small>每一列都可选择“不导入”。“原表骄阳顾问”仅作为历史标签，不会直接改变当前负责人。</small></div><button class="secondary-btn" type="button" id="wizard-save-recipe">保存本机方案</button></header><div class="wizard-recipe-row">${wizardRecipeSelect(preview)}<button class="secondary-btn" type="button" id="wizard-apply-recipe">套用方案</button></div><div class="wizard-column-list">${sourceRows}</div></section><section class="wizard-safety-row">${ownerControl}<label class="import-consent"><input id="wizard-allow-unidentified" type="checkbox" ${config.allowUnidentifiedRows ? "checked" : ""}><span>允许缺少手机号、邮箱和 TW 编号的历史记录进入待补资料状态。</span></label></section><details class="wizard-source-preview"><summary>查看原表前 ${Math.min(4, sample.length)} 行</summary><div class="table-wrap"><table><thead><tr>${(preview.headers || []).map((header) => `<th>${esc(header)}</th>`).join("")}</tr></thead><tbody>${sample.map((row) => `<tr>${(preview.headers || []).map((header) => `<td>${esc(row[header])}</td>`).join("")}</tr>`).join("")}</tbody></table></div></details><div id="wizard-impact"></div><div class="wizard-footer"><button class="secondary-btn" id="wizard-back-sheets">返回工作表选择</button><button class="primary-btn" id="wizard-check-impact">查看预计变更</button></div>`;
+  const filterMode = workspace.querySelector("#wizard-filter-mode");
+  const filterHeader = workspace.querySelector("#wizard-filter-header");
+  const filterValue = workspace.querySelector("#wizard-filter-value");
+  const refreshFilter = () => { filterHeader.disabled = filterMode.value === "all"; filterValue.disabled = filterMode.value !== "equals"; };
+  filterMode.addEventListener("change", refreshFilter); refreshFilter();
+  workspace.querySelector("#wizard-back-sheets")?.addEventListener("click", () => { wizardReadConfig(); renderWizardSheetPicker(); });
+  workspace.querySelector("#wizard-check-impact")?.addEventListener("click", renderWizardImpact);
+  workspace.querySelector("#wizard-save-recipe")?.addEventListener("click", () => saveWizardRecipe(preview));
+  workspace.querySelector("#wizard-apply-recipe")?.addEventListener("click", () => applyWizardRecipe(preview));
+}
+function wizardRecipeSelect(preview) {
+  const matching = importRecipes().filter((recipe) => recipe.signature === wizardSheetKey(preview));
+  return `<select id="wizard-recipe"><option value="">选择已保存的本机方案</option>${matching.map((recipe) => `<option value="${esc(recipe.id)}">${esc(recipe.name)}</option>`).join("")}</select>`;
+}
+function saveWizardRecipe(preview) {
+  const config = wizardReadConfig();
+  const name = window.prompt("给这个导入方案命名，例如：中阳证券资产周报");
+  if (!name?.trim()) return;
+  const items = importRecipes().filter((recipe) => !(recipe.signature === wizardSheetKey(preview) && recipe.name === name.trim()));
+  items.unshift({id: `${Date.now()}-${Math.random().toString(16).slice(2)}`, name: name.trim(), signature: wizardSheetKey(preview), config});
+  saveImportRecipes(items);
+  toast("方案已保存在本机浏览器");
+  renderWizardGenericSheet(preview);
+}
+function applyWizardRecipe(preview) {
+  const id = document.querySelector("#wizard-recipe")?.value;
+  const recipe = importRecipes().find((item) => item.id === id);
+  if (!recipe) { toast("请先选择一个本机方案"); return; }
+  state.importWizard.configs[wizardCurrentSheet()] = {...wizardDefaultConfig(preview), ...recipe.config, sourceMap: {...wizardDefaultConfig(preview).sourceMap, ...(recipe.config.sourceMap || {})}};
+  renderWizardGenericSheet(preview);
+  toast(`已套用“${recipe.name}”`);
+}
+async function renderWizardImpact() {
+  const preview = wizardPreview();
+  const config = wizardReadConfig();
+  if (!preview || !config) return;
+  const targets = Object.values(config.sourceMap || {}).filter(Boolean);
+  if (!targets.length) { toast("请至少选择一列要导入的数据"); return; }
+  if (!targets.some((target) => ["name", "wechatNickname", "twCode"].includes(target))) { toast("请至少选择客户姓名、微信昵称或 TW 编号作为身份信息"); return; }
+  const duplicateTargets = targets.filter((target, index) => targets.indexOf(target) !== index);
+  if (duplicateTargets.length) { toast("同一个系统字段不能映射两列，请保留一列或选择“不导入”"); return; }
+  if (config.filterMode !== "all" && !config.filterHeader) { toast("请选择用于筛选记录的列"); return; }
+  const payload = wizardPayload(preview, config);
+  if (!payload.rows.length) { toast("当前筛选条件没有符合条件的记录"); return; }
+  const root = document.querySelector("#wizard-impact");
+  root.innerHTML = `<div class="empty">正在根据当前客户表估算变更...</div>`;
+  try {
+    const impact = await api("/api/imports/impact", {method: "POST", body: JSON.stringify(payload)});
+    state.importWizard.impact = impact;
+    const counts = impact.counts || {};
+    const blocked = Number(counts.missingTw || 0) + Number(counts.missingIdentity || 0) + Number(counts.needsConfirmation || 0);
+    const notices = [
+      counts.missingTw ? `有 ${counts.missingTw} 行缺少必需的 TW 编号。` : "",
+      counts.needsConfirmation ? `有 ${counts.needsConfirmation} 行没有任何身份编号，请勾选下方确认框或调整筛选。` : "",
+      counts.potentialDuplicate ? `有 ${counts.potentialDuplicate} 行手机号或邮箱已存在，提交后会进入导入复核，不会自动合并。` : "",
+      counts.unknownTw ? `有 ${counts.unknownTw} 个 TW 尚未在主客户表中找到，资产/持仓不会为它们新建客户。` : "",
+    ].filter(Boolean);
+    root.innerHTML = `<section class="wizard-impact"><header><div><span class="wizard-kicker">步骤 3 / 3</span><h4>预计变更</h4><p>${esc(impact.message || "")}</p></div><span class="hint">将处理 ${counts.filteredRows || 0} 行</span></header><div class="wizard-impact-grid"><div><b>${counts.new || 0}</b><span>预计新增</span></div><div><b>${counts.update || 0}</b><span>预计更新</span></div><div><b>${counts.potentialDuplicate || 0}</b><span>待人工复核</span></div><div><b>${(counts.missingTw || 0) + (counts.needsConfirmation || 0) + (counts.missingIdentity || 0)}</b><span>需先处理</span></div></div>${notices.length ? `<ul>${notices.map((notice) => `<li>${esc(notice)}</li>`).join("")}</ul>` : `<p class="wizard-safe-note">没有发现会阻止本次导入的身份信息问题。确认后系统会再次校验当前数据。</p>`}<div class="wizard-impact-actions"><button class="secondary-btn" id="wizard-edit-config">返回修改</button><button class="primary-btn" id="wizard-commit-sheet" ${blocked ? "disabled" : ""}>确认导入此工作表</button></div></section>`;
+    root.querySelector("#wizard-edit-config")?.addEventListener("click", () => root.innerHTML = "");
+    root.querySelector("#wizard-commit-sheet")?.addEventListener("click", commitWizardSheet);
+  } catch (err) { root.innerHTML = `<div class="result-box error-text">${esc(err.message)}</div>`; }
+}
+function renderWizardSpecialSheet(preview) {
+  const workspace = wizardWorkspace();
+  const isActivity = preview.importProfile === "hongan_activity";
+  const activity = preview.honganActivity || {};
+  const counts = isActivity ? activity.counts || {} : preview.pinyinHolding?.counts || {};
+  const stats = isActivity ? [["活动记录", activity.totalRows], ["可自动补全", counts.autoFill], ["已有一致", counts.unchanged], ["需复核", (counts.conflicts || 0) + (counts.ambiguous || 0)], ["未匹配", counts.unmatched]] : [["持仓记录", preview.totalRows], ["可写入", counts.matched], ["同名待确认", counts.ambiguous], ["未匹配", counts.unmatched]];
+  const message = isActivity ? "此标签页符合港安活动分表格式。系统只处理“保险经纪人/港安顾问”，不会修改骄阳当前负责人、开户人、金额或定增信息。" : "此标签页是没有 TW 编号的拼音持仓表。系统只会写入唯一匹配客户的持仓快照，不会新建客户。";
+  const allowed = isActivity ? state.user.canManageAdvisorBindings : true;
+  workspace.querySelector(".section-body").innerHTML = `${wizardProgressMarkup(preview)}<div class="wizard-step-header"><div><span class="wizard-kicker">专用安全导入</span><h4>${isActivity ? "港安活动分表" : "中阳拼音持仓表"}</h4><p>${esc(message)}</p></div><span class="import-profile">专用规则</span></div><section class="wizard-special-summary"><div class="wizard-impact-grid">${stats.map(([label, value]) => `<div><b>${Number(value || 0)}</b><span>${esc(label)}</span></div>`).join("")}</div>${(preview.warnings || []).length ? `<ul>${preview.warnings.map((warning) => `<li>${esc(warning.message)}</li>`).join("")}</ul>` : ""}</section><label class="import-consent wizard-special-consent"><input id="wizard-confirm-special" type="checkbox" ${allowed ? "" : "disabled"}><span>${isActivity ? "我确认只补全唯一匹配且当前为空的港安顾问，不覆盖已有港安顾问，也不修改骄阳负责人。" : "我确认只写入唯一匹配的拼音持仓记录；同名或未匹配记录会进入导入复核。"}</span></label>${allowed ? "" : `<div class="notice">此账号尚未开通“顾问绑定”权限，不能执行港安顾问补全。</div>`}<div class="wizard-footer"><button class="secondary-btn" id="wizard-back-sheets">返回工作表选择</button><button class="primary-btn" id="wizard-commit-special" ${allowed ? "" : "disabled"}>确认导入此工作表</button></div>`;
+  workspace.querySelector("#wizard-back-sheets")?.addEventListener("click", renderWizardSheetPicker);
+  workspace.querySelector("#wizard-commit-special")?.addEventListener("click", () => {
+    if (!workspace.querySelector("#wizard-confirm-special")?.checked) { toast("请先确认本次专用导入的处理范围"); return; }
+    commitWizardSheet();
+  });
+}
+async function commitWizardSheet() {
+  const wizard = state.importWizard;
+  const preview = wizardPreview();
+  if (!wizard || !preview) return;
+  let payload;
+  if (preview.importProfile === "hongan_activity") payload = {filename: `${wizard.file.name} · ${preview.sheetName}`, importProfile: "hongan_activity", confirmHonganActivity: true, rows: preview.activityRows || []};
+  else if (preview.importProfile === "holding_pinyin") {
+    const quantityHeader = preview.suggestedMapping?.holdingQuantity;
+    const nameHeader = preview.suggestedMapping?.name;
+    const snapshot = preview.holdingSnapshots?.[0];
+    payload = {filename: `${wizard.file.name} · ${preview.sheetName}`, importProfile: "holding_pinyin", confirmPinyinHolding: true, rows: (preview.rows || []).map((row) => ({name: row[nameHeader], holdingQuantity: row[quantityHeader], holdingSnapshots: snapshot ? [{...snapshot, quantity: Number(row[quantityHeader]) || 0, marketValue: 0}] : []}))};
+  } else payload = wizardPayload(preview, wizardReadConfig());
+  try {
+    const result = await api("/api/imports/commit", {method: "POST", body: JSON.stringify(payload)});
+    wizard.results.push({sheetName: preview.sheetName, result});
+    if (state.user.canImportCustomers) renderImportHistory();
+    if (wizard.currentIndex + 1 < wizard.selectedSheets.length) {
+      wizard.currentIndex += 1;
+      toast(`“${preview.sheetName}”已完成，继续设置下一张表`);
+      await renderWizardSheetConfiguration();
+      return;
+    }
+    renderWizardComplete();
+  } catch (err) { toast(err.message); }
+}
+function renderWizardComplete() {
+  const wizard = state.importWizard;
+  const workspace = wizardWorkspace();
+  const summary = wizard.results.map(({sheetName, result}) => `<li><b>${esc(sheetName)}</b><span>新增 ${result.created?.length || 0} · 更新 ${result.updated?.length || 0} · 待复核 ${result.conflicts?.length || 0} · 错误 ${result.errors?.length || 0}</span></li>`).join("");
+  workspace.querySelector(".section-body").innerHTML = `<section class="wizard-complete"><span>✓</span><h4>已完成本次工作簿导入</h4><p>每个工作表已分别保存为可追溯批次。需要人工确认的记录已汇总到“导入复核”。</p><ul>${summary}</ul><div class="wizard-footer"><button class="secondary-btn" id="wizard-import-again">导入另一份文件</button><button class="primary-btn" id="wizard-open-history">查看导入批次</button></div></section>`;
+  workspace.querySelector("#wizard-import-again")?.addEventListener("click", renderBulkImport);
+  workspace.querySelector("#wizard-open-history")?.addEventListener("click", () => document.querySelector("#import-history")?.scrollIntoView({behavior: "smooth", block: "start"}));
+}
