@@ -17,7 +17,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 from uuid import uuid4
@@ -66,6 +66,7 @@ INTENT_STATUSES = ["未确认", "有意向", "已锁定", "无意向"]
 PLACEMENT_STATUSES = ["未进入", "意向跟进", "批次确认", "资金筹备", "资金到账", "已参与", "已流失"]
 BATCH_STATUSES = ["筹备中", "开放中", "已截止", "已完成"]
 BATCH_PARTICIPATION_STATUSES = ["已锁定", "资金到账", "已参与", "未参与"]
+PLACEMENT_WORKFLOW_PROFILES = {"placement_intent", "placement_completed", "placement_lost"}
 SOURCES = ["线下沙龙", "线上活动", "渠道推荐", "客户转介绍", "自主拓展", "历史存量", "其他"]
 FOLLOWUP_METHODS = ["电话", "微信", "面谈", "邮件", "活动", "其他"]
 IMPORT_ROW_LIMIT = 5000
@@ -1348,6 +1349,19 @@ def normalize_batch_match_name(value: Any) -> str:
     return re.sub(r"[\s\u3000]+", "", simplify_text(value)).casefold()
 
 
+def batch_date_key(value: Any) -> str:
+    """Extract a comparable YYYY-MM-DD date from common batch labels."""
+    text = simplify_text(value)
+    match = re.search(r"(?<!\d)(20\d{2})\s*[年./_-]\s*(\d{1,2})\s*[月./_-]\s*(\d{1,2})(?:\s*日)?(?!\d)", text)
+    if not match:
+        return ""
+    year, month, day = (int(part) for part in match.groups())
+    try:
+        return date(year, month, day).isoformat()
+    except ValueError:
+        return ""
+
+
 def normalize_batch_participation_status(value: Any) -> str:
     status = str(clean_import_cell(value) or "").strip()
     aliases = {
@@ -1423,9 +1437,17 @@ def resolve_batch_participation_batch(conn: sqlite3.Connection, raw_row: dict[st
         return None, "请指定定增批次，或映射表中的批次名称列"
     rows = conn.execute("SELECT * FROM placement_batches").fetchall()
     matched = [dict(row) for row in rows if normalize_batch_match_name(row["name"]) == normalize_batch_match_name(batch_name)]
-    if not matched:
-        return None, f"没有名为“{batch_name}”的定增批次"
-    return matched[0], None
+    if len(matched) == 1:
+        return matched[0], None
+    if len(matched) > 1:
+        return None, f"系统中有多个名为“{batch_name}”的定增批次"
+    source_date = batch_date_key(batch_name)
+    date_matched = [dict(row) for row in rows if source_date and batch_date_key(row["name"]) == source_date]
+    if len(date_matched) == 1:
+        return date_matched[0], None
+    if len(date_matched) > 1:
+        return None, f"系统中有多个 {source_date} 的定增批次，请统一批次名称后再导入"
+    return None, f"没有名为“{batch_name}”的定增批次"
 
 
 def batch_participation_values(raw_row: dict[str, Any], existing: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -2800,7 +2822,7 @@ HEADER_ALIASES = {
     "twCode": ["TW编号", "TW客户编号", "客户唯一编号", "客户编号", "客户编码", "客户代码", "客户号"],
     "brokerDepositAmount": ["入金金额/USD", "入金金额", "港券入金金额", "券商账户资产", "客户权益资产", "账户权益资产", "账户资产", "权益资产"], "capitalDestination": ["资金流向", "资金去向"],
     "hkAdvisor": ["港安顾问", "保险经纪人"], "sourceAdvisorLabel": ["骄阳顾问", "商务顾问", "客户顾问"],
-    "intentStatus": ["定增意向", "意向状态", "顾问判断"], "placementStatus": ["定增推进", "节点进度", "定增状态"],
+    "intentStatus": ["定增意向", "意向状态", "顾问判断"], "placementStatus": ["定增推进", "节点进度", "定增状态"], "batchName": ["定增批次", "批次名称", "批次"],
     "status": ["本批状态", "参与状态", "定增参与状态", "是否参与定增", "是否参加定增", "参与定增"],
     "intentAmount": ["意向金额", "意向额度", "意向额度(USD)"], "fundedAmount": ["到账金额", "到账金额(USD)"],
     "actualAmount": ["实际参与金额", "实际定增", "定增金额"], "lostReason": ["流失原因", "取消原因"],
@@ -3384,6 +3406,19 @@ def prepare_import_sheet(sheet_name: str, raw_rows: list[list[Any]], allow_gener
     return headers, rows, simplify_text(sheet_name)
 
 
+def suggested_placement_workflow_profile(sheet_name: str, headers: list[str]) -> str:
+    """Suggest a business meaning without making it authoritative until the user confirms."""
+    name = re.sub(r"[\s\u3000]+", "", simplify_text(sheet_name)).casefold()
+    normalized_headers = {re.sub(r"[\s\u3000]+", "", simplify_text(header)).casefold() for header in headers}
+    if "已完成定增" in name or ("定增金额" in normalized_headers and "定增批次" in normalized_headers):
+        return "placement_completed"
+    if "取消" in name or {"卡点", "具体原因"}.issubset(normalized_headers):
+        return "placement_lost"
+    if "触达客户" in name or "意向客户" in name:
+        return "placement_intent"
+    return "standard"
+
+
 def workbook_preview_sheets(filename: str, content: bytes) -> list[dict[str, Any]]:
     """Return every readable worksheet for the generic import wizard."""
     if filename.lower().endswith(".csv"):
@@ -3415,6 +3450,7 @@ def workbook_preview_sheets(filename: str, content: bytes) -> list[dict[str, Any
             "suggestedMapping": mapping,
             "twHeader": detect_tw_header(headers, rows),
             "headerMatchScore": header_match_score(non_empty[max(range(min(30, len(non_empty))), key=lambda i: header_match_score(non_empty[i]))]),
+            "suggestedWorkflowProfile": suggested_placement_workflow_profile(normalized_name, headers),
         })
     if not result:
         raise HTTPException(422, "文件中没有可读取的数据。")
@@ -3715,7 +3751,13 @@ def import_preview(payload: ImportPreviewPayload, user: dict[str, Any] = Depends
             custom_mapping[field["id"]] = match
     preview_rows = [{headers[i]: (row[i] if i < len(row) and row[i] is not None else "") for i in range(len(headers))} for row in raw_rows[:IMPORT_ROW_LIMIT]]
     diagnostics = import_diagnostics(headers, raw_rows[:IMPORT_ROW_LIMIT], mapping, payload.filename)
-    return {"headers": headers, "suggestedMapping": mapping, "suggestedCustomMapping": custom_mapping, "customerFields": [field_dict(row) for row in custom_fields], "rows": preview_rows, "totalRows": len(raw_rows), "truncated": len(raw_rows) > IMPORT_ROW_LIMIT, "sheetName": sheet_name, "textNormalization": "繁体中文已统一转换为简体中文", **diagnostics}
+    return {
+        "headers": headers, "suggestedMapping": mapping, "suggestedCustomMapping": custom_mapping,
+        "customerFields": [field_dict(row) for row in custom_fields], "rows": preview_rows,
+        "totalRows": len(raw_rows), "truncated": len(raw_rows) > IMPORT_ROW_LIMIT, "sheetName": sheet_name,
+        "suggestedWorkflowProfile": suggested_placement_workflow_profile(sheet_name, headers),
+        "textNormalization": "繁体中文已统一转换为简体中文", **diagnostics,
+    }
 
 
 def commit_hongan_activity_import(payload: ImportCommitPayload, user: dict[str, Any]) -> dict[str, Any]:
@@ -3830,6 +3872,340 @@ def commit_pinyin_holding_import(payload: ImportCommitPayload, user: dict[str, A
     return {"jobId": job_id, "mode": "holding_pinyin", "profile": "holding_pinyin", "created": created, "updated": updated, "openedCount": 0, "unchangedCount": unchanged_count, "conflicts": conflicts, "errors": errors, "dataQuality": quality}
 
 
+WORKFLOW_CUSTOMER_FIELDS = (
+    "stage", "capital_destination", "intent_status", "placement_status", "intent_amount",
+    "funded_amount", "actual_amount", "lost_reason", "hongan_advisor",
+)
+
+
+def placement_workflow_customer(
+    conn: sqlite3.Connection, raw_row: dict[str, Any], user: dict[str, Any], forced_customer_id: str | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Match an existing customer; workflow imports never create customers from names alone."""
+    if forced_customer_id:
+        try:
+            return dict(assert_customer_access(conn, forced_customer_id, user)), None
+        except HTTPException:
+            return None, "客户不存在，或您无权查看"
+    customer_id = str(raw_row.get("customerId", "") or "").strip()
+    if customer_id:
+        try:
+            return dict(assert_customer_access(conn, customer_id, user)), None
+        except HTTPException:
+            return None, "客户不存在，或您无权查看"
+    tw_code = normalize_tw_code(raw_row.get("twCode", ""))
+    if tw_code:
+        customer = find_customer_by_tw(conn, tw_code)
+        if not customer:
+            return None, f"未找到 TW 编号 {tw_code}"
+        try:
+            assert_customer_access(conn, customer["id"], user)
+        except HTTPException:
+            return None, "客户不存在，或您无权查看"
+        return customer, None
+
+    candidate_ids: set[str] = set()
+    phone = normalize_phone(str(raw_row.get("phone", "") or ""))
+    email = normalize_email(str(raw_row.get("email", "") or ""))
+    if phone:
+        candidate_ids.update(row["customer_id"] for row in conn.execute(
+            "SELECT customer_id FROM customer_identifiers WHERE kind='phone' AND normalized_value=?", (phone,),
+        ).fetchall())
+    if email:
+        candidate_ids.update(row["customer_id"] for row in conn.execute(
+            "SELECT customer_id FROM customer_identifiers WHERE kind='email' AND normalized_value=?", (email,),
+        ).fetchall())
+    display_name = str(clean_import_cell(raw_row.get("name", raw_row.get("wechatNickname", ""))) or "").strip()
+    if not candidate_ids and display_name:
+        name_key = normalize_batch_match_name(display_name)
+        for row in conn.execute("SELECT id, name, wechat_nickname FROM customers WHERE archived_at IS NULL").fetchall():
+            if name_key in {normalize_batch_match_name(row["name"]), normalize_batch_match_name(row["wechat_nickname"])}:
+                candidate_ids.add(row["id"])
+    if not candidate_ids:
+        return None, "系统中没有找到可匹配客户"
+
+    visible: list[dict[str, Any]] = []
+    for candidate_id in candidate_ids:
+        try:
+            visible.append(dict(assert_customer_access(conn, candidate_id, user)))
+        except HTTPException:
+            continue
+    if len(visible) > 1:
+        advisor = simplify_text(str(raw_row.get("hkAdvisor", "") or "")).strip().casefold()
+        advisor_matches = [
+            item for item in visible
+            if advisor and simplify_text(str(item.get("hongan_advisor", "") or "")).strip().casefold() == advisor
+        ]
+        if len(advisor_matches) == 1:
+            return advisor_matches[0], None
+    if not visible:
+        return None, "系统中没有找到可见客户"
+    if len(visible) > 1:
+        return None, f"匹配到 {len(visible)} 位同名客户，需要人工确认"
+    return visible[0], None
+
+
+def placement_workflow_lost_reason(raw_row: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key in ("lossCategory", "lostReason", "lossObstacle", "lossDetail", "notes"):
+        value = str(clean_import_cell(raw_row.get(key, "")) or "").strip()
+        if value and value not in parts:
+            parts.append(value)
+    return "；".join(parts)[:1000] or "未参与定增"
+
+
+def placement_workflow_destination(raw_row: dict[str, Any]) -> str:
+    category = simplify_text(str(raw_row.get("lossCategory") or raw_row.get("lostReason") or ""))
+    if "二级市场" in category:
+        return "二级市场"
+    if "本期暂不参加" in category or "来不及参加" in category:
+        return "暂不参与定增"
+    return "未参与定增"
+
+
+def placement_workflow_desired_fields(
+    conn: sqlite3.Connection, customer: dict[str, Any], raw_row: dict[str, Any], profile: str,
+) -> dict[str, Any]:
+    if profile == "placement_intent":
+        amount = parse_import_amount(raw_row.get("intentAmount", 0), "意向金额")
+        if amount <= 0:
+            raise HTTPException(422, "意向名单必须包含大于 0 的意向金额")
+        return {
+            "stage": "定增意向", "capital_destination": "参与定增", "intent_status": "有意向",
+            "placement_status": "意向跟进", "intent_amount": amount, "lost_reason": "",
+        }
+    if profile == "placement_completed":
+        totals = conn.execute(
+            """SELECT COALESCE(SUM(intent_amount),0) intent_amount,
+            COALESCE(SUM(funded_amount),0) funded_amount, COALESCE(SUM(actual_amount),0) actual_amount
+            FROM batch_participations WHERE customer_id=?""", (customer["id"],),
+        ).fetchone()
+        return {
+            "stage": "已参与定增", "capital_destination": "参与定增", "intent_status": "已锁定",
+            "placement_status": "已参与", "intent_amount": float(totals["intent_amount"]),
+            "funded_amount": float(totals["funded_amount"]), "actual_amount": float(totals["actual_amount"]),
+            "lost_reason": "",
+        }
+    if profile == "placement_lost":
+        destination = placement_workflow_destination(raw_row)
+        fields = {
+            "capital_destination": destination,
+            "intent_status": "无意向", "placement_status": "已流失",
+            "lost_reason": placement_workflow_lost_reason(raw_row),
+        }
+        # Exiting a placement does not erase a customer's broader lifecycle or
+        # any placement batch they completed previously.
+        completed = conn.execute(
+            "SELECT 1 FROM batch_participations WHERE customer_id=? AND status='已参与' LIMIT 1",
+            (customer["id"],),
+        ).fetchone()
+        if destination != "二级市场" and not completed:
+            fields["stage"] = "已流失"
+        return fields
+    raise HTTPException(422, "不支持的定增名单用途。")
+
+
+def apply_placement_workflow_customer(
+    conn: sqlite3.Connection, customer: dict[str, Any], raw_row: dict[str, Any], profile: str,
+    user: dict[str, Any], source_label: str, source_row: int,
+) -> dict[str, Any]:
+    row = normalize_import_row(raw_row)
+    participation = None
+    participation_action = None
+    batch = None
+    if profile == "placement_completed":
+        batch, batch_error = resolve_batch_participation_batch(conn, row, None)
+        if batch_error:
+            raise HTTPException(422, batch_error)
+        actual_amount = parse_import_amount(row.get("actualAmount", 0), "实际参与金额")
+        if actual_amount <= 0:
+            raise HTTPException(422, "已完成定增名单必须包含大于 0 的实际参与金额")
+        participation, participation_action = save_batch_participation(
+            conn, batch["id"], customer["id"], {**row, "status": "已参与"}, user, source_label, source_row,
+        )
+
+    fields = placement_workflow_desired_fields(conn, customer, row, profile)
+    incoming_advisor = str(clean_import_cell(row.get("hkAdvisor", "")) or "").strip()
+    current_advisor = str(customer.get("hongan_advisor", "") or "").strip()
+    advisor_conflict = None
+    if incoming_advisor and not current_advisor and user.get("canManageAdvisorBindings"):
+        fields["hongan_advisor"] = incoming_advisor
+    elif incoming_advisor and simplify_text(incoming_advisor) != simplify_text(current_advisor):
+        advisor_conflict = {
+            "customerId": customer["id"], "customerCode": customer["customer_code"],
+            "name": customer.get("name", ""), "currentAdvisor": current_advisor,
+            "targetAdvisor": incoming_advisor,
+            "detail": "系统已有港安顾问与本次名单不同；业务状态已写入，港安顾问等待人工确认。",
+        }
+    changes = {key: {"from": customer.get(key), "to": value} for key, value in fields.items() if customer.get(key) != value}
+    if changes:
+        timestamp = now_iso()
+        assignments = ", ".join(f"{key}=?" for key in fields)
+        conn.execute(
+            f"UPDATE customers SET {assignments}, updated_at=?, version=version+1 WHERE id=?",
+            (*fields.values(), timestamp, customer["id"]),
+        )
+        audit(conn, user, f"customer.{profile}_imported", "customer", customer["id"], {
+            "source": source_label, "sourceRow": source_row, "changes": changes,
+            "batchId": batch["id"] if batch else None,
+        })
+    return {
+        "customerId": customer["id"], "customerCode": customer["customer_code"], "changes": changes,
+        "advisorConflict": advisor_conflict, "participation": participation,
+        "participationAction": participation_action, "batch": batch,
+    }
+
+
+def placement_workflow_import_preview(
+    conn: sqlite3.Connection, payload: ImportCommitPayload, user: dict[str, Any], profile: str,
+) -> dict[str, Any]:
+    counts = {"new": 0, "update": 0, "unchanged": 0, "needsConfirmation": 0, "invalid": 0, "advisorConflicts": 0, "filteredRows": len(payload.rows)}
+    problems: list[dict[str, Any]] = []
+    samples: list[dict[str, Any]] = []
+    prepared: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for index, raw_row in enumerate(payload.rows, start=1):
+        row = normalize_import_row(raw_row)
+        customer, customer_error = placement_workflow_customer(conn, row, user)
+        if customer_error:
+            category = "ambiguous" if "匹配到" in customer_error else "unmatched"
+            problems.append({"row": index, "name": row.get("name", ""), "reason": customer_error, "category": category, "rawRow": raw_row})
+            counts["needsConfirmation"] += 1
+            continue
+        batch = None
+        if profile == "placement_completed":
+            batch, batch_error = resolve_batch_participation_batch(conn, row, None)
+            if batch_error:
+                problems.append({"row": index, "name": customer["name"], "reason": batch_error, "category": "error", "rawRow": raw_row})
+                counts["needsConfirmation"] += 1
+                continue
+        key = (customer["id"], batch["id"] if batch else profile)
+        if key in seen:
+            problems.append({"row": index, "name": customer["name"], "reason": "同一客户在同一用途或同一批次出现重复行", "category": "error", "rawRow": raw_row})
+            counts["invalid"] += 1
+            continue
+        seen.add(key)
+        try:
+            if profile == "placement_intent":
+                placement_workflow_desired_fields(conn, customer, row, profile)
+            elif profile == "placement_completed":
+                if parse_import_amount(row.get("actualAmount", 0), "实际参与金额") <= 0:
+                    raise HTTPException(422, "已完成定增名单必须包含大于 0 的实际参与金额")
+        except HTTPException as exc:
+            problems.append({"row": index, "name": customer["name"], "reason": str(exc.detail), "category": "error", "rawRow": raw_row})
+            counts["invalid"] += 1
+            continue
+        incoming_advisor = str(row.get("hkAdvisor", "") or "").strip()
+        current_advisor = str(customer.get("hongan_advisor", "") or "").strip()
+        if incoming_advisor and current_advisor and simplify_text(incoming_advisor) != simplify_text(current_advisor):
+            counts["advisorConflicts"] += 1
+        if profile == "placement_completed":
+            existing = conn.execute(
+                "SELECT * FROM batch_participations WHERE batch_id=? AND customer_id=?", (batch["id"], customer["id"]),
+            ).fetchone()
+            values = batch_participation_values({**row, "status": "已参与"}, dict(existing) if existing else None)
+            if not existing:
+                action = "new"
+            elif any(existing[field] != value for field, value in values.items()):
+                action = "update"
+            else:
+                action = "unchanged"
+        else:
+            desired = placement_workflow_desired_fields(conn, customer, row, profile)
+            action = "update" if any(customer.get(field) != value for field, value in desired.items()) else "unchanged"
+        counts[action] += 1
+        if len(samples) < 16:
+            samples.append({
+                "row": index, "name": customer["name"], "customerCode": customer["customer_code"],
+                "action": action, "batchName": batch["name"] if batch else "", "profile": profile,
+            })
+        prepared.append({"row": index, "raw": raw_row, "customer": customer, "batch": batch})
+    return {"counts": counts, "problems": problems[:200], "samples": samples, "prepared": prepared}
+
+
+def commit_placement_workflow_import(payload: ImportCommitPayload, user: dict[str, Any], profile: str) -> dict[str, Any]:
+    if not payload.rows:
+        raise HTTPException(422, "请至少保留一条名单记录。")
+    with db() as conn:
+        preview = placement_workflow_import_preview(conn, payload, user, profile)
+        updated: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        conflicts: list[dict[str, Any]] = []
+        review_items: list[dict[str, Any]] = []
+        snapshots: dict[str, Any] = {"customers": {}, "participations": {}}
+        for problem in preview["problems"]:
+            category = problem.get("category", "error")
+            item = {key: value for key, value in problem.items() if key not in {"category", "rawRow"}}
+            review_items.append(make_import_review_item(profile, category, item, problem.get("rawRow")))
+            if category in {"ambiguous", "unmatched", "conflict"}:
+                conflicts.append({"row": problem.get("row"), "name": problem.get("name", ""), "detail": problem.get("reason", "")})
+            else:
+                errors.append({"row": problem.get("row"), "name": problem.get("name", ""), "message": problem.get("reason", "")})
+        for item in preview["prepared"]:
+            customer = dict(conn.execute("SELECT * FROM customers WHERE id=?", (item["customer"]["id"],)).fetchone())
+            customer_snapshot = snapshots["customers"].setdefault(customer["id"], {
+                "before": {field: customer.get(field) for field in WORKFLOW_CUSTOMER_FIELDS},
+                "beforeVersion": customer["version"], "afterVersion": customer["version"],
+            })
+            if profile == "placement_completed" and item["batch"]:
+                participation_key = f"{item['batch']['id']}:{customer['id']}"
+                if participation_key not in snapshots["participations"]:
+                    existing = conn.execute(
+                        "SELECT * FROM batch_participations WHERE batch_id=? AND customer_id=?",
+                        (item["batch"]["id"], customer["id"]),
+                    ).fetchone()
+                    snapshots["participations"][participation_key] = {
+                        "batchId": item["batch"]["id"], "customerId": customer["id"],
+                        "before": dict(existing) if existing else None,
+                    }
+            conn.execute("SAVEPOINT placement_workflow_row")
+            try:
+                result = apply_placement_workflow_customer(
+                    conn, customer, item["raw"], profile, user, payload.filename, item["row"],
+                )
+                conn.execute("RELEASE SAVEPOINT placement_workflow_row")
+                current = conn.execute("SELECT version FROM customers WHERE id=?", (customer["id"],)).fetchone()
+                customer_snapshot["afterVersion"] = current["version"]
+                if result["changes"] or result["participationAction"] in {"created", "updated"}:
+                    updated.append({
+                        "row": item["row"], "id": customer["id"], "customerCode": customer["customer_code"],
+                        "changes": result["changes"], "batchId": result["batch"]["id"] if result["batch"] else None,
+                        "participationAction": result["participationAction"],
+                    })
+                if result["advisorConflict"]:
+                    conflict = {**result["advisorConflict"], "row": item["row"]}
+                    conflicts.append(conflict)
+                    review_items.append(make_import_review_item(profile, "conflict", conflict, item["raw"]))
+            except (HTTPException, ValueError) as exc:
+                conn.execute("ROLLBACK TO SAVEPOINT placement_workflow_row")
+                conn.execute("RELEASE SAVEPOINT placement_workflow_row")
+                message = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+                error = {"row": item["row"], "name": customer.get("name", ""), "message": message}
+                errors.append(error)
+                review_items.append(make_import_review_item(profile, "error", error, item["raw"]))
+
+        job_id = str(uuid4())
+        job_created_at = datetime.now(timezone.utc).astimezone().isoformat(timespec="microseconds")
+        updated_ids = list(dict.fromkeys(item["id"] for item in updated))
+        quality = {
+            "mode": profile, "profile": profile, "workflowSnapshots": snapshots,
+            "matchedRows": len(updated), "needsConfirmation": len(review_items),
+        }
+        conn.execute(
+            """INSERT INTO import_jobs(id, filename, owner_id, owner_name, total_rows, created_count, updated_count, conflict_count, error_count, imported_by, imported_by_name, created_at, data_quality_json, created_customer_ids_json, updated_customer_ids_json, opened_customer_ids_json, review_items_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (job_id, payload.filename, UNASSIGNED_OWNER_ID, UNASSIGNED_OWNER["name"], len(payload.rows), 0, len(updated), len(conflicts), len(errors), user["id"], user["name"], job_created_at, json.dumps(quality, ensure_ascii=False, default=str), "[]", json.dumps(updated_ids, ensure_ascii=False), "[]", json.dumps(review_items, ensure_ascii=False, default=str)),
+        )
+        audit(conn, user, f"import.{profile}_completed", "import_job", job_id, {
+            "updated": len(updated), "conflicts": len(conflicts), "errors": len(errors),
+        })
+    return {
+        "jobId": job_id, "mode": profile, "profile": profile, "created": [], "updated": updated,
+        "openedCount": 0, "unchangedCount": preview["counts"]["unchanged"],
+        "conflicts": conflicts, "errors": errors, "dataQuality": quality,
+    }
+
+
 @app.post("/api/imports/impact")
 def import_impact(payload: ImportImpactPayload, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     """Estimate the write result after a user has chosen columns and row filters."""
@@ -3838,6 +4214,14 @@ def import_impact(payload: ImportImpactPayload, user: dict[str, Any] = Depends(c
     if len(payload.rows) > IMPORT_ROW_LIMIT:
         raise HTTPException(422, f"单次最多导入 {IMPORT_ROW_LIMIT} 行，请拆分文件。")
     profile = str(payload.importProfile or "standard").strip().lower()
+    if profile in PLACEMENT_WORKFLOW_PROFILES:
+        with db() as conn:
+            preview = placement_workflow_import_preview(conn, payload, user, profile)
+        return {
+            "profile": profile, "mode": profile, "counts": preview["counts"],
+            "samples": preview["samples"], "problems": preview["problems"],
+            "message": "名单只会匹配系统已有客户；无法唯一确认的记录会进入导入复核，不会自动新建客户。",
+        }
     if profile not in {"standard", "hongan_master", "asset", "holding"}:
         raise HTTPException(422, "请使用已识别的专用导入方式预览此工作表。")
     mode = str(payload.mode or "append").strip().lower()
@@ -3926,12 +4310,14 @@ def import_commit(payload: ImportCommitPayload, user: dict[str, Any] = Depends(c
     if mode not in {"append", "snapshot"}:
         raise HTTPException(422, "导入模式无效。")
     profile = str(payload.importProfile or "standard").strip().lower()
-    if profile not in {"standard", "hongan_master", "asset", "holding", "holding_pinyin", "hongan_activity"}:
+    if profile not in {"standard", "hongan_master", "asset", "holding", "holding_pinyin", "hongan_activity", *PLACEMENT_WORKFLOW_PROFILES}:
         profile = "standard"
     if profile == "hongan_activity":
         return commit_hongan_activity_import(payload, user)
     if profile == "holding_pinyin":
         return commit_pinyin_holding_import(payload, user)
+    if profile in PLACEMENT_WORKFLOW_PROFILES:
+        return commit_placement_workflow_import(payload, user, profile)
     if profile == "standard" and payload.rows:
         if any(row.get("holdingSnapshots") for row in payload.rows) and not any(row.get("accountStatus") for row in payload.rows):
             profile = "holding"
@@ -4148,7 +4534,7 @@ def list_import_reviews(include_resolved: bool = Query(default=False), user: dic
     category_labels = {"conflict": "冲突", "error": "错误", "ambiguous": "同名待确认", "unmatched": "未匹配"}
     for item in items:
         item["categoryLabel"] = category_labels.get(item.get("category"), item.get("category", "待复核"))
-        item["canApply"] = item.get("profile") in {"holding_pinyin", "hongan_activity", "asset", "holding"}
+        item["canApply"] = item.get("profile") in {"holding_pinyin", "hongan_activity", "asset", "holding", *PLACEMENT_WORKFLOW_PROFILES}
     pending = sum(1 for item in items if item.get("status", "pending") == "pending")
     return {"items": items[:1000], "total": len(items), "pendingCount": pending}
 
@@ -4202,6 +4588,21 @@ def resolve_import_review(review_id: str, payload: ImportReviewResolvePayload, u
                 else:
                     raise HTTPException(422, "这条记录没有可写入的持仓数据。")
                 audit(conn, user, "import_review.holding_applied", "customer", customer["id"], {"reviewId": review_id, "profile": profile})
+            elif profile in PLACEMENT_WORKFLOW_PROFILES:
+                raw_row = target.get("rawRow") or {}
+                result = apply_placement_workflow_customer(
+                    conn, dict(customer), raw_row, profile, user, found_job["filename"], int(target.get("row", 0) or 0),
+                )
+                advisor = str(raw_row.get("hkAdvisor", "") or "").strip()
+                if advisor and result.get("advisorConflict"):
+                    require_advisor_binding_manager(user)
+                    conn.execute(
+                        "UPDATE customers SET hongan_advisor=?, updated_at=?, version=version+1 WHERE id=?",
+                        (advisor, now_iso(), customer["id"]),
+                    )
+                audit(conn, user, "import_review.placement_workflow_applied", "customer", customer["id"], {
+                    "reviewId": review_id, "profile": profile, "batchId": result.get("batch", {}).get("id") if result.get("batch") else None,
+                })
             else:
                 raise HTTPException(422, "这类冲突需要先在客户详情中手动修改，再标记为已处理。")
         target["status"] = "resolved" if action in {"apply", "keep"} else "ignored"
@@ -4211,6 +4612,71 @@ def resolve_import_review(review_id: str, payload: ImportReviewResolvePayload, u
         conn.execute("UPDATE import_jobs SET review_items_json=? WHERE id=?", (json.dumps(reviews, ensure_ascii=False, default=str), found_job["id"]))
         audit(conn, user, f"import_review.{target['status']}", "import_review", review_id, {"jobId": found_job["id"], "customerId": payload.customerId or ""})
     return {"reviewId": review_id, "status": target["status"], "customerId": payload.customerId}
+
+
+def rollback_placement_workflow_job(
+    conn: sqlite3.Connection, job: Any, quality: dict[str, Any], user: dict[str, Any], job_id: str,
+) -> dict[str, Any]:
+    snapshots = quality.get("workflowSnapshots") or {}
+    restored: list[dict[str, Any]] = []
+    protected: list[dict[str, Any]] = []
+    protected_customer_ids: set[str] = set()
+    timestamp = now_iso()
+    for customer_id, snapshot in (snapshots.get("customers") or {}).items():
+        current = conn.execute("SELECT * FROM customers WHERE id=? AND archived_at IS NULL", (customer_id,)).fetchone()
+        if not current:
+            continue
+        expected_version = int(snapshot.get("afterVersion", current["version"]))
+        if int(current["version"]) != expected_version:
+            protected.append({"id": customer_id, "customerCode": current["customer_code"], "reason": "导入后客户资料已有修改"})
+            protected_customer_ids.add(customer_id)
+            continue
+        before = snapshot.get("before") or {}
+        values = {field: before.get(field) for field in WORKFLOW_CUSTOMER_FIELDS if field in before}
+        if values:
+            assignments = ", ".join(f"{field}=?" for field in values)
+            conn.execute(
+                f"UPDATE customers SET {assignments}, updated_at=?, version=version+1 WHERE id=?",
+                (*values.values(), timestamp, customer_id),
+            )
+            restored.append({"id": customer_id, "customerCode": current["customer_code"], "fields": list(values)})
+    for snapshot in (snapshots.get("participations") or {}).values():
+        batch_id, customer_id = snapshot.get("batchId"), snapshot.get("customerId")
+        if customer_id in protected_customer_ids:
+            continue
+        current = conn.execute(
+            "SELECT * FROM batch_participations WHERE batch_id=? AND customer_id=?", (batch_id, customer_id),
+        ).fetchone()
+        if current and str(current["updated_at"] or "") > str(job["created_at"] or ""):
+            protected.append({"id": current["id"], "reason": "导入后本批参与记录已有修改"})
+            continue
+        before = snapshot.get("before")
+        if before is None:
+            if current:
+                conn.execute("DELETE FROM batch_participations WHERE id=?", (current["id"],))
+            continue
+        fields = ("status", "intent_amount", "funded_amount", "actual_amount", "notes", "source_label", "source_row")
+        if current:
+            conn.execute(
+                """UPDATE batch_participations SET status=?, intent_amount=?, funded_amount=?, actual_amount=?, notes=?,
+                source_label=?, source_row=?, updated_by=?, updated_by_name=?, updated_at=? WHERE id=?""",
+                (*(before.get(field) for field in fields), user["id"], user["name"], timestamp, current["id"]),
+            )
+        else:
+            conn.execute(
+                """INSERT INTO batch_participations(
+                id, batch_id, customer_id, status, intent_amount, funded_amount, actual_amount, notes, source_label, source_row,
+                created_by, created_by_name, created_at, updated_by, updated_by_name, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (before["id"], before["batch_id"], before["customer_id"], before["status"], before["intent_amount"],
+                 before["funded_amount"], before["actual_amount"], before["notes"], before["source_label"], before["source_row"],
+                 before["created_by"], before["created_by_name"], before["created_at"], user["id"], user["name"], timestamp),
+            )
+    conn.execute("UPDATE import_jobs SET rolled_back_at=?, rolled_back_by=? WHERE id=?", (timestamp, user["id"], job_id))
+    audit(conn, user, "import.rolled_back", "import_job", job_id, {
+        "restored": len(restored), "protected": len(protected), "profile": quality.get("profile"),
+    })
+    return {"jobId": job_id, "restored": restored, "archived": [], "protected": protected, "alreadyRolledBack": False}
 
 
 @app.post("/api/imports/{job_id}/rollback")
@@ -4232,6 +4698,8 @@ def rollback_import(job_id: str, user: dict[str, Any] = Depends(current_user)) -
             quality = {}
         if is_hongan_activity_import_job(dict(job), quality):
             quality = {**quality, "mode": "hongan_activity", "profile": "hongan_activity"}
+        if quality.get("profile") in PLACEMENT_WORKFLOW_PROFILES:
+            return rollback_placement_workflow_job(conn, job, quality, user, job_id)
         if not created_ids and quality.get("mode") != "hongan_activity":
             raise HTTPException(422, "该导入记录没有可撤回的客户，可能是系统升级前的历史记录。")
         if quality.get("mode") == "hongan_activity":

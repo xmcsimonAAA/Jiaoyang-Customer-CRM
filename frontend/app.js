@@ -908,7 +908,7 @@ async function startSsoLogin(token) {
 /* The review queue is intentionally explicit: every pending row can be opened
    before a write, and "keep" records a decision without changing customer data. */
 function reviewName(item) { return item.pinyinName || item.name || item.rawRow?.name || item.rawRow?.twCode || "未命名记录"; }
-function reviewProfileLabel(profile) { return ({holding_pinyin:"中阳拼音持仓", hongan_activity:"港安活动分表", asset:"券商资产", holding:"持仓快照", standard:"普通导入"})[profile] || profile || "普通导入"; }
+function reviewProfileLabel(profile) { return ({holding_pinyin:"中阳拼音持仓", hongan_activity:"港安活动分表", asset:"券商资产", holding:"持仓快照", placement_intent:"定增意向名单", placement_completed:"已完成定增记录", placement_lost:"定增取消 / 流失名单", standard:"普通导入"})[profile] || profile || "普通导入"; }
 function reviewIssueText(item) {
   if (item.category === "conflict") {
     if (item.profile === "hongan_activity") return "系统已有港安顾问，但本次活动表给出了不同值；系统没有自动覆盖。";
@@ -950,11 +950,14 @@ function openImportReviewResolver(item) {
   const importedAdvisor = reviewImportedAdvisor(item);
   const comparison = item.profile === "hongan_activity" ? `<div class="review-comparison"><div><span>系统当前港安顾问</span><strong>${esc(item.currentAdvisor || initial?.currentAdvisor || "未填写")}</strong></div><div><span>本次导入港安顾问</span><strong>${esc(importedAdvisor)}</strong></div></div>` : "";
   const activityScope = item.profile === "hongan_activity" ? `<div class="review-scope"><b>本条冲突字段：港安顾问</b><span>客户姓名、TW 编号仅用于确认客户身份。金额、开户状态、骄阳现场开户人、见证人、定增信息和备注不参与本次比较，也不会被本次操作修改。</span>${item.sourceAdvisors?.length ? `<small>原表骄阳现场开户人：${esc(item.sourceAdvisors.join("、"))}（仅展示，不作为当前负责人）</small>` : ""}</div>` : "";
+  const isPlacementWorkflow = ["placement_intent", "placement_completed", "placement_lost"].includes(item.profile);
+  const raw = item.rawRow || {};
+  const workflowScope = isPlacementWorkflow ? `<div class="review-scope"><b>本条准备写入的定增信息</b><span>${item.profile === "placement_intent" ? `意向金额 ${money(raw.intentAmount || 0)}，状态设为“有意向”；不建立批次关系。` : item.profile === "placement_completed" ? `批次“${esc(raw.batchName || "未填写")}”，意向 ${money(raw.intentAmount || 0)}，实际参与 ${money(raw.actualAmount || 0)}。` : `退出去向“${esc(raw.lossCategory || "未填写")}”，原因“${esc([raw.lossObstacle, raw.lossDetail].filter(Boolean).join("；") || "未填写")}”。`}<br>只处理定增状态与批次关系，不会新建客户，也不会修改骄阳负责人。</span></div>` : "";
   const rawDetails = [item.sourceSheet ? `来源分表：${item.sourceSheet}` : "", item.sourceRow ? `来源行：第 ${item.sourceRow} 行` : "", item.rows ? `活动表同名记录数：${item.rows}` : "", item.quantity != null ? `持仓数量：${item.quantity}` : "", item.detail?.message || (typeof item.detail === "string" ? item.detail : "")].filter(Boolean).join(" · ");
   const directCustomer = initial && !candidates.length ? `<div class="review-candidate-heading">系统已关联客户</div><button type="button" class="review-customer-option selected" data-review-customer="${esc(initial.customerId)}"><span><strong>${esc(initial.customerName || reviewName(item))}</strong><small>${esc(initial.twCode || initial.customerCode || "无 TW 编号")}</small></span><small>${esc(initial.currentAdvisor || "港安顾问未填写")}</small></button>` : "";
   const customerOptions = candidates.length ? `<div class="review-candidate-heading">系统找到的候选客户</div>${candidates.map((candidate) => `<button type="button" class="review-customer-option ${initial?.customerId === candidate.customerId ? "selected" : ""}" data-review-customer="${esc(candidate.customerId)}"><span><strong>${esc(candidate.customerName || "未命名")}</strong><small>${esc(candidate.twCode || candidate.customerCode || "无 TW 编号")}</small></span><small>${esc(candidate.currentAdvisor || "港安顾问未填写")}</small></button>`).join("")}` : directCustomer || `<span class="hint">系统没有直接找到唯一客户，请用 TW 编号、姓名或手机号搜索。</span>`;
-  const profileHint = item.profile === "hongan_activity" ? "这里只处理港安顾问，不会修改骄阳当前负责人。" : item.profile === "holding_pinyin" ? "确认后只会写入这条客户的持仓快照。" : "确认后只会处理这一条导入记录。";
-  openModal(`<div class="modal review-resolver-modal"><div class="modal-header"><div><div class="eyebrow">MANUAL REVIEW</div><h3>${item.profile === "hongan_activity" ? "核对港安顾问" : "复核导入记录"}</h3><span class="hint">${esc(reviewName(item))} · ${esc(reviewProfileLabel(item.profile))}</span></div><button class="close-btn" data-close>×</button></div><div class="modal-body"><div class="review-resolver-note"><strong>${esc(item.categoryLabel || "待复核")}</strong><span>${esc(reviewIssueText(item))}</span><small>${esc(profileHint)}</small></div>${comparison}${activityScope}${rawDetails ? `<div class="review-source-detail">${esc(rawDetails)}</div>` : ""}<form id="review-customer-form"><div class="field"><label>关联到系统客户</label><div class="review-search-row"><input id="review-customer-search" value="${esc(initial?.customerName || reviewName(item))}" placeholder="搜索姓名、TW编号或手机号"><button class="secondary-btn" type="submit">搜索客户</button></div></div></form><div id="review-customer-results" class="review-customer-results">${customerOptions}</div>${item.profile === "hongan_activity" ? `<div class="field review-advisor-field"><label for="review-advisor">准备写入的港安顾问</label><input id="review-advisor" value="${esc(item.targetAdvisor || (item.advisors || [""])[0] || "")}" placeholder="填写港安顾问姓名"></div>` : ""}</div><div class="modal-footer"><button class="secondary-btn" type="button" id="review-keep">保留系统值并完成复核</button><button class="secondary-btn" type="button" data-close>取消</button><button class="primary-btn" type="button" id="review-apply">${item.profile === "hongan_activity" ? "采用导入值" : item.canApply ? "确认关联并写入" : "完成复核"}</button></div></div>`);
+  const profileHint = item.profile === "hongan_activity" ? "这里只处理港安顾问，不会修改骄阳当前负责人。" : item.profile === "holding_pinyin" ? "确认后只会写入这条客户的持仓快照。" : isPlacementWorkflow ? "确认客户身份后，系统会按本表用途写入这一条定增记录。" : "确认后只会处理这一条导入记录。";
+  openModal(`<div class="modal review-resolver-modal"><div class="modal-header"><div><div class="eyebrow">MANUAL REVIEW</div><h3>${item.profile === "hongan_activity" ? "核对港安顾问" : isPlacementWorkflow ? "核对定增名单" : "复核导入记录"}</h3><span class="hint">${esc(reviewName(item))} · ${esc(reviewProfileLabel(item.profile))}</span></div><button class="close-btn" data-close>×</button></div><div class="modal-body"><div class="review-resolver-note"><strong>${esc(item.categoryLabel || "待复核")}</strong><span>${esc(reviewIssueText(item))}</span><small>${esc(profileHint)}</small></div>${comparison}${activityScope}${workflowScope}${rawDetails ? `<div class="review-source-detail">${esc(rawDetails)}</div>` : ""}<form id="review-customer-form"><div class="field"><label>关联到系统客户</label><div class="review-search-row"><input id="review-customer-search" value="${esc(initial?.customerName || reviewName(item))}" placeholder="搜索姓名、TW编号或手机号"><button class="secondary-btn" type="submit">搜索客户</button></div></div></form><div id="review-customer-results" class="review-customer-results">${customerOptions}</div>${item.profile === "hongan_activity" ? `<div class="field review-advisor-field"><label for="review-advisor">准备写入的港安顾问</label><input id="review-advisor" value="${esc(item.targetAdvisor || (item.advisors || [""])[0] || "")}" placeholder="填写港安顾问姓名"></div>` : ""}</div><div class="modal-footer"><button class="secondary-btn" type="button" id="review-keep">保留系统值并完成复核</button><button class="secondary-btn" type="button" data-close>取消</button><button class="primary-btn" type="button" id="review-apply">${item.profile === "hongan_activity" ? "采用导入值" : item.canApply ? "确认关联并写入" : "完成复核"}</button></div></div>`);
   let selectedId = initial?.customerId || "";
   const results = document.querySelector("#review-customer-results");
   const selectResult = (button) => { selectedId = button.dataset.reviewCustomer; results.querySelectorAll(".review-customer-option").forEach((node) => node.classList.toggle("selected", node === button)); };
@@ -973,9 +976,23 @@ const WIZARD_CORE_FIELDS = [
   ["company", "公司"], ["source", "客户来源"], ["sourceDetail", "来源明细"], ["stage", "客户阶段"], ["priority", "优先级"],
   ["accountStatus", "开户状态"], ["accountBroker", "开户券商"], ["accountOpenedAt", "开户日期"], ["brokerDepositAmount", "入金金额"],
   ["capitalDestination", "资金流向"], ["intentStatus", "定增意向"], ["placementStatus", "定增推进"], ["intentAmount", "意向金额"],
-  ["fundedAmount", "到账金额"], ["actualAmount", "实际参与金额"], ["lostReason", "流失原因"], ["hkAdvisor", "港安顾问"],
+  ["fundedAmount", "到账金额"], ["actualAmount", "实际参与金额"], ["batchName", "定增批次（参与关系）"],
+  ["lossCategory", "定增取消去向"], ["lossObstacle", "定增取消卡点"], ["lossDetail", "定增取消原因"],
+  ["lostReason", "流失原因"], ["hkAdvisor", "港安顾问"],
   ["sourceAdvisorLabel", "原表骄阳顾问（历史标签）"], ["notes", "备注"],
 ];
+const WIZARD_WORKFLOW_OPTIONS = [
+  ["standard", "普通客户资料补充"],
+  ["placement_intent", "定增意向名单"],
+  ["placement_completed", "已完成定增记录"],
+  ["placement_lost", "定增取消 / 流失名单"],
+];
+const WIZARD_WORKFLOW_HELP = {
+  standard: "按所选列补充客户资料。带 TW 的表按 TW 更新；没有可靠编号时不会自动合并同名客户。",
+  placement_intent: "只匹配系统已有客户。意向金额大于 0 的客户会自动标记为有意向，不会加入任何批次。",
+  placement_completed: "只匹配系统已有客户。按真实批次建立参与记录，同一客户可以参加多个批次。",
+  placement_lost: "只匹配系统已有客户。二级市场参与者只退出本次定增；明确不再参与者才标记为流失，历史批次记录不会删除。",
+};
 
 function wizardCurrentSheet() { const wizard = state.importWizard; return wizard?.selectedSheets?.[wizard.currentIndex] || ""; }
 function wizardPreview() { return state.importWizard?.previews?.[wizardCurrentSheet()] || null; }
@@ -988,6 +1005,33 @@ function wizardTargetOptions(preview, selected = "") {
   ].filter(Boolean));
   return [["", "不导入"], ...WIZARD_CORE_FIELDS, ...customFields, ...snapshots].map(([value, label]) => `<option value="${esc(value)}" ${selected === value ? "selected" : ""}>${esc(label)}</option>`).join("");
 }
+function wizardHeader(preview, ...aliases) {
+  const keys = aliases.map((value) => String(value).replaceAll(" ", "").toLowerCase());
+  return (preview.headers || []).find((header) => keys.includes(String(header).replaceAll(" ", "").toLowerCase())) || "";
+}
+function applyWizardWorkflowDefaults(preview, sourceMap, profile) {
+  const next = {...sourceMap};
+  if (!["placement_intent", "placement_completed", "placement_lost"].includes(profile)) return next;
+  const workflowTargets = new Set(["stage", "capitalDestination", "intentStatus", "placementStatus", "batchName", "fundedAmount", "actualAmount", "lostReason", "lossCategory", "lossObstacle", "lossDetail"]);
+  Object.keys(next).forEach((header) => { if (workflowTargets.has(next[header])) next[header] = ""; });
+  const set = (target, ...aliases) => { const header = wizardHeader(preview, ...aliases); if (header) next[header] = target; };
+  set("name", "姓名", "客户姓名", "真实姓名");
+  set("hkAdvisor", "港安顾问", "保险经纪人");
+  set("phone", "手机号", "联系电话");
+  set("email", "电子邮箱", "邮箱");
+  if (profile === "placement_intent") {
+    set("intentAmount", "意向额度(USD)", "意向额度", "意向金额");
+  } else if (profile === "placement_completed") {
+    set("batchName", "定增批次", "批次名称");
+    set("intentAmount", "意向额度(USD)", "意向额度", "意向金额");
+    set("actualAmount", "定增金额", "实际参与金额", "实际定增");
+  } else {
+    set("lossCategory", "定增批次", "取消去向", "取消类型");
+    set("lossObstacle", "卡点");
+    set("lossDetail", "具体原因", "取消原因");
+  }
+  return next;
+}
 function wizardDefaultConfig(preview) {
   const sourceMap = {};
   (preview.headers || []).forEach((header) => {
@@ -995,13 +1039,15 @@ function wizardDefaultConfig(preview) {
     const custom = Object.entries(preview.suggestedCustomMapping || {}).find(([, source]) => source === header)?.[0];
     sourceMap[header] = core || (custom ? `custom:${custom}` : "");
   });
+  const workflowProfile = preview.suggestedWorkflowProfile || preview.importProfile || preview.profile || "standard";
   (preview.holdingSnapshots || []).forEach((snapshot, index) => {
     if (snapshot.quantityHeader && !sourceMap[snapshot.quantityHeader]) sourceMap[snapshot.quantityHeader] = `snapshot:${index}:quantity`;
     if (snapshot.marketValueHeader && !sourceMap[snapshot.marketValueHeader]) sourceMap[snapshot.marketValueHeader] = `snapshot:${index}:marketValue`;
   });
   const rows = preview.rows || [];
   return {
-    sourceMap,
+    sourceMap: applyWizardWorkflowDefaults(preview, sourceMap, workflowProfile),
+    workflowProfile,
     selectedRows: new Set(rows.map((_, index) => index)),
     page: 1,
     rangeStart: rows.length ? 1 : 0,
@@ -1027,8 +1073,10 @@ function wizardReadConfig() {
   if (Object.keys(map).length) config.sourceMap = map;
   const owner = document.querySelector("#wizard-default-owner");
   const allowUnidentified = document.querySelector("#wizard-allow-unidentified");
+  const workflowProfile = document.querySelector("#wizard-workflow-profile");
   if (owner) config.ownerId = owner.value;
   if (allowUnidentified) config.allowUnidentifiedRows = allowUnidentified.checked;
+  if (workflowProfile) config.workflowProfile = workflowProfile.value;
   return config;
 }
 function wizardRows(preview, config) {
@@ -1057,7 +1105,7 @@ function wizardRows(preview, config) {
 }
 function wizardPayload(preview, config) {
   const rows = wizardRows(preview, config);
-  const profile = preview.importProfile || preview.profile || "standard";
+  const profile = config.workflowProfile || preview.importProfile || preview.profile || "standard";
   const mode = profile === "standard" && rows.some((row) => String(row.twCode || "").trim()) ? "snapshot" : "append";
   return {filename: `${state.importWizard.file.name} · ${preview.sheetName}`, ownerId: config.ownerId, rows, mode, importProfile: profile, allowUnidentifiedRows: config.allowUnidentifiedRows};
 }
@@ -1081,7 +1129,8 @@ async function handleImportFile(event) {
     for (let index = 0; index < bytes.length; index += 1) binary += String.fromCharCode(bytes[index]);
     const dataBase64 = btoa(binary);
     const workbook = await api("/api/imports/workbook", {method: "POST", body: JSON.stringify({filename: file.name, dataBase64})});
-    const defaultSheets = workbook.sheets.filter((sheet) => Object.keys(sheet.suggestedMapping || {}).length > 0).map((sheet) => sheet.name);
+    const workflowSheets = workbook.sheets.filter((sheet) => sheet.suggestedWorkflowProfile && sheet.suggestedWorkflowProfile !== "standard");
+    const defaultSheets = (workflowSheets.length ? workflowSheets : workbook.sheets.filter((sheet) => Object.keys(sheet.suggestedMapping || {}).length > 0)).map((sheet) => sheet.name);
     state.importWizard = {file, dataBase64, workbook, selectedSheets: defaultSheets, currentIndex: 0, previews: {}, configs: {}, results: []};
     renderWizardSheetPicker();
   } catch (err) {
@@ -1093,7 +1142,7 @@ function renderWizardSheetPicker() {
   const workspace = wizardWorkspace();
   if (!wizard || !workspace) return;
   const sheets = wizard.workbook.sheets || [];
-  workspace.querySelector(".section-body").innerHTML = `<div class="wizard-step-header"><div><span class="wizard-kicker">步骤 1 / 3</span><h4>选择本次要导入的工作表</h4><p>默认勾选了识别到客户字段的工作表。说明页、汇总页或本次不需要的数据不要勾选。</p></div><span class="hint">${esc(wizard.file.name)}</span></div><div class="sheet-picker">${sheets.map((sheet, index) => { const selected = wizard.selectedSheets.includes(sheet.name); const fields = Object.values(sheet.suggestedMapping || {}).slice(0, 5).map((value) => esc(value)).join("、"); return `<label class="sheet-choice ${selected ? "selected" : ""}"><input type="checkbox" data-wizard-sheet="${esc(sheet.name)}" ${selected ? "checked" : ""}><span class="sheet-choice-index">${index + 1}</span><span class="sheet-choice-copy"><strong>${esc(sheet.name)}</strong><small>${sheet.totalRows} 行 · ${fields ? `识别到 ${fields}` : "未识别常用客户字段，请谨慎选择"}</small></span>${sheet.twHeader ? `<span class="sheet-signal">含 TW</span>` : ""}</label>`; }).join("")}</div><div class="wizard-footer"><button class="secondary-btn" id="wizard-reset-file">重新选择文件</button><button class="primary-btn" id="wizard-start-sheets">设置已选工作表</button></div>`;
+  workspace.querySelector(".section-body").innerHTML = `<div class="wizard-step-header"><div><span class="wizard-kicker">步骤 1 / 3</span><h4>选择本次要导入的工作表</h4><p>默认勾选了识别到客户字段的工作表。说明页、汇总页或本次不需要的数据不要勾选。</p></div><span class="hint">${esc(wizard.file.name)}</span></div><div class="sheet-picker">${sheets.map((sheet, index) => { const selected = wizard.selectedSheets.includes(sheet.name); const fields = Object.values(sheet.suggestedMapping || {}).slice(0, 5).map((value) => esc(value)).join("、"); const workflow = WIZARD_WORKFLOW_OPTIONS.find(([value]) => value === sheet.suggestedWorkflowProfile)?.[1]; return `<label class="sheet-choice ${selected ? "selected" : ""}"><input type="checkbox" data-wizard-sheet="${esc(sheet.name)}" ${selected ? "checked" : ""}><span class="sheet-choice-index">${index + 1}</span><span class="sheet-choice-copy"><strong>${esc(sheet.name)}</strong><small>${sheet.totalRows} 行 · ${fields ? `识别到 ${fields}` : "未识别常用客户字段，请谨慎选择"}</small></span>${workflow && sheet.suggestedWorkflowProfile !== "standard" ? `<span class="sheet-purpose">${esc(workflow)}</span>` : sheet.twHeader ? `<span class="sheet-signal">含 TW</span>` : ""}</label>`; }).join("")}</div><div class="wizard-footer"><button class="secondary-btn" id="wizard-reset-file">重新选择文件</button><button class="primary-btn" id="wizard-start-sheets">设置已选工作表</button></div>`;
   workspace.querySelectorAll("[data-wizard-sheet]").forEach((input) => input.addEventListener("change", () => {
     wizard.selectedSheets = [...workspace.querySelectorAll("[data-wizard-sheet]:checked")].map((node) => node.dataset.wizardSheet);
     input.closest(".sheet-choice")?.classList.toggle("selected", input.checked);
@@ -1159,9 +1208,14 @@ function renderWizardGenericSheet(preview) {
   const workspace = wizardWorkspace();
   const config = wizardConfig(preview);
   const ownerChoices = state.meta.ownerChoices || state.meta.owners || [];
-  const ownerControl = state.user.canManageAssignments ? `<label class="wizard-owner"><span>未匹配客户的负责人</span><select id="wizard-default-owner">${ownerChoices.map((owner) => `<option value="${esc(owner.id)}" ${config.ownerId === owner.id ? "selected" : ""}>${esc(owner.name)}${owner.team ? ` · ${esc(owner.team)}` : ""}</option>`).join("")}</select></label>` : "";
-  const profileLabel = preview.importProfile === "asset" ? "券商资产更新" : preview.importProfile === "holding" ? "持仓快照更新" : preview.profile === "hongan_master" ? "港安客户总表" : "客户资料导入";
-  workspace.querySelector(".section-body").innerHTML = `${wizardProgressMarkup(preview)}<div class="wizard-step-header"><div><span class="wizard-kicker">步骤 2 / 3</span><h4>在原表预览中选择行和列</h4><p><b>${esc(profileLabel)}</b>。系统会先按 TW 编号确认客户；没有 TW 时不会自动合并同名客户。“原表骄阳顾问”只保存为历史标签，不改变当前负责人。</p></div><span class="import-profile">${esc(profileLabel)}</span></div>${wizardGridMarkup(preview, config)}<section class="wizard-safety-row">${ownerControl}<label class="import-consent"><input id="wizard-allow-unidentified" type="checkbox" ${config.allowUnidentifiedRows ? "checked" : ""}><span>允许缺少手机号、邮箱和 TW 编号的历史记录进入待补资料状态。</span></label></section><div id="wizard-impact"></div><div class="wizard-footer"><button class="secondary-btn" id="wizard-back-sheets">返回工作表选择</button><button class="primary-btn" id="wizard-check-impact">查看预计变更</button></div>`;
+  const isWorkflow = ["placement_intent", "placement_completed", "placement_lost"].includes(config.workflowProfile);
+  const ownerControl = !isWorkflow && state.user.canManageAssignments ? `<label class="wizard-owner"><span>未匹配客户的负责人</span><select id="wizard-default-owner">${ownerChoices.map((owner) => `<option value="${esc(owner.id)}" ${config.ownerId === owner.id ? "selected" : ""}>${esc(owner.name)}${owner.team ? ` · ${esc(owner.team)}` : ""}</option>`).join("")}</select></label>` : "";
+  const baseProfileLabel = preview.importProfile === "asset" ? "券商资产更新" : preview.importProfile === "holding" ? "持仓快照更新" : preview.profile === "hongan_master" ? "客户资料补充" : "客户资料导入";
+  const profileLabel = WIZARD_WORKFLOW_OPTIONS.find(([value]) => value === config.workflowProfile)?.[1] || baseProfileLabel;
+  const canChooseWorkflow = !["asset", "holding"].includes(preview.importProfile);
+  const workflowPicker = canChooseWorkflow ? `<section class="wizard-workflow-picker"><label><span>本表用途</span><select id="wizard-workflow-profile">${WIZARD_WORKFLOW_OPTIONS.map(([value, label]) => `<option value="${value}" ${config.workflowProfile === value ? "selected" : ""}>${esc(label)}</option>`).join("")}</select></label><p>${esc(WIZARD_WORKFLOW_HELP[config.workflowProfile] || WIZARD_WORKFLOW_HELP.standard)}</p></section>` : "";
+  const safetyControls = isWorkflow ? `<div class="wizard-workflow-safety"><strong>只匹配已有客户</strong><span>优先使用 TW、手机号或邮箱；没有编号时只接受唯一姓名。同名或未找到的记录进入导入复核，不会新建客户。</span></div>` : `<section class="wizard-safety-row">${ownerControl}<label class="import-consent"><input id="wizard-allow-unidentified" type="checkbox" ${config.allowUnidentifiedRows ? "checked" : ""}><span>允许缺少手机号、邮箱和 TW 编号的历史记录进入待补资料状态。</span></label></section>`;
+  workspace.querySelector(".section-body").innerHTML = `${wizardProgressMarkup(preview)}<div class="wizard-step-header"><div><span class="wizard-kicker">步骤 2 / 3</span><h4>在原表预览中选择行和列</h4><p><b>${esc(profileLabel)}</b>。先确认本表用途，再核对要写入的列。“原表骄阳顾问”只保存为历史标签，不改变当前负责人。</p></div><span class="import-profile">${esc(profileLabel)}</span></div>${workflowPicker}${wizardGridMarkup(preview, config)}${safetyControls}<div id="wizard-impact"></div><div class="wizard-footer"><button class="secondary-btn" id="wizard-back-sheets">返回工作表选择</button><button class="primary-btn" id="wizard-check-impact">查看预计变更</button></div>`;
   const rows = preview.rows || [];
   const headers = preview.headers || [];
   const invalidateImpact = () => { const root = workspace.querySelector("#wizard-impact"); if (root) root.innerHTML = ""; state.importWizard.impact = null; };
@@ -1236,6 +1290,12 @@ function renderWizardGenericSheet(preview) {
   workspace.querySelector("#wizard-next-page")?.addEventListener("click", () => { wizardReadConfig(); config.page += 1; renderWizardGenericSheet(preview); });
   workspace.querySelector("#wizard-default-owner")?.addEventListener("change", invalidateImpact);
   workspace.querySelector("#wizard-allow-unidentified")?.addEventListener("change", invalidateImpact);
+  workspace.querySelector("#wizard-workflow-profile")?.addEventListener("change", (event) => {
+    config.workflowProfile = event.currentTarget.value;
+    config.sourceMap = applyWizardWorkflowDefaults(preview, config.sourceMap, config.workflowProfile);
+    invalidateImpact();
+    renderWizardGenericSheet(preview);
+  });
   workspace.querySelector("#wizard-back-sheets")?.addEventListener("click", () => { wizardReadConfig(); renderWizardSheetPicker(); });
   workspace.querySelector("#wizard-check-impact")?.addEventListener("click", renderWizardImpact);
   updateSelectionState();
@@ -1257,14 +1317,21 @@ async function renderWizardImpact() {
     const impact = await api("/api/imports/impact", {method: "POST", body: JSON.stringify(payload)});
     state.importWizard.impact = impact;
     const counts = impact.counts || {};
-    const blocked = Number(counts.missingTw || 0) + Number(counts.missingIdentity || 0) + Number(counts.needsConfirmation || 0);
+    const isWorkflow = ["placement_intent", "placement_completed", "placement_lost"].includes(config.workflowProfile);
+    const writable = Number(counts.new || 0) + Number(counts.update || 0);
+    const reviewable = Number(counts.needsConfirmation || 0) + Number(counts.advisorConflicts || 0);
+    const blocked = isWorkflow ? !writable && !reviewable : Number(counts.missingTw || 0) + Number(counts.missingIdentity || 0) + Number(counts.needsConfirmation || 0);
+    const reviewCount = Number(counts.needsConfirmation || 0) + Number(counts.advisorConflicts || 0) + Number(counts.invalid || 0) + Number(counts.potentialDuplicate || 0);
     const notices = [
       counts.missingTw ? `有 ${counts.missingTw} 行缺少必需的 TW 编号。` : "",
-      counts.needsConfirmation ? `有 ${counts.needsConfirmation} 行没有任何身份编号，请勾选下方确认框或调整筛选。` : "",
+      counts.needsConfirmation ? (isWorkflow ? `有 ${counts.needsConfirmation} 行无法唯一匹配，提交后会进入导入复核，不会新建客户。` : `有 ${counts.needsConfirmation} 行没有任何身份编号，请勾选下方确认框或调整筛选。`) : "",
+      counts.advisorConflicts ? `有 ${counts.advisorConflicts} 位客户的港安顾问与本表不同；业务状态可以写入，顾问差异会留待人工确认。` : "",
+      counts.invalid ? `有 ${counts.invalid} 行金额、批次或重复关系不符合要求，将进入导入复核。` : "",
       counts.potentialDuplicate ? `有 ${counts.potentialDuplicate} 行手机号或邮箱已存在，提交后会进入导入复核，不会自动合并。` : "",
       counts.unknownTw ? `有 ${counts.unknownTw} 个 TW 尚未在主客户表中找到，资产/持仓不会为它们新建客户。` : "",
     ].filter(Boolean);
-    root.innerHTML = `<section class="wizard-impact"><header><div><span class="wizard-kicker">步骤 3 / 3</span><h4>预计变更</h4><p>${esc(impact.message || "")}</p></div><span class="hint">将处理 ${counts.filteredRows || 0} 行</span></header><div class="wizard-impact-grid"><div><b>${counts.new || 0}</b><span>预计新增</span></div><div><b>${counts.update || 0}</b><span>预计更新</span></div><div><b>${counts.potentialDuplicate || 0}</b><span>待人工复核</span></div><div><b>${(counts.missingTw || 0) + (counts.needsConfirmation || 0) + (counts.missingIdentity || 0)}</b><span>需先处理</span></div></div>${notices.length ? `<ul>${notices.map((notice) => `<li>${esc(notice)}</li>`).join("")}</ul>` : `<p class="wizard-safe-note">没有发现会阻止本次导入的身份信息问题。确认后系统会再次校验当前数据。</p>`}<div class="wizard-impact-actions"><button class="secondary-btn" id="wizard-edit-config">返回修改</button><button class="primary-btn" id="wizard-commit-sheet" ${blocked ? "disabled" : ""}>确认导入此工作表</button></div></section>`;
+    const newLabel = config.workflowProfile === "placement_completed" ? "新增批次关系" : "预计新增";
+    root.innerHTML = `<section class="wizard-impact"><header><div><span class="wizard-kicker">步骤 3 / 3</span><h4>预计变更</h4><p>${esc(impact.message || "")}</p></div><span class="hint">将检查 ${counts.filteredRows || 0} 行</span></header><div class="wizard-impact-grid"><div><b>${counts.new || 0}</b><span>${newLabel}</span></div><div><b>${counts.update || 0}</b><span>预计更新</span></div><div><b>${counts.unchanged || 0}</b><span>无需变化</span></div><div><b>${reviewCount}</b><span>进入人工复核</span></div></div>${notices.length ? `<ul>${notices.map((notice) => `<li>${esc(notice)}</li>`).join("")}</ul>` : `<p class="wizard-safe-note">没有发现会阻止本次导入的身份信息问题。确认后系统会再次校验当前数据。</p>`}<div class="wizard-impact-actions"><button class="secondary-btn" id="wizard-edit-config">返回修改</button><button class="primary-btn" id="wizard-commit-sheet" ${blocked ? "disabled" : ""}>确认导入此工作表</button></div></section>`;
     root.querySelector("#wizard-edit-config")?.addEventListener("click", () => root.innerHTML = "");
     root.querySelector("#wizard-commit-sheet")?.addEventListener("click", commitWizardSheet);
   } catch (err) { root.innerHTML = `<div class="result-box error-text">${esc(err.message)}</div>`; }

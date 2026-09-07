@@ -1166,3 +1166,135 @@ def test_crm_permissions_can_extend_a_manager_without_changing_muskzoom_role_or_
     assert reset.status_code == 200, reset.text
     assert reset.json()["user"]["crmScopeMode"] == "inherit"
     assert reset.json()["user"]["customerScope"] == "self"
+
+
+def test_placement_workflow_imports_keep_multi_batch_history_and_queue_uncertain_names():
+    admin_headers, _ = login("admin", "admin123")
+    first_batch = client.post(
+        "/api/batches", headers=admin_headers,
+        json={"name": "工作流测试批次一", "status": "已完成"},
+    )
+    second_batch = client.post(
+        "/api/batches", headers=admin_headers,
+        json={"name": "工作流测试批次二", "status": "已完成"},
+    )
+    assert first_batch.status_code == second_batch.status_code == 201
+
+    intended = client.post(
+        "/api/customers", headers=admin_headers,
+        json={"name": "工作流意向客户", "stage": "初步接洽"},
+    ).json()["customer"]
+    repeated = client.post(
+        "/api/customers", headers=admin_headers,
+        json={"name": "工作流多批次客户", "stage": "开户推进"},
+    ).json()["customer"]
+    secondary = client.post(
+        "/api/customers", headers=admin_headers,
+        json={"name": "工作流二级市场客户", "stage": "开户推进"},
+    ).json()["customer"]
+    client.post("/api/customers", headers=admin_headers, json={"name": "工作流同名客户"})
+    client.post("/api/customers", headers=admin_headers, json={"name": "工作流同名客户"})
+
+    intent_rows = [{"name": intended["name"], "hkAdvisor": "测试港安顾问", "intentAmount": "100000"}]
+    intent_impact = client.post(
+        "/api/imports/impact", headers=admin_headers,
+        json={"filename": "触达客户总表", "importProfile": "placement_intent", "rows": intent_rows},
+    )
+    assert intent_impact.status_code == 200, intent_impact.text
+    assert intent_impact.json()["counts"]["update"] == 1
+    intent_commit = client.post(
+        "/api/imports/commit", headers=admin_headers,
+        json={"filename": "触达客户总表", "importProfile": "placement_intent", "rows": intent_rows},
+    )
+    assert intent_commit.status_code == 200, intent_commit.text
+    assert intent_commit.json()["created"] == []
+    intended_detail = client.get(f"/api/customers/{intended['id']}", headers=admin_headers).json()["customer"]
+    assert intended_detail["intent_status"] == "有意向"
+    assert intended_detail["placement_status"] == "意向跟进"
+    assert intended_detail["intent_amount"] == 100000
+    assert intended_detail["hongan_advisor"] == "测试港安顾问"
+
+    completed_rows = [
+        {"name": repeated["name"], "batchName": "工作流测试批次一", "intentAmount": "1000", "actualAmount": "900"},
+        {"name": repeated["name"], "batchName": "工作流测试批次二", "intentAmount": "2000", "actualAmount": "1800"},
+    ]
+    completed_impact = client.post(
+        "/api/imports/impact", headers=admin_headers,
+        json={"filename": "已完成定增客户表", "importProfile": "placement_completed", "rows": completed_rows},
+    )
+    assert completed_impact.status_code == 200, completed_impact.text
+    assert completed_impact.json()["counts"]["new"] == 2
+    completed_commit = client.post(
+        "/api/imports/commit", headers=admin_headers,
+        json={"filename": "已完成定增客户表", "importProfile": "placement_completed", "rows": completed_rows},
+    )
+    assert completed_commit.status_code == 200, completed_commit.text
+    repeated_detail = client.get(f"/api/customers/{repeated['id']}", headers=admin_headers).json()
+    assert len(repeated_detail["batchParticipations"]) == 2
+    assert {row["batch_name"] for row in repeated_detail["batchParticipations"]} == {"工作流测试批次一", "工作流测试批次二"}
+    assert repeated_detail["customer"]["intent_amount"] == 3000
+    assert repeated_detail["customer"]["actual_amount"] == 2700
+    assert repeated_detail["customer"]["stage"] == "已参与定增"
+
+    lost_commit = client.post(
+        "/api/imports/commit", headers=admin_headers,
+        json={
+            "filename": "已确认取消客户表", "importProfile": "placement_lost",
+            "rows": [
+                {"name": secondary["name"], "lossCategory": "二级市场参与", "lossDetail": "改为二级市场购买"},
+                {"name": repeated["name"], "lossCategory": "放弃参与定增", "lossDetail": "本期取消"},
+            ],
+        },
+    )
+    assert lost_commit.status_code == 200, lost_commit.text
+    secondary_detail = client.get(f"/api/customers/{secondary['id']}", headers=admin_headers).json()["customer"]
+    assert secondary_detail["capital_destination"] == "二级市场"
+    assert secondary_detail["placement_status"] == "已流失"
+    assert secondary_detail["stage"] == "开户推进"
+    repeated_after_loss = client.get(f"/api/customers/{repeated['id']}", headers=admin_headers).json()
+    assert repeated_after_loss["customer"]["stage"] == "已参与定增"
+    assert len(repeated_after_loss["batchParticipations"]) == 2
+
+    uncertain_commit = client.post(
+        "/api/imports/commit", headers=admin_headers,
+        json={
+            "filename": "触达客户总表-待确认", "importProfile": "placement_intent",
+            "rows": [
+                {"name": "工作流同名客户", "intentAmount": "500"},
+                {"name": "工作流系统未收录客户", "intentAmount": "600"},
+            ],
+        },
+    )
+    assert uncertain_commit.status_code == 200, uncertain_commit.text
+    assert uncertain_commit.json()["created"] == []
+    assert len(uncertain_commit.json()["conflicts"]) == 2
+    reviews = client.get("/api/import-reviews", headers=admin_headers).json()["items"]
+    uncertain_reviews = [item for item in reviews if item["jobId"] == uncertain_commit.json()["jobId"]]
+    assert {item["category"] for item in uncertain_reviews} == {"ambiguous", "unmatched"}
+    assert all(item["canApply"] for item in uncertain_reviews)
+
+    rollback_customer = client.post(
+        "/api/customers", headers=admin_headers,
+        json={"name": "工作流回滚客户", "stage": "初步接洽"},
+    ).json()["customer"]
+    rollback_import = client.post(
+        "/api/imports/commit", headers=admin_headers,
+        json={
+            "filename": "已完成定增客户表-回滚", "importProfile": "placement_completed",
+            "rows": [{"name": rollback_customer["name"], "batchName": "工作流测试批次一", "intentAmount": "700", "actualAmount": "650"}],
+        },
+    )
+    assert rollback_import.status_code == 200, rollback_import.text
+    rolled_back = client.post(f"/api/imports/{rollback_import.json()['jobId']}/rollback", headers=admin_headers)
+    assert rolled_back.status_code == 200, rolled_back.text
+    rollback_detail = client.get(f"/api/customers/{rollback_customer['id']}", headers=admin_headers).json()
+    assert rollback_detail["customer"]["stage"] == "初步接洽"
+    assert rollback_detail["batchParticipations"] == []
+
+
+def test_placement_workflow_sheet_purpose_suggestions():
+    assert crm_main.suggested_placement_workflow_profile("触达客户总表", ["姓名", "意向额度(USD)"]) == "placement_intent"
+    assert crm_main.suggested_placement_workflow_profile("已完成定增客户表", ["姓名", "定增批次", "定增金额"]) == "placement_completed"
+    assert crm_main.suggested_placement_workflow_profile("已确认取消客户表", ["姓名", "定增批次", "卡点", "具体原因"]) == "placement_lost"
+    assert crm_main.batch_date_key("2026.04.08") == "2026-04-08"
+    assert crm_main.batch_date_key("2026年4月8日定增批次") == "2026-04-08"
