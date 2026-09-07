@@ -246,6 +246,29 @@ POSTGRES_SCHEMA_STATEMENTS = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS batch_participations (
+        id TEXT PRIMARY KEY,
+        batch_id TEXT NOT NULL REFERENCES placement_batches(id) DEFERRABLE INITIALLY DEFERRED,
+        customer_id TEXT NOT NULL REFERENCES customers(id) DEFERRABLE INITIALLY DEFERRED,
+        status TEXT NOT NULL DEFAULT '已参与',
+        intent_amount DOUBLE PRECISION NOT NULL DEFAULT 0,
+        funded_amount DOUBLE PRECISION NOT NULL DEFAULT 0,
+        actual_amount DOUBLE PRECISION NOT NULL DEFAULT 0,
+        notes TEXT NOT NULL DEFAULT '',
+        source_label TEXT NOT NULL DEFAULT '手工录入',
+        source_row INTEGER,
+        created_by TEXT NOT NULL,
+        created_by_name TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_by TEXT NOT NULL,
+        updated_by_name TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(batch_id, customer_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_batch_participations_batch ON batch_participations(batch_id, updated_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_batch_participations_customer ON batch_participations(customer_id, updated_at DESC)",
+    """
     CREATE TABLE IF NOT EXISTS customer_fields (
         id TEXT PRIMARY KEY,
         field_key TEXT NOT NULL UNIQUE,

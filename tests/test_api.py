@@ -813,6 +813,56 @@ def test_placement_batch_and_closed_loop_metrics():
     assert target["actual_amount"] == 200000
 
 
+def test_batch_participations_support_multiple_batches_and_safe_import_preview():
+    supervisor_headers, _ = login("supervisor", "supervisor123")
+    manager_headers, _ = login("manager", "manager123")
+    first_batch = client.post(
+        "/api/batches", headers=supervisor_headers,
+        json={"name": "历史定增批次一", "status": "已完成"},
+    )
+    second_batch = client.post(
+        "/api/batches", headers=supervisor_headers,
+        json={"name": "历史定增批次二", "status": "已完成"},
+    )
+    assert first_batch.status_code == second_batch.status_code == 201
+    first_id = first_batch.json()["batch"]["id"]
+    second_id = second_batch.json()["batch"]["id"]
+    created = client.post(
+        "/api/customers", headers=manager_headers,
+        json={"name": "多批次客户", "phone": "13800000123"},
+    )
+    assert created.status_code == 201, created.text
+    customer = created.json()["customer"]
+    first_participation = client.post(
+        f"/api/batches/{first_id}/participations", headers=supervisor_headers,
+        json={"customerId": customer["id"], "status": "已参与", "actualAmount": 1000},
+    )
+    second_participation = client.post(
+        f"/api/batches/{second_id}/participations", headers=supervisor_headers,
+        json={"customerId": customer["id"], "status": "资金到账", "fundedAmount": 2000},
+    )
+    assert first_participation.status_code == second_participation.status_code == 201
+    detail = client.get(f"/api/customers/{customer['id']}", headers=manager_headers)
+    assert detail.status_code == 200
+    assert {row["batch_id"] for row in detail.json()["batchParticipations"]} == {first_id, second_id}
+    listed = client.get(f"/api/batches/{first_id}/participations", headers=supervisor_headers)
+    assert listed.status_code == 200
+    assert listed.json()["items"][0]["participation_actual_amount"] == 1000
+    impact = client.post(
+        "/api/batch-participations/impact", headers=supervisor_headers,
+        json={"filename": "历史批次.csv", "batchId": first_id, "rows": [{"phone": "13800000123", "status": "已参与", "actualAmount": "1500"}]},
+    )
+    assert impact.status_code == 200, impact.text
+    assert impact.json()["counts"]["update"] == 1
+    imported = client.post(
+        "/api/batch-participations/import", headers=supervisor_headers,
+        json={"filename": "历史批次.csv", "batchId": first_id, "rows": [{"phone": "13800000123", "status": "已参与", "actualAmount": "1500"}]},
+    )
+    assert imported.status_code == 200, imported.text
+    assert imported.json()["counts"]["updated"] == 1
+    assert client.get(f"/api/batches/{second_id}/participations", headers=manager_headers).status_code == 200
+
+
 def test_xlsx_preview_ignores_broken_styles():
     admin_headers, _ = login("admin", "admin123")
     payload = {

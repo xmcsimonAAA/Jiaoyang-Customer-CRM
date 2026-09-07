@@ -36,6 +36,7 @@ TABLE_ORDER = [
     "import_jobs",
     "audit_logs",
     "placement_batches",
+    "batch_participations",
     "customer_fields",
     "customer_field_values",
     "customer_holding_snapshots",
@@ -60,9 +61,13 @@ def source_table_columns(conn: sqlite3.Connection, table: str) -> list[str]:
 
 def source_counts(conn: sqlite3.Connection) -> dict[str, int]:
     return {
-        table: int(conn.execute(f"SELECT COUNT(*) FROM {quote_identifier(table)}").fetchone()[0])
+        table: int(conn.execute(f"SELECT COUNT(*) FROM {quote_identifier(table)}").fetchone()[0]) if source_table_exists(conn, table) else 0
         for table in TABLE_ORDER
     }
+
+
+def source_table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone())
 
 
 def validate_source(conn: sqlite3.Connection) -> dict[str, int]:
@@ -70,7 +75,10 @@ def validate_source(conn: sqlite3.Connection) -> dict[str, int]:
     if integrity != "ok":
         raise RuntimeError(f"SQLite 完整性检查失败: {integrity}")
     existing = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-    missing = [table for table in TABLE_ORDER if table not in existing]
+    # Participation history was introduced after the first production snapshot.
+    # Treat it as an optional zero-row table so an older verified snapshot can
+    # still be migrated without fabricating historical relationships.
+    missing = [table for table in TABLE_ORDER if table not in existing and table != "batch_participations"]
     if missing:
         raise RuntimeError(f"SQLite 缺少必要数据表: {', '.join(missing)}")
     return source_counts(conn)
@@ -103,6 +111,8 @@ def target_counts(conn: Any) -> dict[str, int]:
 
 
 def copy_table(source: sqlite3.Connection, target: Any, table: str) -> int:
+    if not source_table_exists(source, table):
+        return 0
     columns = source_table_columns(source, table)
     allowed = set(target_columns(target, table))
     unsupported = [column for column in columns if column not in allowed]

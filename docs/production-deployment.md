@@ -183,6 +183,16 @@ The pinyin holding importer uses the `pypinyin` dependency. It identifies
 `name`/`qty` workbooks, previews unique and ambiguous matches, and only writes
 the unique matches after an explicit confirmation in the CRM.
 
+The placement-batch workspace keeps historical participation in a separate
+`batch_participations` table. A customer may therefore be linked to multiple
+placement batches. `target_batch_id` remains the single current planning target
+and is not treated as proof that the customer participated. Supervisors with
+customer-import permission can open a batch, add records manually, or upload a
+workbook after selecting the worksheet and identity/status/amount columns. The
+preview reports exact matches, updates, duplicates, and rows needing review;
+the import never creates customers, changes current owners, or writes secondary-
+market holding snapshots. Restarting the service creates this table automatically.
+
 ## 8. Acceptance and cutover
 
 Before sharing the entry with staff, validate all of the following:

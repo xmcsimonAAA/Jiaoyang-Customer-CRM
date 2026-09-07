@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import io
 import json
+import math
 import os
 import re
 import secrets
@@ -64,6 +65,7 @@ ACCOUNT_STATUSES = ["未启动", "资料准备", "开户审核", "已开户", "�
 INTENT_STATUSES = ["未确认", "有意向", "已锁定", "无意向"]
 PLACEMENT_STATUSES = ["未进入", "意向跟进", "批次确认", "资金筹备", "资金到账", "已参与", "已流失"]
 BATCH_STATUSES = ["筹备中", "开放中", "已截止", "已完成"]
+BATCH_PARTICIPATION_STATUSES = ["已锁定", "资金到账", "已参与", "未参与"]
 SOURCES = ["线下沙龙", "线上活动", "渠道推荐", "客户转介绍", "自主拓展", "历史存量", "其他"]
 FOLLOWUP_METHODS = ["电话", "微信", "面谈", "邮件", "活动", "其他"]
 IMPORT_ROW_LIMIT = 5000
@@ -295,6 +297,29 @@ def init_sqlite_db() -> None:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS batch_participations (
+                id TEXT PRIMARY KEY,
+                batch_id TEXT NOT NULL,
+                customer_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT '已参与',
+                intent_amount REAL NOT NULL DEFAULT 0,
+                funded_amount REAL NOT NULL DEFAULT 0,
+                actual_amount REAL NOT NULL DEFAULT 0,
+                notes TEXT NOT NULL DEFAULT '',
+                source_label TEXT NOT NULL DEFAULT '手工录入',
+                source_row INTEGER,
+                created_by TEXT NOT NULL,
+                created_by_name TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_by TEXT NOT NULL,
+                updated_by_name TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(batch_id, customer_id),
+                FOREIGN KEY (batch_id) REFERENCES placement_batches(id),
+                FOREIGN KEY (customer_id) REFERENCES customers(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_batch_participations_batch ON batch_participations(batch_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_batch_participations_customer ON batch_participations(customer_id, updated_at DESC);
             CREATE TABLE IF NOT EXISTS customer_fields (
                 id TEXT PRIMARY KEY,
                 field_key TEXT NOT NULL UNIQUE,
@@ -592,6 +617,31 @@ class BatchPatch(BaseModel):
     status: str | None = None
     targetAmount: float | None = Field(default=None, ge=0)
     notes: str | None = None
+
+
+class BatchParticipationPayload(BaseModel):
+    customerId: str
+    status: str = "已参与"
+    intentAmount: float = Field(default=0, ge=0)
+    fundedAmount: float = Field(default=0, ge=0)
+    actualAmount: float = Field(default=0, ge=0)
+    notes: str = ""
+    sourceLabel: str = "手工录入"
+    sourceRow: int | None = Field(default=None, ge=1)
+
+
+class BatchParticipationPatch(BaseModel):
+    status: str | None = None
+    intentAmount: float | None = Field(default=None, ge=0)
+    fundedAmount: float | None = Field(default=None, ge=0)
+    actualAmount: float | None = Field(default=None, ge=0)
+    notes: str | None = None
+
+
+class BatchParticipationImportPayload(BaseModel):
+    filename: str = Field(min_length=1, max_length=240)
+    batchId: str | None = None
+    rows: list[dict[str, Any]] = Field(default_factory=list)
 
 
 ADVISOR_CUSTOMER_TYPES = {"non_placement": "非定增", "placement": "定增"}
@@ -1281,6 +1331,228 @@ def find_customer_by_tw(conn: sqlite3.Connection, tw_code: str) -> dict[str, Any
     return dict(row) if row else None
 
 
+def parse_import_amount(value: Any, label: str) -> float:
+    cleaned = clean_import_cell(value)
+    if cleaned in (None, ""):
+        return 0.0
+    try:
+        amount = float(str(cleaned).replace(",", "").replace("$", "").strip())
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, f"{label}必须是数字。") from exc
+    if not math.isfinite(amount) or amount < 0:
+        raise HTTPException(422, f"{label}必须是大于等于 0 的有限数字。")
+    return amount
+
+
+def normalize_batch_match_name(value: Any) -> str:
+    return re.sub(r"[\s\u3000]+", "", simplify_text(value)).casefold()
+
+
+def normalize_batch_participation_status(value: Any) -> str:
+    status = str(clean_import_cell(value) or "").strip()
+    aliases = {
+        "参与定增": "已参与", "已参与定增": "已参与", "完成参与": "已参与", "已完成": "已参与",
+        "资金已到账": "资金到账", "已到账": "资金到账", "锁定": "已锁定",
+        "不参与": "未参与", "未参与定增": "未参与", "放弃": "未参与", "否": "未参与", "N": "未参与", "NO": "未参与",
+        "是": "已参与", "Y": "已参与", "YES": "已参与",
+    }
+    return aliases.get(status, aliases.get(status.upper(), status))
+
+
+def visible_batch_participation_customer(conn: sqlite3.Connection, raw_row: dict[str, Any], user: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """Resolve an imported customer without ever creating a new customer record."""
+    customer_id = str(raw_row.get("customerId", "") or "").strip()
+    if customer_id:
+        try:
+            return dict(assert_customer_access(conn, customer_id, user)), None
+        except HTTPException:
+            return None, "客户不存在，或您无权查看"
+    tw_code = normalize_tw_code(raw_row.get("twCode", ""))
+    if tw_code:
+        customer = find_customer_by_tw(conn, tw_code)
+        if not customer:
+            return None, f"未找到 TW 编号 {tw_code}"
+        try:
+            assert_customer_access(conn, customer["id"], user)
+        except HTTPException:
+            return None, "客户不存在，或您无权查看"
+        return customer, None
+    phone = normalize_phone(str(raw_row.get("phone", "") or ""))
+    if phone:
+        rows = conn.execute(
+            """SELECT c.* FROM customer_identifiers i JOIN customers c ON c.id=i.customer_id
+            WHERE i.kind='phone' AND i.normalized_value=? AND c.archived_at IS NULL""",
+            (phone,),
+        ).fetchall()
+    else:
+        display_name = str(clean_import_cell(raw_row.get("name", raw_row.get("wechatNickname", ""))) or "").strip()
+        if not display_name:
+            return None, "缺少 TW 编号、手机号和客户姓名"
+        name_key = normalize_batch_match_name(display_name)
+        # Name matching is intentionally done in Python so traditional/simplified
+        # Chinese and full-width spaces follow the same normalization as imports.
+        candidates = conn.execute("SELECT c.* FROM customers c WHERE c.archived_at IS NULL").fetchall()
+        rows = [
+            row for row in candidates
+            if name_key in {
+                normalize_batch_match_name(row["name"]),
+                normalize_batch_match_name(row["wechat_nickname"]),
+            }
+        ]
+    visible: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            assert_customer_access(conn, row["id"], user)
+            visible.append(dict(row))
+        except HTTPException:
+            continue
+    if not visible:
+        return None, "系统中没有找到可见客户"
+    if len(visible) > 1:
+        return None, f"匹配到 {len(visible)} 位客户，需要使用 TW 编号确认"
+    return visible[0], None
+
+
+def resolve_batch_participation_batch(conn: sqlite3.Connection, raw_row: dict[str, Any], default_batch_id: str | None) -> tuple[dict[str, Any] | None, str | None]:
+    batch_id = str(raw_row.get("batchId") or default_batch_id or "").strip()
+    if batch_id:
+        row = conn.execute("SELECT * FROM placement_batches WHERE id=?", (batch_id,)).fetchone()
+        return (dict(row), None) if row else (None, "所选定增批次不存在")
+    batch_name = str(clean_import_cell(raw_row.get("batchName", "")) or "").strip()
+    if not batch_name:
+        return None, "请指定定增批次，或映射表中的批次名称列"
+    rows = conn.execute("SELECT * FROM placement_batches").fetchall()
+    matched = [dict(row) for row in rows if normalize_batch_match_name(row["name"]) == normalize_batch_match_name(batch_name)]
+    if not matched:
+        return None, f"没有名为“{batch_name}”的定增批次"
+    return matched[0], None
+
+
+def batch_participation_values(raw_row: dict[str, Any], existing: dict[str, Any] | None = None) -> dict[str, Any]:
+    def text_value(key: str, default: str) -> str:
+        return str(clean_import_cell(raw_row[key]) or "").strip() if key in raw_row else default
+
+    def amount_value(key: str, default: float, label: str) -> float:
+        return parse_import_amount(raw_row[key], label) if key in raw_row else default
+
+    return {
+        "status": normalize_batch_participation_status(text_value("status", str(existing["status"]) if existing else "已参与")) or "已参与",
+        "intent_amount": amount_value("intentAmount", float(existing["intent_amount"]) if existing else 0, "意向金额"),
+        "funded_amount": amount_value("fundedAmount", float(existing["funded_amount"]) if existing else 0, "到账金额"),
+        "actual_amount": amount_value("actualAmount", float(existing["actual_amount"]) if existing else 0, "实际参与金额"),
+        "notes": text_value("notes", str(existing["notes"]) if existing else ""),
+    }
+
+
+def save_batch_participation(
+    conn: sqlite3.Connection,
+    batch_id: str,
+    customer_id: str,
+    raw_values: dict[str, Any],
+    user: dict[str, Any],
+    source_label: str = "手工录入",
+    source_row: int | None = None,
+) -> tuple[dict[str, Any], str]:
+    existing_row = conn.execute(
+        "SELECT * FROM batch_participations WHERE batch_id=? AND customer_id=?",
+        (batch_id, customer_id),
+    ).fetchone()
+    existing = dict(existing_row) if existing_row else None
+    values = batch_participation_values(raw_values, existing)
+    if values["status"] not in BATCH_PARTICIPATION_STATUSES:
+        raise HTTPException(422, "无效的批次参与状态。")
+    timestamp = now_iso()
+    if existing:
+        changed = any(existing[key] != value for key, value in values.items())
+        if changed or source_label != existing["source_label"] or source_row != existing["source_row"]:
+            conn.execute(
+                """UPDATE batch_participations SET status=?, intent_amount=?, funded_amount=?, actual_amount=?, notes=?,
+                source_label=?, source_row=?, updated_by=?, updated_by_name=?, updated_at=? WHERE id=?""",
+                (values["status"], values["intent_amount"], values["funded_amount"], values["actual_amount"], values["notes"],
+                 source_label[:240], source_row, user["id"], user["name"], timestamp, existing["id"]),
+            )
+            action = "updated"
+        else:
+            action = "unchanged"
+        row = conn.execute("SELECT * FROM batch_participations WHERE id=?", (existing["id"],)).fetchone()
+        return dict(row), action
+    participation_id = str(uuid4())
+    conn.execute(
+        """INSERT INTO batch_participations(
+        id, batch_id, customer_id, status, intent_amount, funded_amount, actual_amount, notes, source_label, source_row,
+        created_by, created_by_name, created_at, updated_by, updated_by_name, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (participation_id, batch_id, customer_id, values["status"], values["intent_amount"], values["funded_amount"], values["actual_amount"], values["notes"],
+         source_label[:240], source_row, user["id"], user["name"], timestamp, user["id"], user["name"], timestamp),
+    )
+    row = conn.execute("SELECT * FROM batch_participations WHERE id=?", (participation_id,)).fetchone()
+    return dict(row), "created"
+
+
+def batch_participation_import_preview(
+    conn: sqlite3.Connection, payload: BatchParticipationImportPayload, user: dict[str, Any]
+) -> dict[str, Any]:
+    prepared: list[dict[str, Any]] = []
+    problems: list[dict[str, Any]] = []
+    samples: list[dict[str, Any]] = []
+    counts = {"new": 0, "update": 0, "unchanged": 0, "needsConfirmation": 0, "invalid": 0}
+    seen: set[tuple[str, str]] = set()
+    for index, raw in enumerate(payload.rows, start=1):
+        if not isinstance(raw, dict):
+            problems.append({"row": index, "reason": "这一行不是有效的表格记录"})
+            counts["invalid"] += 1
+            continue
+        batch, batch_error = resolve_batch_participation_batch(conn, raw, payload.batchId)
+        customer, customer_error = visible_batch_participation_customer(conn, raw, user)
+        if batch_error or customer_error:
+            problems.append({
+                "row": index,
+                "name": str(raw.get("name") or raw.get("wechatNickname") or raw.get("twCode") or "未命名客户"),
+                "reason": batch_error or customer_error,
+            })
+            counts["needsConfirmation"] += 1
+            continue
+        try:
+            values = batch_participation_values(raw)
+            if values["status"] not in BATCH_PARTICIPATION_STATUSES:
+                raise HTTPException(422, "无效的批次参与状态")
+        except HTTPException as exc:
+            problems.append({"row": index, "name": customer["name"], "reason": str(exc.detail)})
+            counts["invalid"] += 1
+            continue
+        key = (batch["id"], customer["id"])
+        if key in seen:
+            problems.append({"row": index, "name": customer["name"], "reason": "同一客户在同一批次出现重复行，请只保留一行"})
+            counts["invalid"] += 1
+            continue
+        seen.add(key)
+        existing_row = conn.execute(
+            "SELECT * FROM batch_participations WHERE batch_id=? AND customer_id=?", key
+        ).fetchone()
+        existing = dict(existing_row) if existing_row else None
+        if not existing:
+            action = "new"
+        elif any(existing[field] != value for field, value in values.items()) or existing["source_label"] != payload.filename or existing["source_row"] != index:
+            action = "update"
+        else:
+            action = "unchanged"
+        counts[action] += 1
+        summary = {
+            "row": index,
+            "customerId": customer["id"],
+            "customerName": customer["name"] or customer.get("wechat_nickname") or customer["customer_code"],
+            "customerCode": customer["customer_code"],
+            "batchId": batch["id"],
+            "batchName": batch["name"],
+            "action": action,
+            "status": values["status"],
+        }
+        if len(samples) < 16:
+            samples.append(summary)
+        prepared.append({"row": index, "raw": raw, "customer": customer, "batch": batch, "values": values, "action": action})
+    return {"counts": counts, "samples": samples, "problems": problems[:80], "prepared": prepared}
+
+
 def add_tw_identifier(conn: sqlite3.Connection, customer_id: str, tw_code: str) -> None:
     code = normalize_tw_code(tw_code)
     if not code:
@@ -1466,7 +1738,7 @@ def meta(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     return {
         "stages": STAGES, "sources": SOURCES, "followupMethods": FOLLOWUP_METHODS, "owners": available, "collaboratorUsers": collaborator_users,
         "accountStatuses": ACCOUNT_STATUSES, "intentStatuses": INTENT_STATUSES,
-        "placementStatuses": PLACEMENT_STATUSES, "batchStatuses": BATCH_STATUSES,
+        "placementStatuses": PLACEMENT_STATUSES, "batchStatuses": BATCH_STATUSES, "batchParticipationStatuses": BATCH_PARTICIPATION_STATUSES,
         "batches": [dict(row) for row in batches], "customerFields": [field_dict(row) for row in fields], "ownerChoices": owner_choices,
         "honganAdvisors": [row["advisor"] for row in hongan_advisors], "crmScopeModes": ["inherit", "self", "team", "all"],
     }
@@ -1569,7 +1841,7 @@ def dashboard(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
             f"""SELECT COUNT(*) total,
             SUM(CASE WHEN account_status = '已开户' THEN 1 ELSE 0 END) accounts_opened,
             SUM(CASE WHEN intent_status IN ('有意向','已锁定') THEN 1 ELSE 0 END) intended,
-            SUM(CASE WHEN target_batch_id IS NOT NULL THEN 1 ELSE 0 END) batched,
+            SUM(CASE WHEN target_batch_id IS NOT NULL OR EXISTS (SELECT 1 FROM batch_participations bp WHERE bp.customer_id=c.id) THEN 1 ELSE 0 END) batched,
             SUM(CASE WHEN placement_status IN ('资金到账','已参与') THEN 1 ELSE 0 END) funded,
             SUM(CASE WHEN placement_status = '已参与' THEN 1 ELSE 0 END) closed,
             SUM(CASE WHEN placement_status = '已流失' THEN 1 ELSE 0 END) lost,
@@ -1593,7 +1865,9 @@ def dashboard(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
         risk = conn.execute(
             f"""SELECT
             SUM(CASE WHEN {due_expression} <= {today_expression} THEN 1 ELSE 0 END) due,
-            SUM(CASE WHEN c.intent_status IN ('有意向','已锁定') AND c.target_batch_id IS NULL AND c.placement_status NOT IN ('已参与','已流失') THEN 1 ELSE 0 END) intent_unbatched,
+            SUM(CASE WHEN c.intent_status IN ('有意向','已锁定') AND c.target_batch_id IS NULL
+                AND NOT EXISTS (SELECT 1 FROM batch_participations bp_unbatched WHERE bp_unbatched.customer_id=c.id)
+                AND c.placement_status NOT IN ('已参与','已流失') THEN 1 ELSE 0 END) intent_unbatched,
             SUM(CASE WHEN TRIM(c.phone) = '' AND TRIM(c.email) = '' AND TRIM(c.wechat_nickname) = '' THEN 1 ELSE 0 END) missing_contact,
             SUM(CASE WHEN c.owner_id = ? OR TRIM(c.owner_name) = '' THEN 1 ELSE 0 END) unassigned,
             SUM(CASE WHEN c.placement_status NOT IN ('已参与','已流失') AND {created_date_expression} <= {sql_days_ago(7)} AND COALESCE({last_followup_date_expression}, {created_date_expression}) < {sql_days_ago(7)} THEN 1 ELSE 0 END) stalled
@@ -1623,7 +1897,7 @@ def dashboard(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
             f"""SELECT
             CASE WHEN TRIM(c.owner_team) != '' AND c.owner_team != '待分配池' THEN c.owner_team ELSE c.owner_name END group_name,
             COUNT(*) total,
-            SUM(CASE WHEN c.target_batch_id IS NOT NULL THEN 1 ELSE 0 END) batched,
+            SUM(CASE WHEN c.target_batch_id IS NOT NULL OR EXISTS (SELECT 1 FROM batch_participations bp WHERE bp.customer_id=c.id) THEN 1 ELSE 0 END) batched,
             SUM(CASE WHEN c.placement_status = '已参与' THEN 1 ELSE 0 END) closed
             FROM customers c
             WHERE c.archived_at IS NULL AND {clause}
@@ -1837,14 +2111,14 @@ def list_customers(
     if metric == "intent":
         filters.append("c.intent_status IN ('有意向','已锁定')")
     if metric == "batched":
-        filters.append("c.target_batch_id IS NOT NULL")
+        filters.append("(c.target_batch_id IS NOT NULL OR EXISTS (SELECT 1 FROM batch_participations bp_metric WHERE bp_metric.customer_id=c.id))")
     if metric == "funded":
         filters.append("c.placement_status IN ('资金到账','已参与')")
     if metric == "closed":
         filters.append("c.placement_status = '已参与'")
     if batch_id:
-        filters.append("c.target_batch_id = ?")
-        values.append(batch_id)
+        filters.append("(c.target_batch_id = ? OR EXISTS (SELECT 1 FROM batch_participations bp_filter WHERE bp_filter.customer_id=c.id AND bp_filter.batch_id=?))")
+        values.extend([batch_id, batch_id])
     if placement_status:
         filters.append("c.placement_status = ?")
         values.append(placement_status)
@@ -1984,8 +2258,20 @@ def customer_detail(customer_id: str, user: dict[str, Any] = Depends(current_use
         followups = conn.execute("SELECT * FROM followups WHERE customer_id = ? ORDER BY created_at DESC", (customer_id,)).fetchall()
         assignments = conn.execute("SELECT * FROM assignments WHERE customer_id = ? ORDER BY changed_at DESC", (customer_id,)).fetchall()
         snapshots = conn.execute("SELECT * FROM customer_holding_snapshots WHERE customer_id = ? ORDER BY snapshot_date DESC, created_at DESC", (customer_id,)).fetchall()
+        participations = conn.execute(
+            """SELECT bp.*, b.name batch_name, b.close_date batch_close_date, b.status batch_lifecycle_status
+            FROM batch_participations bp JOIN placement_batches b ON b.id=bp.batch_id
+            WHERE bp.customer_id=? ORDER BY COALESCE(b.close_date, '9999-12-31') DESC, bp.updated_at DESC""",
+            (customer_id,),
+        ).fetchall()
         customer_data = attach_customer_relations(conn, [dict(customer)])[0]
-    return {"customer": customer_data, "followups": [dict(row) for row in followups], "assignments": [dict(row) for row in assignments], "holdingSnapshots": [dict(row) for row in snapshots]}
+    return {
+        "customer": customer_data,
+        "followups": [dict(row) for row in followups],
+        "assignments": [dict(row) for row in assignments],
+        "holdingSnapshots": [dict(row) for row in snapshots],
+        "batchParticipations": [dict(row) for row in participations],
+    }
 
 
 @app.put("/api/customers/{customer_id}/collaborators")
@@ -2238,6 +2524,28 @@ def merge_customers(payload: MergePayload, user: dict[str, Any] = Depends(curren
                 conn.execute("UPDATE customer_field_values SET value_text=?, updated_by=?, updated_at=? WHERE customer_id=? AND field_id=?", (value["value_text"], value["updated_by"], value["updated_at"], target["id"], value["field_id"]))
         conn.execute("DELETE FROM customer_field_values WHERE customer_id=?", (source["id"],))
         merged_at = now_iso()
+        for participation in conn.execute("SELECT * FROM batch_participations WHERE customer_id=?", (source["id"],)).fetchall():
+            existing_participation = conn.execute(
+                "SELECT * FROM batch_participations WHERE customer_id=? AND batch_id=?",
+                (target["id"], participation["batch_id"]),
+            ).fetchone()
+            if not existing_participation:
+                conn.execute("UPDATE batch_participations SET customer_id=? WHERE id=?", (target["id"], participation["id"]))
+                continue
+            # A merged source is a duplicate identity, not an additional investment.
+            # Keep the largest recorded amount for each field and preserve both notes.
+            merged_notes = "\n".join(item for item in [existing_participation["notes"], participation["notes"]] if item).strip()
+            conn.execute(
+                """UPDATE batch_participations SET intent_amount=?, funded_amount=?, actual_amount=?, notes=?,
+                updated_at=?, updated_by=?, updated_by_name=? WHERE id=?""",
+                (
+                    max(float(existing_participation["intent_amount"]), float(participation["intent_amount"])),
+                    max(float(existing_participation["funded_amount"]), float(participation["funded_amount"])),
+                    max(float(existing_participation["actual_amount"]), float(participation["actual_amount"])),
+                    merged_notes, merged_at, user["id"], user["name"], existing_participation["id"],
+                ),
+            )
+            conn.execute("DELETE FROM batch_participations WHERE id=?", (participation["id"],))
         conn.execute("UPDATE customers SET archived_at = ?, merged_into_id = ?, updated_at = ?, version = version + 1 WHERE id = ?", (merged_at, target["id"], merged_at, source["id"]))
         conn.execute("UPDATE customers SET updated_at = ?, version = version + 1 WHERE id = ?", (merged_at, target["id"]))
         conn.execute("INSERT INTO merge_events VALUES (?, ?, ?, ?, ?, ?, ?)", (str(uuid4()), source["id"], target["id"], payload.reason.strip(), user["id"], user["name"], merged_at))
@@ -2267,15 +2575,40 @@ def list_batches(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]
     clause, params = access_clause(user)
     with db() as conn:
         rows = conn.execute(
-            f"""SELECT b.*, COUNT(c.id) customer_count,
-            COALESCE(SUM(c.intent_amount),0) intent_amount,
-            COALESCE(SUM(c.funded_amount),0) funded_amount,
-            COALESCE(SUM(c.actual_amount),0) actual_amount,
-            SUM(CASE WHEN c.placement_status='已参与' THEN 1 ELSE 0 END) closed_count,
-            SUM(CASE WHEN c.placement_status='已流失' THEN 1 ELSE 0 END) lost_count
+            f"""SELECT b.*,
+            COALESCE(p.customer_count, 0) + COALESCE(t.customer_count, 0) customer_count,
+            COALESCE(p.customer_count, 0) participation_count,
+            COALESCE(t.customer_count, 0) target_customer_count,
+            COALESCE(p.intent_amount, 0) + COALESCE(t.intent_amount, 0) intent_amount,
+            COALESCE(p.funded_amount, 0) + COALESCE(t.funded_amount, 0) funded_amount,
+            COALESCE(p.actual_amount, 0) + COALESCE(t.actual_amount, 0) actual_amount,
+            COALESCE(p.closed_count, 0) + COALESCE(t.closed_count, 0) closed_count,
+            COALESCE(p.lost_count, 0) + COALESCE(t.lost_count, 0) lost_count
             FROM placement_batches b
-            LEFT JOIN customers c ON c.target_batch_id=b.id AND c.archived_at IS NULL AND {clause}
-            GROUP BY b.id ORDER BY COALESCE(b.close_date, '9999-12-31'), b.created_at DESC""", params,
+            LEFT JOIN (
+                SELECT bp.batch_id, COUNT(c.id) customer_count,
+                COALESCE(SUM(bp.intent_amount),0) intent_amount,
+                COALESCE(SUM(bp.funded_amount),0) funded_amount,
+                COALESCE(SUM(bp.actual_amount),0) actual_amount,
+                SUM(CASE WHEN bp.status='已参与' THEN 1 ELSE 0 END) closed_count,
+                SUM(CASE WHEN bp.status='未参与' THEN 1 ELSE 0 END) lost_count
+                FROM batch_participations bp JOIN customers c ON c.id=bp.customer_id
+                WHERE c.archived_at IS NULL AND {clause}
+                GROUP BY bp.batch_id
+            ) p ON p.batch_id=b.id
+            LEFT JOIN (
+                SELECT c.target_batch_id batch_id, COUNT(c.id) customer_count,
+                COALESCE(SUM(c.intent_amount),0) intent_amount,
+                COALESCE(SUM(c.funded_amount),0) funded_amount,
+                COALESCE(SUM(c.actual_amount),0) actual_amount,
+                SUM(CASE WHEN c.placement_status='已参与' THEN 1 ELSE 0 END) closed_count,
+                SUM(CASE WHEN c.placement_status='已流失' THEN 1 ELSE 0 END) lost_count
+                FROM customers c LEFT JOIN batch_participations bp ON bp.batch_id=c.target_batch_id AND bp.customer_id=c.id
+                WHERE c.archived_at IS NULL AND c.target_batch_id IS NOT NULL AND bp.id IS NULL AND {clause}
+                GROUP BY c.target_batch_id
+            ) t ON t.batch_id=b.id
+            ORDER BY COALESCE(b.close_date, '9999-12-31'), b.created_at DESC""",
+            (*params, *params),
         ).fetchall()
     return {"items": [dict(row) for row in rows]}
 
@@ -2321,6 +2654,143 @@ def update_batch(batch_id: str, payload: BatchPatch, user: dict[str, Any] = Depe
     return {"batch": dict(row)}
 
 
+@app.get("/api/batches/{batch_id}/participations")
+def list_batch_participations(batch_id: str, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    clause, params = access_clause(user)
+    with db() as conn:
+        batch = conn.execute("SELECT * FROM placement_batches WHERE id=?", (batch_id,)).fetchone()
+        if not batch:
+            raise HTTPException(404, "批次不存在。")
+        rows = conn.execute(
+            f"""SELECT bp.id participation_id, bp.batch_id, bp.status participation_status,
+            bp.intent_amount participation_intent_amount, bp.funded_amount participation_funded_amount,
+            bp.actual_amount participation_actual_amount, bp.notes participation_notes,
+            bp.source_label, bp.source_row, bp.created_at participation_created_at,
+            bp.updated_at participation_updated_at, bp.updated_by_name,
+            c.*, b.name batch_name, b.close_date batch_close_date, b.status batch_lifecycle_status
+            FROM batch_participations bp
+            JOIN customers c ON c.id=bp.customer_id
+            JOIN placement_batches b ON b.id=bp.batch_id
+            WHERE bp.batch_id=? AND c.archived_at IS NULL AND {clause}
+            ORDER BY bp.updated_at DESC, c.name""",
+            (batch_id, *params),
+        ).fetchall()
+        customers = attach_customer_relations(conn, [dict(row) for row in rows])
+        target_rows = conn.execute(
+            f"""SELECT c.*, b.name target_batch_name
+            FROM customers c LEFT JOIN placement_batches b ON b.id=c.target_batch_id
+            LEFT JOIN batch_participations bp ON bp.batch_id=c.target_batch_id AND bp.customer_id=c.id
+            WHERE c.target_batch_id=? AND bp.id IS NULL AND c.archived_at IS NULL AND {clause}
+            ORDER BY c.updated_at DESC""",
+            (batch_id, *params),
+        ).fetchall()
+        target_customers = attach_customer_relations(conn, [dict(row) for row in target_rows])
+    return {"batch": dict(batch), "items": customers, "targetCustomers": target_customers}
+
+
+@app.post("/api/batches/{batch_id}/participations", status_code=201)
+def create_batch_participation(batch_id: str, payload: BatchParticipationPayload, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    require_supervisor(user)
+    with db() as conn:
+        if not conn.execute("SELECT id FROM placement_batches WHERE id=?", (batch_id,)).fetchone():
+            raise HTTPException(404, "批次不存在。")
+        assert_customer_access(conn, payload.customerId, user)
+        participation, action = save_batch_participation(
+            conn, batch_id, payload.customerId, payload.model_dump(), user, "手工录入", payload.sourceRow,
+        )
+        audit(conn, user, f"batch_participation.{action}", "batch_participation", participation["id"], {"batchId": batch_id, "customerId": payload.customerId, "source": "manual"})
+    return {"participation": participation, "action": action}
+
+
+@app.patch("/api/batch-participations/{participation_id}")
+def update_batch_participation(participation_id: str, payload: BatchParticipationPatch, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    require_supervisor(user)
+    with db() as conn:
+        row = conn.execute("SELECT * FROM batch_participations WHERE id=?", (participation_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "批次参与记录不存在。")
+        participation = dict(row)
+        assert_customer_access(conn, participation["customer_id"], user)
+        values = payload.model_dump(exclude_none=True)
+        raw_values = {
+            "status": values.get("status", participation["status"]),
+            "intentAmount": values.get("intentAmount", participation["intent_amount"]),
+            "fundedAmount": values.get("fundedAmount", participation["funded_amount"]),
+            "actualAmount": values.get("actualAmount", participation["actual_amount"]),
+            "notes": values.get("notes", participation["notes"]),
+        }
+        saved, action = save_batch_participation(
+            conn, participation["batch_id"], participation["customer_id"], raw_values, user,
+            participation["source_label"], participation["source_row"],
+        )
+        audit(conn, user, f"batch_participation.{action}", "batch_participation", saved["id"], {"batchId": saved["batch_id"], "customerId": saved["customer_id"], "source": "manual_edit"})
+    return {"participation": saved, "action": action}
+
+
+@app.delete("/api/batch-participations/{participation_id}")
+def delete_batch_participation(participation_id: str, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    require_supervisor(user)
+    with db() as conn:
+        row = conn.execute("SELECT * FROM batch_participations WHERE id=?", (participation_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "批次参与记录不存在。")
+        participation = dict(row)
+        assert_customer_access(conn, participation["customer_id"], user)
+        conn.execute("DELETE FROM batch_participations WHERE id=?", (participation_id,))
+        audit(conn, user, "batch_participation.deleted", "batch_participation", participation_id, {"batchId": participation["batch_id"], "customerId": participation["customer_id"]})
+    return {"ok": True}
+
+
+@app.post("/api/batch-participations/impact")
+def batch_participation_impact(payload: BatchParticipationImportPayload, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    if not user["canImportCustomers"]:
+        raise HTTPException(403, "您的账号未开通批量导入权限。")
+    require_supervisor(user)
+    if not payload.rows:
+        raise HTTPException(422, "请至少保留一条参与记录。")
+    if len(payload.rows) > IMPORT_ROW_LIMIT:
+        raise HTTPException(422, f"单次最多导入 {IMPORT_ROW_LIMIT} 行，请拆分文件。")
+    with db() as conn:
+        preview = batch_participation_import_preview(conn, payload, user)
+    return {"filename": payload.filename, **{key: value for key, value in preview.items() if key != "prepared"}}
+
+
+@app.post("/api/batch-participations/import")
+def import_batch_participations(payload: BatchParticipationImportPayload, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    if not user["canImportCustomers"]:
+        raise HTTPException(403, "您的账号未开通批量导入权限。")
+    require_supervisor(user)
+    if not payload.rows:
+        raise HTTPException(422, "请至少保留一条参与记录。")
+    if len(payload.rows) > IMPORT_ROW_LIMIT:
+        raise HTTPException(422, f"单次最多导入 {IMPORT_ROW_LIMIT} 行，请拆分文件。")
+    with db() as conn:
+        preview = batch_participation_import_preview(conn, payload, user)
+        created, updated, unchanged = [], [], 0
+        for item in preview["prepared"]:
+            saved, action = save_batch_participation(
+                conn, item["batch"]["id"], item["customer"]["id"], item["raw"], user, payload.filename, item["row"],
+            )
+            result = {"row": item["row"], "participationId": saved["id"], "customerId": item["customer"]["id"], "batchId": item["batch"]["id"]}
+            if action == "created":
+                created.append(result)
+            elif action == "updated":
+                updated.append(result)
+            else:
+                unchanged += 1
+        audit(conn, user, "batch_participation.imported", "batch_participation_import", str(uuid4()), {
+            "filename": payload.filename, "created": len(created), "updated": len(updated), "unchanged": unchanged,
+            "needsConfirmation": preview["counts"]["needsConfirmation"], "invalid": preview["counts"]["invalid"],
+        })
+    return {
+        "created": created,
+        "updated": updated,
+        "unchangedCount": unchanged,
+        "needsConfirmation": preview["problems"],
+        "counts": {**preview["counts"], "created": len(created), "updated": len(updated), "unchanged": unchanged},
+    }
+
+
 HEADER_ALIASES = {
     "name": ["客户姓名", "真实姓名", "客户真实姓名", "姓名", "客户名称", "名称"], "wechatNickname": ["微信昵称", "微信名", "昵称"], "phone": ["手机号", "手机", "联系电话", "电话"],
     "email": ["邮箱", "电子邮箱", "email"], "company": ["公司", "公司名称", "机构", "单位"],
@@ -2331,6 +2801,7 @@ HEADER_ALIASES = {
     "brokerDepositAmount": ["入金金额/USD", "入金金额", "港券入金金额", "券商账户资产", "客户权益资产", "账户权益资产", "账户资产", "权益资产"], "capitalDestination": ["资金流向", "资金去向"],
     "hkAdvisor": ["港安顾问", "保险经纪人"], "sourceAdvisorLabel": ["骄阳顾问", "商务顾问", "客户顾问"],
     "intentStatus": ["定增意向", "意向状态", "顾问判断"], "placementStatus": ["定增推进", "节点进度", "定增状态"],
+    "status": ["本批状态", "参与状态", "定增参与状态", "是否参与定增", "是否参加定增", "参与定增"],
     "intentAmount": ["意向金额", "意向额度", "意向额度(USD)"], "fundedAmount": ["到账金额", "到账金额(USD)"],
     "actualAmount": ["实际参与金额", "实际定增", "定增金额"], "lostReason": ["流失原因", "取消原因"],
     "notes": ["备注", "情况说明", "最新跟进"],
