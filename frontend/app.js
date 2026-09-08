@@ -39,6 +39,20 @@ const tag = (value, tone = "gray") => `<span class="tag ${tone}">${esc(value || 
 const toneFor = (value) => ["已参与", "已开户", "资金到账", "已完成"].includes(value) ? "teal" : ["已流失", "开户失败"].includes(value) ? "red" : ["已锁定", "批次确认", "开放中"].includes(value) ? "amber" : "gray";
 const roleTone = (role) => role === "manager" ? "teal" : role === "supervisor" ? "amber" : "cyan";
 const toast = (message) => { const node = document.querySelector("#toast"); node.textContent = message; node.classList.add("show"); setTimeout(() => node.classList.remove("show"), 2400); };
+const busyMarkup = (title, detail) => `<div class="operation-busy" role="status" aria-live="polite"><span class="operation-spinner" aria-hidden="true"></span><div><strong>${esc(title)}</strong><small>${esc(detail)}</small></div></div>`;
+function setBusyButton(button, busy, label = "处理中...") {
+  if (!button) return;
+  if (busy) {
+    button.dataset.idleLabel = button.textContent;
+    button.textContent = label;
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+  } else {
+    button.textContent = button.dataset.idleLabel || button.textContent;
+    button.disabled = false;
+    button.removeAttribute("aria-busy");
+  }
+}
 const customerDisplayName = (row) => {
   const name = String(row.name || "").trim();
   return name && !["/", "-", "—"].includes(name) ? name : "";
@@ -395,7 +409,11 @@ async function loadBatchCustomers(batchId, target) {
     const canImport = Boolean(state.user.canImportCustomers && canManage);
     const participationRows = data.items || [];
     const targetRows = data.targetCustomers || [];
-    target.innerHTML = `<div class="section-heading subheading batch-detail-heading"><div><div class="eyebrow">PLACEMENT BATCH</div><h3>${esc(batch.name)}</h3><p>${esc(batch.close_date || "截止日期待定")} · ${tag(batch.status, toneFor(batch.status))} · 本页只显示已建立的批次参与关系。</p></div><div class="heading-actions">${canManage ? `<button class="secondary-btn" id="batch-add-participant">＋ 手动添加</button>` : ""}${canImport ? `<button class="primary-btn" id="batch-import-participants">批量导入参与人</button>` : ""}</div></div><section class="batch-detail-summary"><article><span>已建立参与关系</span><b>${participationRows.length}</b><small>同一客户可出现在多个批次</small></article><article><span>已参与</span><b>${participationRows.filter((row) => row.participation_status === "已参与").length}</b><small>按本批状态统计</small></article><article><span>当前目标客户</span><b>${targetRows.length}</b><small>尚未建立历史参与关系</small></article></section>${targetRows.length ? `<div class="batch-target-notice">有 ${targetRows.length} 位客户当前目标为本批次，但还没有本批参与记录。若确认参加，请手动添加或用表格导入。</div>` : ""}<section class="section batch-participant-section"><div class="section-header"><div><h3>本批参与客户</h3><span class="hint">状态、金额和来源只属于本批，不会覆盖客户的二级市场持仓或当前负责人。</span></div><span class="hint">${participationRows.length} 条记录</span></div><div class="table-wrap"><table class="batch-participant-table"><thead><tr><th>客户</th><th>TW 编号</th><th>本批状态</th><th>意向 / 到账 / 实际</th><th>来源</th><th>更新时间</th>${canManage ? "<th></th>" : ""}</tr></thead><tbody>${participationRows.length ? participationRows.map((row) => `<tr><td><button class="link-btn" data-open-customer="${esc(row.id)}">${esc(customerDisplayName(row) || row.customer_code)}</button><div class="hint">${esc(row.owner_name || "待分配")} · ${esc(row.owner_team || "")}</div></td><td class="tw-code-cell">${esc(row.tw_code || "-")}</td><td>${tag(row.participation_status, toneFor(row.participation_status))}</td><td>${money(row.participation_intent_amount)} / ${money(row.participation_funded_amount)} / ${money(row.participation_actual_amount)}</td><td><span class="hint">${esc(row.source_label || "手工录入")}</span>${row.participation_notes ? `<div class="hint wrap-cell">${esc(row.participation_notes)}</div>` : ""}</td><td class="hint">${fmt(row.participation_updated_at)}</td>${canManage ? `<td class="batch-participant-actions"><button class="secondary-btn" data-edit-participation="${esc(row.participation_id)}">编辑</button><button class="secondary-btn" data-delete-participation="${esc(row.participation_id)}">移除</button></td>` : ""}</tr>`).join("") : `<tr><td colspan="${canManage ? 7 : 6}"><div class="empty">本批还没有参与记录。可以手动添加，或用批量导入按 TW 编号/姓名匹配。</div></td></tr>`}</tbody></table></div></section>`;
+    target.innerHTML = `<div class="section-heading subheading batch-detail-heading"><div><div class="eyebrow">PLACEMENT BATCH</div><h3>${esc(batch.name)}</h3><p>${esc(batch.close_date || "截止日期待定")} · ${tag(batch.status, toneFor(batch.status))} · 本页只显示已建立的批次参与关系。</p></div><div class="heading-actions">${canManage ? `<button class="secondary-btn" id="batch-edit">编辑批次</button><button class="secondary-btn" id="batch-add-participant">＋ 手动添加</button>` : ""}${canImport ? `<button class="primary-btn" id="batch-import-participants">批量导入参与人</button>` : ""}</div></div><section class="batch-detail-summary"><article><span>已建立参与关系</span><b>${participationRows.length}</b><small>同一客户可出现在多个批次</small></article><article><span>已参与</span><b>${participationRows.filter((row) => row.participation_status === "已参与").length}</b><small>按本批状态统计</small></article><article><span>当前目标客户</span><b>${targetRows.length}</b><small>尚未建立历史参与关系</small></article></section>${targetRows.length ? `<div class="batch-target-notice">有 ${targetRows.length} 位客户当前目标为本批次，但还没有本批参与记录。若确认参加，请手动添加或用表格导入。</div>` : ""}<section class="section batch-participant-section"><div class="section-header"><div><h3>本批参与客户</h3><span class="hint">状态、金额和来源只属于本批，不会覆盖客户的二级市场持仓或当前负责人。</span></div><span class="hint">${participationRows.length} 条记录</span></div><div class="table-wrap"><table class="batch-participant-table"><thead><tr><th>客户</th><th>TW 编号</th><th>本批状态</th><th>意向 / 到账 / 实际</th><th>来源</th><th>更新时间</th>${canManage ? "<th></th>" : ""}</tr></thead><tbody>${participationRows.length ? participationRows.map((row) => `<tr><td><button class="link-btn" data-open-customer="${esc(row.id)}">${esc(customerDisplayName(row) || row.customer_code)}</button><div class="hint">${esc(row.owner_name || "待分配")} · ${esc(row.owner_team || "")}</div></td><td class="tw-code-cell">${esc(row.tw_code || "-")}</td><td>${tag(row.participation_status, toneFor(row.participation_status))}</td><td>${money(row.participation_intent_amount)} / ${money(row.participation_funded_amount)} / ${money(row.participation_actual_amount)}</td><td><span class="hint">${esc(row.source_label || "手工录入")}</span>${row.participation_notes ? `<div class="hint wrap-cell">${esc(row.participation_notes)}</div>` : ""}</td><td class="hint">${fmt(row.participation_updated_at)}</td>${canManage ? `<td class="batch-participant-actions"><button class="secondary-btn" data-edit-participation="${esc(row.participation_id)}">编辑</button><button class="secondary-btn" data-delete-participation="${esc(row.participation_id)}">移除</button></td>` : ""}</tr>`).join("") : `<tr><td colspan="${canManage ? 7 : 6}"><div class="empty">本批还没有参与记录。可以手动添加，或用批量导入按 TW 编号/姓名匹配。</div></td></tr>`}</tbody></table></div></section>`;
+    target.querySelector("#batch-edit")?.addEventListener("click", () => openBatchForm(batch, async () => {
+      await renderBatches(document.querySelector("#content"));
+      await loadBatchCustomers(batchId, document.querySelector("#batch-customers"));
+    }));
     target.querySelector("#batch-add-participant")?.addEventListener("click", () => openBatchParticipantForm(batch, null, () => loadBatchCustomers(batchId, target)));
     target.querySelector("#batch-import-participants")?.addEventListener("click", () => openBatchImportForm(batch, () => loadBatchCustomers(batchId, target)));
     target.querySelectorAll("[data-open-customer]").forEach((node) => node.addEventListener("click", () => openDetail(node.dataset.openCustomer)));
@@ -433,15 +451,37 @@ function openBatchImportForm(batch, onComplete = null) {
   const fileInput = document.querySelector("#batch-import-file"); const workspace = document.querySelector("#batch-import-workspace"); let importState = {file: null, dataBase64: "", workbook: null, preview: null, sheetName: "", mode: "current", mapping: {}, batchNameHeader: ""};
   const toBase64 = async (file) => { const buffer = await file.arrayBuffer(); const bytes = new Uint8Array(buffer); let binary = ""; for (let index = 0; index < bytes.length; index += 1) binary += String.fromCharCode(bytes[index]); return btoa(binary); };
   const renderSheets = () => { const sheets = importState.workbook?.sheets || []; workspace.innerHTML = `<div class="batch-import-step"><strong>1. 选择工作表</strong><span class="hint">说明页不要选；每次只处理一个工作表。</span></div><div class="batch-sheet-list">${sheets.map((sheet) => `<button type="button" class="batch-sheet-choice" data-batch-sheet="${esc(sheet.name)}"><strong>${esc(sheet.name)}</strong><small>${sheet.totalRows} 行 · ${Object.values(sheet.suggestedMapping || {}).slice(0, 4).map(esc).join("、") || "未识别常用字段"}</small></button>`).join("")}</div>`; workspace.querySelectorAll("[data-batch-sheet]").forEach((button) => button.addEventListener("click", () => loadBatchImportPreview(button.dataset.batchSheet))); };
-  const loadBatchImportPreview = async (sheetName) => { importState.sheetName = sheetName; workspace.innerHTML = `<div class="empty">正在读取“${esc(sheetName)}”...</div>`; try { importState.preview = await api("/api/imports/preview", {method:"POST", body:JSON.stringify({filename:importState.file.name, dataBase64:importState.dataBase64, sheetName})}); renderBatchImportMapping(); } catch (err) { workspace.innerHTML = `<div class="result-box error-text">${esc(err.message)}</div>`; } };
+  const loadBatchImportPreview = async (sheetName) => { importState.sheetName = sheetName; workspace.innerHTML = busyMarkup("正在生成工作表预览", `正在读取“${sheetName}”，此时尚未写入批次数据。`); try { importState.preview = await api("/api/imports/preview", {method:"POST", body:JSON.stringify({filename:importState.file.name, dataBase64:importState.dataBase64, sheetName})}); renderBatchImportMapping(); } catch (err) { workspace.innerHTML = `<div class="result-box error-text">${esc(err.message)}</div>`; } };
   const rawRows = () => importState.preview?.rows || [];
   const renderBatchImportMapping = () => { const preview = importState.preview; const headers = preview.headers || []; const suggested = preview.suggestedMapping || {}; const defaultMap = {twCode:suggested.twCode || "", name:suggested.name || "客户姓名", phone:suggested.phone || "", status:suggested.status || "", intentAmount:suggested.intentAmount || "", fundedAmount:suggested.fundedAmount || "", actualAmount:suggested.actualAmount || "", notes:suggested.notes || ""}; importState.mapping = {...defaultMap}; workspace.innerHTML = `<div class="batch-import-step"><strong>2. 选择列</strong><span class="hint">当前批次：${esc(batch.name)}。如果表格包含多批次，请切换为“按批次名称列”。</span></div><div class="batch-import-mode"><label><input type="radio" name="batch-import-mode" value="current" checked> 导入到当前批次</label><label><input type="radio" name="batch-import-mode" value="column"> 表中包含批次名称</label></div><div class="batch-import-mapping">${[["twCode","TW 编号"],["name","客户姓名"],["phone","手机号"],["status","本批状态"],["intentAmount","意向金额"],["fundedAmount","到账金额"],["actualAmount","实际参与金额"],["notes","备注"]].map(([key,label]) => `<label><span>${label}</span><select data-batch-map="${key}">${batchImportOptionHeaders(headers, defaultMap[key])}</select></label>`).join("")}<label id="batch-name-map" hidden><span>批次名称列</span><select data-batch-map="batchName">${batchImportOptionHeaders(headers)}</select></label></div><details class="wizard-source-preview"><summary>查看原表前 5 行</summary><div class="table-wrap"><table><thead><tr>${headers.map((header) => `<th>${esc(header)}</th>`).join("")}</tr></thead><tbody>${(preview.rows || []).slice(0,5).map((row) => `<tr>${headers.map((header) => `<td>${esc(row[header])}</td>`).join("")}</tr>`).join("")}</tbody></table></div></details><div id="batch-import-impact"></div><div class="wizard-footer"><button class="secondary-btn" type="button" id="batch-import-back">返回工作表</button><button class="primary-btn" type="button" id="batch-import-check">查看匹配结果</button></div>`; workspace.querySelectorAll("[data-batch-map]").forEach((select) => select.addEventListener("change", () => { importState.mapping[select.dataset.batchMap] = select.value; })); workspace.querySelectorAll("[name=batch-import-mode]").forEach((radio) => radio.addEventListener("change", () => { importState.mode = radio.value; workspace.querySelector("#batch-name-map").hidden = radio.value !== "column"; })); workspace.querySelector("#batch-import-back").addEventListener("click", renderSheets); workspace.querySelector("#batch-import-check").addEventListener("click", checkBatchImportImpact); };
   const buildBatchRows = () => rawRows().map((source) => { const row = {}; Object.entries(importState.mapping).forEach(([target, header]) => { if (header) row[target] = source[header]; }); return row; }).filter((row) => Object.values(row).some((value) => String(value ?? "").trim()));
-  const checkBatchImportImpact = async () => { const mapping = importState.mapping; if (!mapping.twCode && !mapping.name && !mapping.phone) { toast("至少选择 TW 编号、客户姓名或手机号中的一列"); return; } if (importState.mode === "column" && !mapping.batchName) { toast("请选择批次名称列"); return; } const rows = buildBatchRows(); if (!rows.length) { toast("没有可导入的记录"); return; } const impact = workspace.querySelector("#batch-import-impact"); impact.innerHTML = `<div class="empty">正在匹配客户和批次...</div>`; try { const payload = {filename:`${importState.file.name} · ${importState.sheetName}`, batchId:importState.mode === "current" ? batch.id : null, rows}; const result = await api("/api/batch-participations/impact", {method:"POST", body:JSON.stringify(payload)}); const counts = result.counts || {}; impact.innerHTML = `<section class="batch-import-impact"><div class="batch-import-counts"><article><b>${counts.new || 0}</b><span>新增参与关系</span></article><article><b>${counts.update || 0}</b><span>更新已有关系</span></article><article><b>${counts.unchanged || 0}</b><span>无需变化</span></article><article class="warning"><b>${counts.needsConfirmation || 0}</b><span>需人工确认</span></article><article class="warning"><b>${counts.invalid || 0}</b><span>无效行</span></article></div>${result.problems?.length ? `<details open><summary>查看前 ${Math.min(20,result.problems.length)} 条未写入记录</summary><div class="batch-import-problems">${result.problems.slice(0,20).map((item) => `<div><strong>第 ${item.row} 行 · ${esc(item.name || "未命名")}</strong><span>${esc(item.reason)}</span></div>`).join("")}</div></details>` : `<p class="hint">所有可识别记录都已通过预览。确认后才会写入。</p>`}<div class="batch-import-confirm"><button class="primary-btn" type="button" id="batch-import-confirm" ${counts.new || counts.update ? "" : "disabled"}>确认写入 ${Number(counts.new || 0) + Number(counts.update || 0)} 条</button></div></section>`; impact.querySelector("#batch-import-confirm")?.addEventListener("click", () => commitBatchImport(payload)); } catch (err) { impact.innerHTML = `<div class="result-box error-text">${esc(err.message)}</div>`; } };
-  const commitBatchImport = async (payload) => { const button = workspace.querySelector("#batch-import-confirm"); if (button) button.disabled = true; try { const result = await api("/api/batch-participations/import", {method:"POST", body:JSON.stringify(payload)}); closeModal(); toast(`已写入 ${result.counts?.created || 0} 条，更新 ${result.counts?.updated || 0} 条，${result.needsConfirmation?.length || 0} 条留待人工确认`); if (onComplete) await onComplete(); } catch (err) { if (button) button.disabled = false; toast(err.message); } };
-  fileInput.addEventListener("change", async () => { const file = fileInput.files?.[0]; if (!file) return; importState.file = file; document.querySelector("#batch-import-file-name").textContent = `正在读取：${file.name}`; workspace.innerHTML = `<div class="empty">正在读取工作表...</div>`; try { importState.dataBase64 = await toBase64(file); importState.workbook = await api("/api/imports/workbook", {method:"POST", body:JSON.stringify({filename:file.name, dataBase64:importState.dataBase64})}); document.querySelector("#batch-import-file-name").textContent = `${file.name} · 请选择工作表`; renderSheets(); } catch (err) { workspace.innerHTML = `<div class="result-box error-text">${esc(err.message)}</div>`; } });
+  const checkBatchImportImpact = async () => { const mapping = importState.mapping; if (!mapping.twCode && !mapping.name && !mapping.phone) { toast("至少选择 TW 编号、客户姓名或手机号中的一列"); return; } if (importState.mode === "column" && !mapping.batchName) { toast("请选择批次名称列"); return; } const rows = buildBatchRows(); if (!rows.length) { toast("没有可导入的记录"); return; } const impact = workspace.querySelector("#batch-import-impact"); const checkButton = workspace.querySelector("#batch-import-check"); setBusyButton(checkButton, true, "正在匹配..."); impact.innerHTML = busyMarkup("正在匹配客户和批次", "当前只计算预计变化，确认前不会写入数据。"); try { const payload = {filename:`${importState.file.name} · ${importState.sheetName}`, batchId:importState.mode === "current" ? batch.id : null, rows}; const result = await api("/api/batch-participations/impact", {method:"POST", body:JSON.stringify(payload)}); const counts = result.counts || {}; impact.innerHTML = `<section class="batch-import-impact"><div class="batch-import-counts"><article><b>${counts.new || 0}</b><span>新增参与关系</span></article><article><b>${counts.update || 0}</b><span>更新已有关系</span></article><article><b>${counts.unchanged || 0}</b><span>无需变化</span></article><article class="warning"><b>${counts.needsConfirmation || 0}</b><span>需人工确认</span></article><article class="warning"><b>${counts.invalid || 0}</b><span>无效行</span></article></div>${result.problems?.length ? `<details open><summary>查看前 ${Math.min(20,result.problems.length)} 条未写入记录</summary><div class="batch-import-problems">${result.problems.slice(0,20).map((item) => `<div><strong>第 ${item.row} 行 · ${esc(item.name || "未命名")}</strong><span>${esc(item.reason)}</span></div>`).join("")}</div></details>` : `<p class="hint">所有可识别记录都已通过预览。确认后才会写入。</p>`}<div class="batch-import-confirm"><button class="primary-btn" type="button" id="batch-import-confirm" ${counts.new || counts.update ? "" : "disabled"}>确认写入 ${Number(counts.new || 0) + Number(counts.update || 0)} 条</button></div></section>`; impact.querySelector("#batch-import-confirm")?.addEventListener("click", () => commitBatchImport(payload)); } catch (err) { impact.innerHTML = `<div class="result-box error-text">${esc(err.message)}</div>`; } finally { if (checkButton?.isConnected) setBusyButton(checkButton, false); } };
+  const commitBatchImport = async (payload) => { const button = workspace.querySelector("#batch-import-confirm"); setBusyButton(button, true, "正在写入..."); workspace.querySelector(".batch-import-impact")?.insertAdjacentHTML("beforeend", busyMarkup("正在写入批次参与记录", "请勿关闭页面或重复点击。")); try { const result = await api("/api/batch-participations/import", {method:"POST", body:JSON.stringify(payload)}); closeModal(); toast(`已写入 ${result.counts?.created || 0} 条，更新 ${result.counts?.updated || 0} 条，${result.needsConfirmation?.length || 0} 条留待人工确认`); if (onComplete) await onComplete(); } catch (err) { workspace.querySelector(".operation-busy")?.remove(); setBusyButton(button, false); toast(err.message); } };
+  fileInput.addEventListener("change", async () => { const file = fileInput.files?.[0]; if (!file) return; importState.file = file; document.querySelector("#batch-import-file-name").textContent = `正在读取：${file.name}`; workspace.innerHTML = busyMarkup("正在上传并解析工作簿", `${file.name} · 现在只读取工作表，不会写入批次数据。`); try { importState.dataBase64 = await toBase64(file); importState.workbook = await api("/api/imports/workbook", {method:"POST", body:JSON.stringify({filename:file.name, dataBase64:importState.dataBase64})}); document.querySelector("#batch-import-file-name").textContent = `${file.name} · 请选择工作表`; renderSheets(); } catch (err) { workspace.innerHTML = `<div class="result-box error-text">${esc(err.message)}</div>`; } });
 }
-function openBatchForm() { openModal(`<div class="modal"><div class="modal-header"><h3>创建定增批次</h3><button class="close-btn" data-close>×</button></div><form id="batch-form"><div class="modal-body"><div class="field"><label>批次名称 *</label><input name="name" required placeholder="例如：2026 年 9 月批次"></div><div class="form-grid"><div class="field"><label>截止日期</label><input name="closeDate" type="date"></div><div class="field"><label>批次状态</label><select name="status">${state.meta.batchStatuses.map((v) => `<option>${esc(v)}</option>`).join("")}</select></div><div class="field"><label>目标金额 (USD)</label><input name="targetAmount" type="number" min="0" inputmode="decimal"></div></div><div class="field"><label>批次备注</label><textarea name="notes"></textarea></div></div><div class="modal-footer"><button class="secondary-btn" type="button" data-close>取消</button><button class="primary-btn">创建批次</button></div></form></div>`); document.querySelector("#batch-form").addEventListener("submit", async (event) => { event.preventDefault(); const values = Object.fromEntries(new FormData(event.currentTarget)); values.targetAmount = Number(values.targetAmount || 0); values.closeDate = values.closeDate || null; try { await api("/api/batches", {method:"POST", body: JSON.stringify(values)}); closeModal(); state.meta = await api("/api/meta"); toast("批次已创建"); navigate("placement"); } catch (err) { toast(err.message); } }); }
+function openBatchForm(batch = null, onComplete = null) {
+  const editing = Boolean(batch?.id);
+  const statuses = state.meta.batchStatuses || ["筹备中", "开放中", "已截止", "已完成"];
+  openModal(`<div class="modal"><div class="modal-header"><div><h3>${editing ? "编辑定增批次" : "创建定增批次"}</h3>${editing ? `<span class="hint">可在这里把“已截止”改为“已完成”。参与客户和金额记录不会受到影响。</span>` : ""}</div><button class="close-btn" data-close>×</button></div><form id="batch-form"><div class="modal-body"><div class="field"><label>批次名称 *</label><input name="name" required value="${esc(batch?.name || "")}" placeholder="例如：2026 年 9 月批次"></div><div class="form-grid"><div class="field"><label>截止日期</label><input name="closeDate" type="date" value="${esc(batch?.close_date || "")}"></div><div class="field"><label>批次状态</label><select name="status">${statuses.map((value) => `<option ${value === (batch?.status || "筹备中") ? "selected" : ""}>${esc(value)}</option>`).join("")}</select></div><div class="field"><label>目标金额 (USD)</label><input name="targetAmount" type="number" min="0" inputmode="decimal" value="${Number(batch?.target_amount || 0)}"></div></div><div class="field"><label>批次备注</label><textarea name="notes">${esc(batch?.notes || "")}</textarea></div></div><div class="modal-footer"><button class="secondary-btn" type="button" data-close>取消</button><button class="primary-btn">${editing ? "保存批次修改" : "创建批次"}</button></div></form></div>`);
+  document.querySelector("#batch-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const button = event.currentTarget.querySelector(".primary-btn");
+    const values = Object.fromEntries(new FormData(event.currentTarget));
+    values.targetAmount = Number(values.targetAmount || 0);
+    values.closeDate = values.closeDate || null;
+    setBusyButton(button, true, editing ? "正在保存..." : "正在创建...");
+    try {
+      await api(editing ? `/api/batches/${encodeURIComponent(batch.id)}` : "/api/batches", {method: editing ? "PATCH" : "POST", body: JSON.stringify(values)});
+      closeModal();
+      state.meta = await api("/api/meta");
+      toast(editing ? "批次状态和资料已更新" : "批次已创建");
+      if (onComplete) await onComplete(); else await navigate("placement");
+    } catch (err) {
+      toast(err.message);
+      setBusyButton(button, false);
+    }
+  });
+}
 function gridFieldControl(row, field) { const value = row.custom_values?.[field.id] || ""; const attrs = `data-grid-field="${esc(field.id)}" data-customer="${esc(row.id)}" data-version="${row.version}" data-saved="${esc(value)}"`; if (field.fieldType === "select") return `<select class="grid-input" ${attrs}><option value="">未填写</option>${field.options.map((option) => `<option ${value === option ? "selected" : ""}>${esc(option)}</option>`).join("")}</select>`; return `<input class="grid-input" ${attrs} type="${field.fieldType === "number" ? "number" : field.fieldType === "date" ? "date" : "text"}" value="${esc(value)}">`; }
 function coreGridSelect(row, key, values, current) { return `<select class="grid-input status-input" data-grid-core="${key}" data-customer="${esc(row.id)}" data-version="${row.version}" data-saved="${esc(current)}">${values.map((value) => `<option ${value === current ? "selected" : ""}>${esc(value)}</option>`).join("")}</select>`; }
 function coreGridText(row, key, current, placeholder) { return `<input class="grid-input relation-input" data-grid-core="${key}" data-customer="${esc(row.id)}" data-version="${row.version}" data-saved="${esc(current)}" value="${esc(current)}" placeholder="${esc(placeholder)}">`; }
@@ -657,7 +697,7 @@ async function savePermission(input, item) {
 }
 async function renderAudit(content) { const data = await api("/api/admin/audit"); content.innerHTML = `<section class="section"><div class="section-header"><h3>操作审计</h3><span class="hint">客户、批次、跟进和权限变更</span></div><div class="table-wrap"><table><thead><tr><th>时间</th><th>操作人</th><th>动作</th><th>对象</th><th>详情</th></tr></thead><tbody>${data.items.length ? data.items.map((item) => `<tr><td class="hint">${fmt(item.created_at)}</td><td>${esc(item.actor_name)}</td><td>${esc(item.action)}</td><td>${esc(item.entity_type)} / ${esc(item.entity_id.slice(0, 12))}</td><td class="hint">${esc(JSON.stringify(item.detail))}</td></tr>`).join("") : `<tr><td colspan="5"><div class="empty">暂无审计记录</div></td></tr>`}</tbody></table></div></section>`; }
 
-function openQuickCustomerForm() {
+function openQuickCustomerForm(defaults = {}, onComplete = null) {
   const batches = (state.meta.batches || []).map((batch) => `<option value="${esc(batch.id)}">${esc(batch.name)} · ${esc(batch.status)}</option>`).join("");
   const customFields = (state.meta.customerFields || []).map((field) => `<div class="field"><label>${esc(field.label)}</label>${field.fieldType === "select" ? `<select data-custom-input="${esc(field.id)}"><option value="">未填写</option>${field.options.map((option) => `<option>${esc(option)}</option>`).join("")}</select>` : `<input data-custom-input="${esc(field.id)}" type="${field.fieldType === "number" ? "number" : field.fieldType === "date" ? "date" : "text"}">`}</div>`).join("");
   const ownerChoices = state.meta.ownerChoices || state.meta.owners || [];
@@ -665,8 +705,33 @@ function openQuickCustomerForm() {
   const canManageHonganAdvisor = state.user.canManageAdvisorBindings;
   const advisorOptions = (state.meta.honganAdvisors || []).map((advisor) => `<option value="${esc(advisor)}"></option>`).join("");
   openModal(`<div class="modal quick-modal"><div class="modal-header"><div><h3>新增客户</h3><span class="hint">港安顾问是外部引荐关系；当前骄阳负责人是内部跟进与归属关系。</span></div><button class="close-btn" data-close>×</button></div><form id="quick-customer-form"><div class="modal-body"><datalist id="hongan-advisor-options">${advisorOptions}</datalist><div class="form-grid"><div class="field"><label>客户姓名</label><input name="name" autofocus></div><div class="field"><label>微信昵称</label><input name="wechatNickname"></div><div class="field"><label>手机号</label><input name="phone" inputmode="tel"></div><div class="field"><label>邮箱</label><input name="email" type="email" inputmode="email" autocomplete="email"></div><div class="field"><label>港安顾问（外部引荐）</label><input name="hkAdvisor" list="hongan-advisor-options" placeholder="可选择或输入姓名"></div>${ownerField}<div class="field"><label>客户来源</label><select name="source"><option value="">未填写</option>${state.meta.sources.map((v) => `<option>${esc(v)}</option>`).join("")}</select></div><div class="field"><label>当前阶段</label><select name="stage">${state.meta.stages.map((v) => `<option>${esc(v)}</option>`).join("")}</select></div><div class="field span-2"><label>当前情况</label><textarea name="notes" placeholder="客户诉求、当前进度或下一步安排"></textarea></div></div>${customFields ? `<details class="form-details"><summary>补充信息 · ${state.meta.customerFields.length} 项</summary><div class="form-grid">${customFields}</div></details>` : ""}<details class="form-details"><summary>开户与定增进度</summary><div class="form-grid"><div class="field"><label>港券开户状态</label><select name="accountStatus">${state.meta.accountStatuses.map((v) => `<option>${esc(v)}</option>`).join("")}</select></div><div class="field"><label>定增意向</label><select name="intentStatus">${state.meta.intentStatuses.map((v) => `<option>${esc(v)}</option>`).join("")}</select></div><div class="field"><label>定增推进</label><select name="placementStatus">${state.meta.placementStatuses.map((v) => `<option>${esc(v)}</option>`).join("")}</select></div><div class="field"><label>目标批次</label><select name="targetBatchId"><option value="">暂不排批次</option>${batches}</select></div><div class="field"><label>意向金额 (USD)</label><input name="intentAmount" type="number" min="0" inputmode="decimal"></div><div class="field"><label>到账金额 (USD)</label><input name="fundedAmount" type="number" min="0" inputmode="decimal"></div><div class="field"><label>实际参与金额 (USD)</label><input name="actualAmount" type="number" min="0" inputmode="decimal"></div><div class="field"><label>开户券商</label><input name="accountBroker"></div></div></details></div><div class="modal-footer"><button class="secondary-btn" type="button" data-close>取消</button><button class="primary-btn">保存客户</button></div></form></div>`);
-  if (!canManageHonganAdvisor) document.querySelector("#quick-customer-form [name=hkAdvisor]")?.closest(".field")?.remove();
-  document.querySelector("#quick-customer-form").addEventListener("submit", async (event) => { event.preventDefault(); const values = Object.fromEntries(new FormData(event.currentTarget)); for (const key of ["intentAmount", "fundedAmount", "actualAmount"]) values[key] = Number(values[key] || 0); values.targetBatchId = values.targetBatchId || null; values.customValues = Object.fromEntries([...event.currentTarget.querySelectorAll("[data-custom-input]")].map((input) => [input.dataset.customInput,input.value])); try { const result = await api("/api/customers", {method:"POST", body: JSON.stringify(values)}); state.meta = await api("/api/meta"); closeModal(); toast(result.potentialDuplicates?.length ? `客户已保存，发现 ${result.potentialDuplicates.length} 条同名或同昵称记录，请主管确认` : "客户已进入数据表"); await navigate(state.view === "imports" ? "customers" : state.view); } catch (err) { toast(err.message); } });
+  const form = document.querySelector("#quick-customer-form");
+  Object.entries(defaults || {}).forEach(([name, value]) => {
+    const input = form.elements.namedItem(name);
+    if (input && value != null && [...(input.options || [])].some((option) => option.value === String(value))) input.value = String(value);
+    else if (input && !input.options) input.value = String(value);
+  });
+  if (!canManageHonganAdvisor) form.querySelector("[name=hkAdvisor]")?.closest(".field")?.remove();
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const button = event.currentTarget.querySelector(".primary-btn");
+    const values = Object.fromEntries(new FormData(event.currentTarget));
+    for (const key of ["intentAmount", "fundedAmount", "actualAmount"]) values[key] = Number(values[key] || 0);
+    values.targetBatchId = values.targetBatchId || null;
+    values.customValues = Object.fromEntries([...event.currentTarget.querySelectorAll("[data-custom-input]")].map((input) => [input.dataset.customInput,input.value]));
+    setBusyButton(button, true, "正在保存...");
+    try {
+      const result = await api("/api/customers", {method:"POST", body: JSON.stringify(values)});
+      state.meta = await api("/api/meta");
+      closeModal();
+      toast(result.potentialDuplicates?.length ? `客户已保存，发现 ${result.potentialDuplicates.length} 条同名或同昵称记录，请主管确认` : "客户已进入数据表");
+      if (onComplete) { await onComplete(result.customer); return; }
+      await navigate(state.view === "imports" ? "customers" : state.view);
+    } catch (err) {
+      toast(err.message);
+      setBusyButton(button, false);
+    }
+  });
 }
 async function openQuickFollowForm(selectedCustomerId = "") {
   if (!state.customers.length) {
@@ -952,23 +1017,54 @@ function openImportReviewResolver(item) {
   const activityScope = item.profile === "hongan_activity" ? `<div class="review-scope"><b>本条冲突字段：港安顾问</b><span>客户姓名、TW 编号仅用于确认客户身份。金额、开户状态、骄阳现场开户人、见证人、定增信息和备注不参与本次比较，也不会被本次操作修改。</span>${item.sourceAdvisors?.length ? `<small>原表骄阳现场开户人：${esc(item.sourceAdvisors.join("、"))}（仅展示，不作为当前负责人）</small>` : ""}</div>` : "";
   const isPlacementWorkflow = ["placement_intent", "placement_completed", "placement_lost"].includes(item.profile);
   const raw = item.rawRow || {};
-  const workflowScope = isPlacementWorkflow ? `<div class="review-scope"><b>本条准备写入的定增信息</b><span>${item.profile === "placement_intent" ? `意向金额 ${money(raw.intentAmount || 0)}，状态设为“有意向”；不建立批次关系。` : item.profile === "placement_completed" ? `批次“${esc(raw.batchName || "未填写")}”，意向 ${money(raw.intentAmount || 0)}，实际参与 ${money(raw.actualAmount || 0)}。` : `退出去向“${esc(raw.lossCategory || "未填写")}”，原因“${esc([raw.lossObstacle, raw.lossDetail].filter(Boolean).join("；") || "未填写")}”。`}<br>只处理定增状态与批次关系，不会新建客户，也不会修改骄阳负责人。</span></div>` : "";
+  const workflowScope = isPlacementWorkflow ? `<div class="review-scope"><b>本条准备写入的定增信息</b><span>${item.profile === "placement_intent" ? `意向金额 ${money(raw.intentAmount || 0)}，状态设为“有意向”；不建立批次关系。` : item.profile === "placement_completed" ? `批次“${esc(raw.batchName || "未填写")}”，意向 ${money(raw.intentAmount || 0)}，实际参与 ${money(raw.actualAmount || 0)}。` : `退出去向“${esc(raw.lossCategory || "未填写")}”，原因“${esc([raw.lossObstacle, raw.lossDetail].filter(Boolean).join("；") || "未填写")}”。`}<br>“关联并写入”只更新你明确选中的系统客户，不会自动新建，也不会修改骄阳负责人。</span></div>` : "";
   const rawDetails = [item.sourceSheet ? `来源分表：${item.sourceSheet}` : "", item.sourceRow ? `来源行：第 ${item.sourceRow} 行` : "", item.rows ? `活动表同名记录数：${item.rows}` : "", item.quantity != null ? `持仓数量：${item.quantity}` : "", item.detail?.message || (typeof item.detail === "string" ? item.detail : "")].filter(Boolean).join(" · ");
   const directCustomer = initial && !candidates.length ? `<div class="review-candidate-heading">系统已关联客户</div><button type="button" class="review-customer-option selected" data-review-customer="${esc(initial.customerId)}"><span><strong>${esc(initial.customerName || reviewName(item))}</strong><small>${esc(initial.twCode || initial.customerCode || "无 TW 编号")}</small></span><small>${esc(initial.currentAdvisor || "港安顾问未填写")}</small></button>` : "";
-  const customerOptions = candidates.length ? `<div class="review-candidate-heading">系统找到的候选客户</div>${candidates.map((candidate) => `<button type="button" class="review-customer-option ${initial?.customerId === candidate.customerId ? "selected" : ""}" data-review-customer="${esc(candidate.customerId)}"><span><strong>${esc(candidate.customerName || "未命名")}</strong><small>${esc(candidate.twCode || candidate.customerCode || "无 TW 编号")}</small></span><small>${esc(candidate.currentAdvisor || "港安顾问未填写")}</small></button>`).join("")}` : directCustomer || `<span class="hint">系统没有直接找到唯一客户，请用 TW 编号、姓名或手机号搜索。</span>`;
+  const customerOptions = candidates.length ? `<div class="review-candidate-heading">系统找到的候选客户</div>${candidates.map((candidate) => `<button type="button" class="review-customer-option ${initial?.customerId === candidate.customerId ? "selected" : ""}" data-review-customer="${esc(candidate.customerId)}"><span><strong>${esc(candidate.customerName || "未命名")}</strong><small>${esc(candidate.twCode || candidate.customerCode || "无 TW 编号")}</small></span><small>${esc(candidate.currentAdvisor || "港安顾问未填写")}</small></button>`).join("")}` : directCustomer || `<div class="review-no-match"><strong>尚未选择系统客户</strong><span>搜索结果中选中一位客户后，才能把这条定增信息写给他。</span></div>`;
   const profileHint = item.profile === "hongan_activity" ? "这里只处理港安顾问，不会修改骄阳当前负责人。" : item.profile === "holding_pinyin" ? "确认后只会写入这条客户的持仓快照。" : isPlacementWorkflow ? "确认客户身份后，系统会按本表用途写入这一条定增记录。" : "确认后只会处理这一条导入记录。";
-  openModal(`<div class="modal review-resolver-modal"><div class="modal-header"><div><div class="eyebrow">MANUAL REVIEW</div><h3>${item.profile === "hongan_activity" ? "核对港安顾问" : isPlacementWorkflow ? "核对定增名单" : "复核导入记录"}</h3><span class="hint">${esc(reviewName(item))} · ${esc(reviewProfileLabel(item.profile))}</span></div><button class="close-btn" data-close>×</button></div><div class="modal-body"><div class="review-resolver-note"><strong>${esc(item.categoryLabel || "待复核")}</strong><span>${esc(reviewIssueText(item))}</span><small>${esc(profileHint)}</small></div>${comparison}${activityScope}${workflowScope}${rawDetails ? `<div class="review-source-detail">${esc(rawDetails)}</div>` : ""}<form id="review-customer-form"><div class="field"><label>关联到系统客户</label><div class="review-search-row"><input id="review-customer-search" value="${esc(initial?.customerName || reviewName(item))}" placeholder="搜索姓名、TW编号或手机号"><button class="secondary-btn" type="submit">搜索客户</button></div></div></form><div id="review-customer-results" class="review-customer-results">${customerOptions}</div>${item.profile === "hongan_activity" ? `<div class="field review-advisor-field"><label for="review-advisor">准备写入的港安顾问</label><input id="review-advisor" value="${esc(item.targetAdvisor || (item.advisors || [""])[0] || "")}" placeholder="填写港安顾问姓名"></div>` : ""}</div><div class="modal-footer"><button class="secondary-btn" type="button" id="review-keep">保留系统值并完成复核</button><button class="secondary-btn" type="button" data-close>取消</button><button class="primary-btn" type="button" id="review-apply">${item.profile === "hongan_activity" ? "采用导入值" : item.canApply ? "确认关联并写入" : "完成复核"}</button></div></div>`);
+  const canCreateCustomer = item.category === "unmatched" && Boolean(raw.name || raw.wechatNickname || item.name);
+  const keepLabel = item.category === "unmatched" ? "不写入并完成复核" : "保留系统值并完成复核";
+  const applyLabel = item.profile === "hongan_activity" ? "写入已选客户" : item.canApply ? "关联已选客户并写入" : "完成复核";
+  openModal(`<div class="modal review-resolver-modal"><div class="modal-header"><div><div class="eyebrow">MANUAL REVIEW</div><h3>${item.profile === "hongan_activity" ? "核对港安顾问" : isPlacementWorkflow ? "核对定增名单" : "复核导入记录"}</h3><span class="hint">${esc(reviewName(item))} · ${esc(reviewProfileLabel(item.profile))}</span></div><button class="close-btn" data-close>×</button></div><div class="modal-body"><div class="review-resolver-note"><strong>${esc(item.categoryLabel || "待复核")}</strong><span>${esc(reviewIssueText(item))}</span><small>${esc(profileHint)}</small></div>${comparison}${activityScope}${workflowScope}${rawDetails ? `<div class="review-source-detail">${esc(rawDetails)}</div>` : ""}<section class="review-link-section"><div class="review-candidate-heading">关联已有客户</div><p>这一步不会新建客户。请先搜索，并在结果中明确选中一位客户。</p><form id="review-customer-form"><div class="review-search-row"><input id="review-customer-search" type="search" value="${esc(initial?.customerName || reviewName(item))}" placeholder="搜索姓名、TW 编号或手机号" aria-label="搜索已有客户"><button class="secondary-btn" type="submit">搜索</button></div></form><div id="review-customer-results" class="review-customer-results">${customerOptions}</div></section>${canCreateCustomer ? `<section class="review-create-customer"><div><strong>确认系统里还没有这个人？</strong><span>先建立一条客户记录，保存后会自动返回本页并选中该客户；定增信息仍需再次确认才会写入。</span></div><button class="secondary-btn" type="button" id="review-create-customer">＋ 先新建客户</button></section>` : ""}${item.profile === "hongan_activity" ? `<div class="field review-advisor-field"><label for="review-advisor">准备写入的港安顾问</label><input id="review-advisor" value="${esc(item.targetAdvisor || (item.advisors || [""])[0] || "")}" placeholder="填写港安顾问姓名"></div>` : ""}</div><div class="modal-footer"><button class="secondary-btn" type="button" id="review-keep">${keepLabel}</button><button class="secondary-btn" type="button" data-close>取消</button><button class="primary-btn" type="button" id="review-apply" ${item.canApply && !initial?.customerId ? "disabled" : ""}>${applyLabel}</button></div></div>`);
   let selectedId = initial?.customerId || "";
   const results = document.querySelector("#review-customer-results");
-  const selectResult = (button) => { selectedId = button.dataset.reviewCustomer; results.querySelectorAll(".review-customer-option").forEach((node) => node.classList.toggle("selected", node === button)); };
-  const renderResults = (rows) => { results.innerHTML = rows.length ? rows.map((row) => `<button type="button" class="review-customer-option ${selectedId === row.id ? "selected" : ""}" data-review-customer="${esc(row.id)}"><span><strong>${esc(row.name || row.wechat_nickname || "未命名")}</strong><small>${esc(row.tw_code || row.customer_code || "无 TW 编号")}</small></span></button>`).join("") : `<span class="hint">没有找到可见客户。</span>`; results.querySelectorAll("[data-review-customer]").forEach((button) => button.addEventListener("click", () => selectResult(button))); };
+  const applyButton = document.querySelector("#review-apply");
+  const updateApplyState = () => { if (item.canApply) applyButton.disabled = !selectedId; };
+  const selectResult = (button) => { selectedId = button.dataset.reviewCustomer; results.querySelectorAll(".review-customer-option").forEach((node) => node.classList.toggle("selected", node === button)); updateApplyState(); };
+  const renderResults = (rows) => { selectedId = ""; results.innerHTML = rows.length ? rows.map((row) => `<button type="button" class="review-customer-option" data-review-customer="${esc(row.id)}"><span><strong>${esc(row.name || row.wechat_nickname || "未命名")}</strong><small>${esc(row.tw_code || row.customer_code || "无 TW 编号")}</small></span><small>点击选择</small></button>`).join("") : `<div class="review-no-match"><strong>没有找到已有客户</strong><span>请换 TW 编号、手机号或姓名重试；确认确实不存在时，可使用下方“先新建客户”。</span></div>`; results.querySelectorAll("[data-review-customer]").forEach((button) => button.addEventListener("click", () => selectResult(button))); updateApplyState(); };
   results.querySelectorAll("[data-review-customer]").forEach((button) => button.addEventListener("click", () => selectResult(button)));
-  document.querySelector("#review-customer-form")?.addEventListener("submit", async (event) => { event.preventDefault(); const query = document.querySelector("#review-customer-search").value.trim(); if (!query) return; try { const data = await api(`/api/customers?search=${encodeURIComponent(query)}&page=1&pageSize=20`); renderResults(data.items || []); } catch (err) { toast(err.message); } });
+  document.querySelector("#review-customer-form")?.addEventListener("submit", async (event) => { event.preventDefault(); const query = document.querySelector("#review-customer-search").value.trim(); if (!query) return; const button = event.currentTarget.querySelector("button"); setBusyButton(button, true, "搜索中..."); try { const data = await api(`/api/customers?search=${encodeURIComponent(query)}&page=1&pageSize=20`); renderResults(data.items || []); } catch (err) { toast(err.message); } finally { setBusyButton(button, false); } });
+  document.querySelector("#review-create-customer")?.addEventListener("click", () => {
+    const defaults = {
+      name: raw.name || item.name || "",
+      wechatNickname: raw.wechatNickname || "",
+      phone: raw.phone || "",
+      email: raw.email || "",
+      hkAdvisor: raw.hkAdvisor || item.targetAdvisor || "",
+      notes: `由“${item.filename || "导入批次"}”人工复核新建`,
+    };
+    openQuickCustomerForm(defaults, (customer) => openImportReviewResolver({...item, customerId: customer.id, customerName: customer.name || customer.wechat_nickname, customerCode: customer.customer_code, twCode: customer.tw_code, currentAdvisor: customer.hongan_advisor, candidates: []}));
+  });
   document.querySelector("#review-keep")?.addEventListener("click", () => resolveImportReview(item.id, "keep", selectedId, ""));
-  document.querySelector("#review-apply")?.addEventListener("click", () => { if (!item.canApply) { resolveImportReview(item.id, "keep", selectedId, "已在客户表完成人工检查"); return; } if (!selectedId) { toast("请先选择要关联的客户"); return; } const advisor = document.querySelector("#review-advisor")?.value.trim() || ""; if (item.profile === "hongan_activity" && !advisor) { toast("请填写本次要采用的港安顾问"); return; } resolveImportReview(item.id, "apply", selectedId, advisor); });
+  document.querySelector("#review-apply")?.addEventListener("click", () => { if (!item.canApply) { resolveImportReview(item.id, "keep", selectedId, "已在客户表完成人工检查"); return; } if (!selectedId) { toast("请先搜索并选中一位系统客户"); return; } const advisor = document.querySelector("#review-advisor")?.value.trim() || ""; if (item.profile === "hongan_activity" && !advisor) { toast("请填写本次要采用的港安顾问"); return; } resolveImportReview(item.id, "apply", selectedId, advisor); });
 }
 
-async function resolveImportReview(reviewId, action, customerId = "", honganAdvisor = "") { try { await api(`/api/import-reviews/${encodeURIComponent(reviewId)}/resolve`, {method:"POST", body: JSON.stringify({action, customerId: customerId || null, honganAdvisor: honganAdvisor || null})}); closeModal(); const message = action === "apply" ? "已采用导入值并写入" : action === "keep" ? "已保留系统值并完成复核" : "已暂不处理"; toast(message); await renderImportReviews(document.querySelector("#content")); } catch (err) { toast(err.message); } }
+async function resolveImportReview(reviewId, action, customerId = "", honganAdvisor = "") {
+  const modal = document.querySelector(".review-resolver-modal");
+  const buttons = [...(modal?.querySelectorAll(".modal-footer button") || [])];
+  buttons.forEach((button) => { button.disabled = true; });
+  try {
+    await api(`/api/import-reviews/${encodeURIComponent(reviewId)}/resolve`, {method:"POST", body: JSON.stringify({action, customerId: customerId || null, honganAdvisor: honganAdvisor || null})});
+    closeModal();
+    const message = action === "apply" ? "已写入明确选中的系统客户" : action === "keep" ? "已完成复核，本条未写入" : "已暂不处理";
+    toast(message);
+    await renderImportReviews(document.querySelector("#content"));
+  } catch (err) {
+    buttons.forEach((button) => { button.disabled = false; });
+    if (action === "apply" && !customerId) document.querySelector("#review-apply")?.setAttribute("disabled", "");
+    toast(err.message);
+  }
+}
 
 /* Import wizard: upload is read-only until the final confirmation for each sheet. */
 const WIZARD_CORE_FIELDS = [
@@ -1120,8 +1216,10 @@ function renderBulkImport() {
 async function handleImportFile(event) {
   const file = event.target.files?.[0];
   if (!file) return;
-  const previewRoot = document.querySelector("#bulk-preview");
-  previewRoot.innerHTML = `<div class="empty">正在读取 ${esc(file.name)} 的工作表...</div>`;
+  const workspace = wizardWorkspace();
+  const body = workspace?.querySelector(".section-body");
+  if (!body) return;
+  body.innerHTML = busyMarkup("正在上传并解析工作簿", `${file.name} · 现在只读取工作表结构，不会写入客户数据。`);
   try {
     const buffer = await file.arrayBuffer();
     const bytes = new Uint8Array(buffer);
@@ -1134,7 +1232,8 @@ async function handleImportFile(event) {
     state.importWizard = {file, dataBase64, workbook, selectedSheets: defaultSheets, currentIndex: 0, previews: {}, configs: {}, results: []};
     renderWizardSheetPicker();
   } catch (err) {
-    previewRoot.innerHTML = `<div class="result-box error-text">${esc(err.message)}</div>`;
+    body.innerHTML = `<div class="result-box error-text">${esc(err.message)}</div><div class="wizard-footer"><button class="secondary-btn" id="wizard-retry-file">重新选择文件</button></div>`;
+    body.querySelector("#wizard-retry-file")?.addEventListener("click", renderBulkImport);
   }
 }
 function renderWizardSheetPicker() {
@@ -1159,7 +1258,7 @@ async function renderWizardSheetConfiguration() {
   const sheetName = wizardCurrentSheet();
   const workspace = wizardWorkspace();
   if (!wizard || !sheetName || !workspace) return;
-  workspace.querySelector(".section-body").innerHTML = `<div class="empty">正在读取“${esc(sheetName)}”...</div>`;
+  workspace.querySelector(".section-body").innerHTML = busyMarkup("正在生成工作表预览", `正在读取“${sheetName}”的行列。此时尚未写入客户数据。`);
   try {
     if (!wizard.previews[sheetName]) wizard.previews[sheetName] = await api("/api/imports/preview", {method: "POST", body: JSON.stringify({filename: wizard.file.name, dataBase64: wizard.dataBase64, sheetName})});
     const preview = wizardPreview();
@@ -1172,7 +1271,7 @@ async function renderWizardSheetConfiguration() {
 }
 function wizardProgressMarkup(preview) {
   const wizard = state.importWizard;
-  return `<div class="wizard-progress"><span>工作表 ${wizard.currentIndex + 1} / ${wizard.selectedSheets.length}</span><strong>${esc(preview.sheetName || wizardCurrentSheet())}</strong><small>${preview.totalRows || 0} 行</small></div>`;
+  return `<div class="wizard-progress"><span>当前工作表 ${wizard.currentIndex + 1} / ${wizard.selectedSheets.length}</span><strong>${esc(preview.sheetName || wizardCurrentSheet())}</strong><small>${preview.totalRows || 0} 行 · 完成本表后自动进入下一张</small></div>`;
 }
 const WIZARD_GRID_PAGE_SIZE = 50;
 
@@ -1213,7 +1312,11 @@ function renderWizardGenericSheet(preview) {
   const baseProfileLabel = preview.importProfile === "asset" ? "券商资产更新" : preview.importProfile === "holding" ? "持仓快照更新" : preview.profile === "hongan_master" ? "客户资料补充" : "客户资料导入";
   const profileLabel = WIZARD_WORKFLOW_OPTIONS.find(([value]) => value === config.workflowProfile)?.[1] || baseProfileLabel;
   const canChooseWorkflow = !["asset", "holding"].includes(preview.importProfile);
-  const workflowPicker = canChooseWorkflow ? `<section class="wizard-workflow-picker"><label><span>本表用途</span><select id="wizard-workflow-profile">${WIZARD_WORKFLOW_OPTIONS.map(([value, label]) => `<option value="${value}" ${config.workflowProfile === value ? "selected" : ""}>${esc(label)}</option>`).join("")}</select></label><p>${esc(WIZARD_WORKFLOW_HELP[config.workflowProfile] || WIZARD_WORKFLOW_HELP.standard)}</p></section>` : "";
+  const workflowOptions = WIZARD_WORKFLOW_OPTIONS.map(([value, label]) => `<option value="${value}" ${config.workflowProfile === value ? "selected" : ""}>${esc(label)}</option>`).join("");
+  const confidentlyDetected = ["placement_intent", "placement_completed", "placement_lost"].includes(preview.suggestedWorkflowProfile);
+  const workflowPicker = !canChooseWorkflow ? "" : confidentlyDetected
+    ? `<section class="wizard-detected-purpose"><div><span>本表写入规则</span><strong>${esc(profileLabel)}</strong><small>${esc(WIZARD_WORKFLOW_HELP[config.workflowProfile] || WIZARD_WORKFLOW_HELP.standard)}</small></div><details><summary>识别不正确？更改写入规则</summary><label><span>写入规则</span><select id="wizard-workflow-profile">${workflowOptions}</select></label></details></section>`
+    : `<section class="wizard-workflow-picker"><label><span>这张表要补充什么</span><select id="wizard-workflow-profile">${workflowOptions}</select></label><p>${esc(WIZARD_WORKFLOW_HELP[config.workflowProfile] || WIZARD_WORKFLOW_HELP.standard)}<br>此选项只改变写入规则，不会切换上方显示的当前工作表。</p></section>`;
   const safetyControls = isWorkflow ? `<div class="wizard-workflow-safety"><strong>只匹配已有客户</strong><span>优先使用 TW、手机号或邮箱；没有编号时只接受唯一姓名。同名或未找到的记录进入导入复核，不会新建客户。</span></div>` : `<section class="wizard-safety-row">${ownerControl}<label class="import-consent"><input id="wizard-allow-unidentified" type="checkbox" ${config.allowUnidentifiedRows ? "checked" : ""}><span>允许缺少手机号、邮箱和 TW 编号的历史记录进入待补资料状态。</span></label></section>`;
   workspace.querySelector(".section-body").innerHTML = `${wizardProgressMarkup(preview)}<div class="wizard-step-header"><div><span class="wizard-kicker">步骤 2 / 3</span><h4>在原表预览中选择行和列</h4><p><b>${esc(profileLabel)}</b>。先确认本表用途，再核对要写入的列。“原表骄阳顾问”只保存为历史标签，不改变当前负责人。</p></div><span class="import-profile">${esc(profileLabel)}</span></div>${workflowPicker}${wizardGridMarkup(preview, config)}${safetyControls}<div id="wizard-impact"></div><div class="wizard-footer"><button class="secondary-btn" id="wizard-back-sheets">返回工作表选择</button><button class="primary-btn" id="wizard-check-impact">查看预计变更</button></div>`;
   const rows = preview.rows || [];
@@ -1312,7 +1415,9 @@ async function renderWizardImpact() {
   const payload = wizardPayload(preview, config);
   if (!payload.rows.length) { toast("请至少勾选一行要导入的记录"); return; }
   const root = document.querySelector("#wizard-impact");
-  root.innerHTML = `<div class="empty">正在根据当前客户表估算变更...</div>`;
+  const checkButton = document.querySelector("#wizard-check-impact");
+  setBusyButton(checkButton, true, "正在核对...");
+  root.innerHTML = busyMarkup("正在核对预计变更", "正在与当前客户库比对；此时仍未写入任何数据。");
   try {
     const impact = await api("/api/imports/impact", {method: "POST", body: JSON.stringify(payload)});
     state.importWizard.impact = impact;
@@ -1334,7 +1439,11 @@ async function renderWizardImpact() {
     root.innerHTML = `<section class="wizard-impact"><header><div><span class="wizard-kicker">步骤 3 / 3</span><h4>预计变更</h4><p>${esc(impact.message || "")}</p></div><span class="hint">将检查 ${counts.filteredRows || 0} 行</span></header><div class="wizard-impact-grid"><div><b>${counts.new || 0}</b><span>${newLabel}</span></div><div><b>${counts.update || 0}</b><span>预计更新</span></div><div><b>${counts.unchanged || 0}</b><span>无需变化</span></div><div><b>${reviewCount}</b><span>进入人工复核</span></div></div>${notices.length ? `<ul>${notices.map((notice) => `<li>${esc(notice)}</li>`).join("")}</ul>` : `<p class="wizard-safe-note">没有发现会阻止本次导入的身份信息问题。确认后系统会再次校验当前数据。</p>`}<div class="wizard-impact-actions"><button class="secondary-btn" id="wizard-edit-config">返回修改</button><button class="primary-btn" id="wizard-commit-sheet" ${blocked ? "disabled" : ""}>确认导入此工作表</button></div></section>`;
     root.querySelector("#wizard-edit-config")?.addEventListener("click", () => root.innerHTML = "");
     root.querySelector("#wizard-commit-sheet")?.addEventListener("click", commitWizardSheet);
-  } catch (err) { root.innerHTML = `<div class="result-box error-text">${esc(err.message)}</div>`; }
+  } catch (err) {
+    root.innerHTML = `<div class="result-box error-text">${esc(err.message)}</div>`;
+  } finally {
+    if (checkButton?.isConnected) setBusyButton(checkButton, false);
+  }
 }
 function renderWizardSpecialSheet(preview) {
   const workspace = wizardWorkspace();
@@ -1363,6 +1472,10 @@ async function commitWizardSheet() {
     const snapshot = preview.holdingSnapshots?.[0];
     payload = {filename: `${wizard.file.name} · ${preview.sheetName}`, importProfile: "holding_pinyin", confirmPinyinHolding: true, rows: (preview.rows || []).map((row) => ({name: row[nameHeader], holdingQuantity: row[quantityHeader], holdingSnapshots: snapshot ? [{...snapshot, quantity: Number(row[quantityHeader]) || 0, marketValue: 0}] : []}))};
   } else payload = wizardPayload(preview, wizardReadConfig());
+  const commitButton = document.querySelector("#wizard-commit-sheet") || document.querySelector("#wizard-commit-special");
+  const busyHost = document.querySelector("#wizard-impact") || commitButton?.closest(".section-body");
+  setBusyButton(commitButton, true, "正在写入...");
+  busyHost?.insertAdjacentHTML("beforeend", busyMarkup("正在写入当前工作表", `正在保存“${preview.sheetName}”，请勿关闭页面或重复点击。`));
   try {
     const result = await api("/api/imports/commit", {method: "POST", body: JSON.stringify(payload)});
     wizard.results.push({sheetName: preview.sheetName, result});
@@ -1374,7 +1487,11 @@ async function commitWizardSheet() {
       return;
     }
     renderWizardComplete();
-  } catch (err) { toast(err.message); }
+  } catch (err) {
+    document.querySelector(".operation-busy")?.remove();
+    if (commitButton?.isConnected) setBusyButton(commitButton, false);
+    toast(err.message);
+  }
 }
 function renderWizardComplete() {
   const wizard = state.importWizard;

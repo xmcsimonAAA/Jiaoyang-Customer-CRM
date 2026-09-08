@@ -759,6 +759,13 @@ def test_placement_batch_and_closed_loop_metrics():
     assert batch.status_code == 201, batch.text
     batch_id = batch.json()["batch"]["id"]
 
+    updated_batch = client.patch(
+        f"/api/batches/{batch_id}", headers=supervisor_headers,
+        json={"status": "已完成"},
+    )
+    assert updated_batch.status_code == 200, updated_batch.text
+    assert updated_batch.json()["batch"]["status"] == "已完成"
+
     created = client.post(
         "/api/customers", headers=manager_headers,
         json={
