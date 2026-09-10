@@ -4505,12 +4505,19 @@ def import_review_access(user: dict[str, Any]) -> None:
 
 
 @app.get("/api/import-reviews")
-def list_import_reviews(include_resolved: bool = Query(default=False), user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+def list_import_reviews(
+    include_resolved: bool = Query(default=False),
+    job_id: str = Query("", alias="job_id"),
+    user: dict[str, Any] = Depends(current_user),
+) -> dict[str, Any]:
     """Return one cross-batch queue for import conflicts and unmatched rows."""
     import_review_access(user)
     items: list[dict[str, Any]] = []
     with db() as conn:
-        jobs = conn.execute("SELECT * FROM import_jobs ORDER BY created_at DESC LIMIT 200").fetchall()
+        if job_id:
+            jobs = conn.execute("SELECT * FROM import_jobs WHERE id = ?", (job_id,)).fetchall()
+        else:
+            jobs = conn.execute("SELECT * FROM import_jobs ORDER BY created_at DESC LIMIT 200").fetchall()
         for job in jobs:
             job_dict = dict(job)
             reviews = parse_import_review_items(job_dict)

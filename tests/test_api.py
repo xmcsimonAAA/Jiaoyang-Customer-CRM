@@ -623,6 +623,10 @@ def test_pinyin_holding_preview_writes_only_unique_customer_matches():
     reviews = client.get("/api/import-reviews", headers=admin_headers)
     assert reviews.status_code == 200, reviews.text
     review = next(item for item in reviews.json()["items"] if item["profile"] == "holding_pinyin")
+    filtered_reviews = client.get(f"/api/import-reviews?job_id={commit.json()['jobId']}", headers=admin_headers)
+    assert filtered_reviews.status_code == 200, filtered_reviews.text
+    assert filtered_reviews.json()["total"] == 1
+    assert filtered_reviews.json()["items"][0]["jobId"] == commit.json()["jobId"]
     resolved = client.post(f"/api/import-reviews/{review['id']}/resolve", headers=admin_headers, json={"action": "apply", "customerId": master.json()["created"][1]["id"]})
     assert resolved.status_code == 200, resolved.text
     remaining = client.get("/api/import-reviews", headers=admin_headers).json()["items"]
