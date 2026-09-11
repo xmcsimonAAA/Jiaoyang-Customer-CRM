@@ -651,6 +651,11 @@ def test_import_wizard_lists_workbook_tabs_and_estimates_changes_without_writing
     assert one_sheet.json()["importProfile"] == "hongan_activity"
     assert one_sheet.json()["sheetName"] == "2026.08.19"
     assert one_sheet.json()["honganActivity"]["totalRows"] == 3
+    assert one_sheet.json()["headers"] == ["序号", "客户姓名", "是否开券商户", "入金金额", "骄阳现场开户人", "保险经纪人", "中阳见证人"]
+    assert one_sheet.json()["suggestedMapping"]["name"] == "客户姓名"
+    assert one_sheet.json()["suggestedMapping"]["hkAdvisor"] == "保险经纪人"
+    assert len(one_sheet.json()["rows"]) == 3
+    assert one_sheet.json()["rows"][0]["__sourceRow"] == 2
 
     before = client.get("/api/customers", headers=admin_headers).json()["total"]
     impact = client.post(
@@ -918,6 +923,124 @@ def test_hongan_activity_workbook_updates_only_safe_name_matches():
     assert blank_detail["owner_id"] == "unassigned"
     assert existing_detail["hongan_advisor"] == "活动港安乙"
     assert existing_detail["owner_id"] == "unassigned"
+
+
+def test_hongan_activity_can_create_pending_tw_customers_and_reconcile_later_snapshot():
+    admin_headers, _ = login("admin", "admin123")
+    activity = client.post(
+        "/api/imports/commit",
+        headers=admin_headers,
+        json={
+            "filename": "港安活动跟踪.xlsx · 2026.09.07",
+            "importProfile": "hongan_activity",
+            "confirmHonganActivity": True,
+            "createUnmatchedHonganCustomers": True,
+            "rows": [
+                {"name": "最新活动待编号", "hkAdvisor": "港安顾问新", "sourceSheet": "2026.09.07"},
+                {"name": "最新活动未填顾问", "hkAdvisor": "", "sourceSheet": "2026.09.07"},
+            ],
+        },
+    )
+    assert activity.status_code == 200, activity.text
+    activity_result = activity.json()
+    assert len(activity_result["created"]) == 2
+    assert activity_result["dataQuality"]["createdAwaitingTw"] == 2
+    pending_id = next(item["id"] for item in activity_result["created"] if item["name"] == "最新活动待编号")
+    pending = client.get(f"/api/customers/{pending_id}", headers=admin_headers).json()["customer"]
+    assert pending["tw_code"] == ""
+    assert pending["owner_id"] == "unassigned"
+    assert pending["source"] == "线下沙龙"
+    assert pending["source_detail"] == "港安活动分表 · 2026.09.07"
+
+    snapshot_payload = {
+        "filename": "券商客户表.xlsx",
+        "ownerId": "unassigned",
+        "importProfile": "hongan_master",
+        "rows": [{
+            "name": "最新活动待编号", "twCode": "TW2026090999", "phone": "13912345678",
+            "hkAdvisor": "港安顾问新", "accountStatus": "已开户",
+        }],
+    }
+    impact = client.post("/api/imports/impact", headers=admin_headers, json=snapshot_payload)
+    assert impact.status_code == 200, impact.text
+    assert impact.json()["counts"]["new"] == 0
+    assert impact.json()["counts"]["update"] == 1
+    assert impact.json()["counts"]["pendingTwReconciled"] == 1
+
+    snapshot = client.post("/api/imports/commit", headers=admin_headers, json=snapshot_payload)
+    assert snapshot.status_code == 200, snapshot.text
+    snapshot_result = snapshot.json()
+    assert snapshot_result["created"] == []
+    assert snapshot_result["updated"][0]["id"] == pending_id
+    assert snapshot_result["dataQuality"]["twReconciledRows"] == 1
+    reconciled = client.get(f"/api/customers/{pending_id}", headers=admin_headers).json()["customer"]
+    assert reconciled["tw_code"] == "TW2026090999"
+    assert reconciled["phone"] == "13912345678"
+    assert reconciled["account_status"] == "已开户"
+
+
+def test_hongan_activity_writes_only_selected_core_and_custom_fields_and_rolls_them_back():
+    admin_headers, _ = login("admin", "admin123")
+    field_response = client.post(
+        "/api/customer-fields", headers=admin_headers,
+        json={"label": "活动报名渠道", "fieldType": "text", "options": []},
+    )
+    assert field_response.status_code == 201, field_response.text
+    field_id = field_response.json()["field"]["id"]
+    created = client.post(
+        "/api/customers", headers=admin_headers,
+        json={"name": "活动选列更新客户", "notes": "原有备注必须保留"},
+    )
+    assert created.status_code == 201, created.text
+    customer_id = created.json()["customer"]["id"]
+
+    imported = client.post(
+        "/api/imports/commit", headers=admin_headers,
+        json={
+            "filename": "港安活动跟踪.xlsx · 2026.09.07",
+            "importProfile": "hongan_activity",
+            "confirmHonganActivity": True,
+            "rows": [{
+                "name": "活动选列更新客户", "accountStatus": "已开户",
+                "customValues": {field_id: "企业微信邀请"}, "sourceSheet": "2026.09.07", "sourceRow": 12,
+            }],
+        },
+    )
+    assert imported.status_code == 200, imported.text
+    assert len(imported.json()["updated"]) == 1
+    detail = client.get(f"/api/customers/{customer_id}", headers=admin_headers).json()["customer"]
+    assert detail["account_status"] == "已开户"
+    assert detail["custom_values"][field_id] == "企业微信邀请"
+    assert detail["notes"] == "原有备注必须保留"
+
+    rolled_back = client.post(f"/api/imports/{imported.json()['jobId']}/rollback", headers=admin_headers)
+    assert rolled_back.status_code == 200, rolled_back.text
+    restored = client.get(f"/api/customers/{customer_id}", headers=admin_headers).json()["customer"]
+    assert restored["account_status"] == "未启动"
+    assert field_id not in restored["custom_values"]
+    assert restored["notes"] == "原有备注必须保留"
+
+
+def test_hongan_activity_pending_customer_can_be_rolled_back_while_untouched():
+    admin_headers, _ = login("admin", "admin123")
+    activity = client.post(
+        "/api/imports/commit",
+        headers=admin_headers,
+        json={
+            "filename": "港安活动跟踪.xlsx · 2026.09.10",
+            "importProfile": "hongan_activity",
+            "confirmHonganActivity": True,
+            "createUnmatchedHonganCustomers": True,
+            "rows": [{"name": "活动待撤回客户", "hkAdvisor": "港安顾问撤回", "sourceSheet": "2026.09.10"}],
+        },
+    )
+    assert activity.status_code == 200, activity.text
+    result = activity.json()
+    customer_id = result["created"][0]["id"]
+    rolled_back = client.post(f"/api/imports/{result['jobId']}/rollback", headers=admin_headers)
+    assert rolled_back.status_code == 200, rolled_back.text
+    assert rolled_back.json()["archived"][0]["id"] == customer_id
+    assert client.get(f"/api/customers/{customer_id}", headers=admin_headers).status_code == 404
 
 
 def test_hongan_activity_rollback_restores_only_legacy_owner_assignment():

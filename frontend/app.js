@@ -541,7 +541,7 @@ function renderImports(content) { const canManageImportHistory = Boolean(state.u
 function renderBulkImport() { const workspace = document.querySelector("#import-workspace"); workspace.innerHTML = `<div class="section-header"><div><h3>批量导入历史数据</h3><span class="hint">支持 .xlsx / .csv · 单次最多 5000 行</span></div><button class="secondary-btn" id="download-import-template">下载导入模板</button></div><div class="section-body"><div class="dropzone"><strong>选择客户表格</strong><span class="hint">系统会先识别列并展示预览，不会自动合并重复客户</span><label class="primary-btn" style="display:inline-block;margin-top:16px"><input type="file" id="import-file" accept=".xlsx,.csv">选择文件</label></div><div id="bulk-preview"></div></div>`; document.querySelector("#import-file").addEventListener("change", handleImportFile); document.querySelector("#download-import-template")?.addEventListener("click", downloadImportTemplate); }
 async function downloadImportTemplate() { try { const response = await fetch("/api/imports/template.csv", {headers: state.token ? {Authorization: `Bearer ${state.token}`} : {}}); if (!response.ok) { const detail = await response.json().catch(() => ({})); throw new Error(detail.detail || "模板下载失败"); } const blob = await response.blob(); const url = URL.createObjectURL(blob); const link = document.createElement("a"); link.href = url; link.download = "骄阳客户导入模板.csv"; document.body.appendChild(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000); toast("导入模板已下载"); } catch (err) { toast(err.message); } }
 async function renderImportHistory() { const workspace = document.querySelector("#import-history"); if (!workspace) return; try { const data = await api("/api/imports"); const totalBatches = data.items.length; const visibleItems = state.importHistoryExpanded ? data.items : data.items.slice(0, 4); const hiddenCount = totalBatches - visibleItems.length; const groups = {}; visibleItems.forEach((item) => { const key = String(item.created_at || "").slice(0, 7) || "未标日期"; (groups[key] ||= []).push(item); }); const months = Object.entries(groups).sort(([a], [b]) => b.localeCompare(a)); const monthLabel = (key) => { const [year, month] = key.split("-"); return year && month ? `${year} 年 ${Number(month)} 月` : key; }; workspace.innerHTML = `<div class="section-header"><div><h3>导入批次</h3><span class="hint">每次上传都会保留为一个批次；点击指标可下钻查看该批新增、更新或新开户客户。</span></div><span class="hint">显示 ${visibleItems.length} / 共 ${totalBatches} 批</span></div>${months.length ? months.map(([month, items]) => `<section class="import-month"><header><h4>${monthLabel(month)}</h4><span>${items.length} 批导入</span></header><div class="import-batch-list">${items.map((item) => { const changed = Number(item.created_count || 0) + Number(item.updated_count || 0); const mode = item.dataQuality?.mode === "snapshot" ? "全量快照" : item.dataQuality?.mode === "holding_pinyin" ? "中阳拼音持仓" : item.dataQuality?.mode === "hongan_activity" ? "港安活动分表" : "增量 / 手工"; const status = item.rolled_back_at ? "已撤回" : changed ? "已完成" : "无变化"; const rollbackLabel = item.dataQuality?.mode === "hongan_activity" ? "恢复本批变更" : "撤回"; const reviewLink = item.pendingReviewCount ? `<button class="import-review-link" data-open-import-reviews="${esc(item.id)}">待复核 ${item.pendingReviewCount} 条</button>` : ""; return `<article class="import-batch-card ${item.rolled_back_at ? "is-rolled-back" : ""}"><div class="import-batch-head"><div><span class="import-batch-date">${fmt(item.created_at)}</span><h4>${esc(item.filename)}</h4><p>${esc(item.imported_by_name)} · ${mode} · ${item.total_rows} 行</p></div>${tag(status, item.rolled_back_at ? "gray" : changed ? "teal" : "gray")}</div><div class="import-batch-metrics"><button data-import-filter="${esc(item.id)}" data-import-mode="created"><small>本批新增</small><b>${item.created_count || 0}</b></button><button data-import-filter="${esc(item.id)}" data-import-mode="updated"><small>本批更新</small><b>${item.updated_count || 0}</b></button><button data-import-filter="${esc(item.id)}" data-import-mode="opened"><small>本批新开户</small><b>${item.openedCount || 0}</b></button><div><small>冲突 / 错误</small><b>${item.conflict_count || 0} / ${item.error_count || 0}</b></div></div><footer>${reviewLink}<button class="import-batch-link" data-import-filter="${esc(item.id)}" data-import-mode="all">查看本批全部变更 →</button>${!item.rolled_back_at && (item.created_count || item.dataQuality?.mode === "hongan_activity") ? `<button class="secondary-btn" data-rollback-import="${esc(item.id)}" data-rollback-profile="${esc(item.dataQuality?.mode || "")}">${rollbackLabel}</button>` : ""}</footer></article>`; }).join("")}</div></section>`).join("") : `<div class="empty">暂无批量导入记录</div>`}`; if (hiddenCount || (state.importHistoryExpanded && totalBatches > 4)) workspace.insertAdjacentHTML("beforeend", `<button class="secondary-btn import-history-toggle" id="toggle-import-history" type="button">${state.importHistoryExpanded ? "收起较早批次" : `查看全部 ${totalBatches} 批`}</button>`); workspace.querySelector("#toggle-import-history")?.addEventListener("click", () => { state.importHistoryExpanded = !state.importHistoryExpanded; renderImportHistory(); }); workspace.querySelectorAll("[data-open-import-reviews]").forEach((button) => button.addEventListener("click", () => { state.importReviewJobId = button.dataset.openImportReviews; state.importReviewsIncludeResolved = false; navigate("reviews"); })); workspace.querySelectorAll("[data-import-filter]").forEach((button) => button.addEventListener("click", () => { state.importJobId = button.dataset.importFilter; state.importJobMode = button.dataset.importMode || "all"; state.customerPage = 1; navigate("customers", {preserveWorkflow:true}); })); workspace.querySelectorAll("[data-rollback-import]").forEach((button) => button.addEventListener("click", () => rollbackImport(button.dataset.rollbackImport, button.dataset.rollbackProfile === "hongan_activity"))); } catch (err) { workspace.innerHTML = `<div class="empty">${esc(err.message)}</div>`; } }
-async function rollbackImport(jobId, isHonganActivity = false) { const prompt = isHonganActivity ? "这批是港安活动分表。确认只恢复这批导入造成的错误骄阳负责人分配吗？港安顾问信息不会被清除，导入后人工修改过的负责人会保留。" : "确认撤回这次导入造成的变更吗？系统会保护导入后已被再次编辑的客户。"; if (!window.confirm(prompt)) return; try { const data = await api(`/api/imports/${encodeURIComponent(jobId)}/rollback`, {method:"POST"}); const message = isHonganActivity ? `已恢复 ${data.restored?.length || 0} 条负责人${data.protected?.length ? `，保护 ${data.protected.length} 条` : ""}` : data.protected.length ? `已撤回 ${data.archived.length} 条，保护 ${data.protected.length} 条` : `已撤回 ${data.archived.length} 条`; toast(message); renderImportHistory(); } catch (err) { toast(err.message); } }
+async function rollbackImport(jobId, isHonganActivity = false) { const prompt = isHonganActivity ? "确认恢复这批港安活动导入吗？本批新建且尚未编辑、补 TW、跟进的客户会被撤回；已有客户的港安顾问不会被清除。" : "确认撤回这次导入造成的变更吗？系统会保护导入后已被再次编辑的客户。"; if (!window.confirm(prompt)) return; try { const data = await api(`/api/imports/${encodeURIComponent(jobId)}/rollback`, {method:"POST"}); const message = isHonganActivity ? `已撤回 ${data.archived?.length || 0} 位本批新客户${data.restored?.length ? `，恢复 ${data.restored.length} 条旧负责人变更` : ""}${data.protected?.length ? `，保护 ${data.protected.length} 条` : ""}` : data.protected.length ? `已撤回 ${data.archived.length} 条，保护 ${data.protected.length} 条` : `已撤回 ${data.archived.length} 条`; toast(message); renderImportHistory(); } catch (err) { toast(err.message); } }
 async function handleImportFile(event) { const file = event.target.files[0]; if (!file) return; const workspace = document.querySelector("#bulk-preview"); workspace.innerHTML = `<div class="empty">正在读取 ${esc(file.name)}...</div>`; const buffer = await file.arrayBuffer(); let binary = ""; const bytes = new Uint8Array(buffer); for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]); try { const preview = await api("/api/imports/preview", {method:"POST", body: JSON.stringify({filename:file.name, dataBase64:btoa(binary)})}); state.importPreview = {file, preview}; renderImportPreview(workspace); renderImportDiagnostics(workspace, preview); } catch (err) { workspace.innerHTML = `<div class="result-box error-text">${esc(err.message)}</div>`; } }
 
 function renderImportDiagnostics(workspace, preview) {
@@ -574,9 +574,10 @@ function renderHonganActivityPreview(workspace, preview) {
   const counts = activity.counts || {};
   const stat = (label, value, tone = "") => `<div class="hongan-import-stat ${tone}"><b>${Number(value || 0)}</b><span>${label}</span></div>`;
   const sample = (items, label) => items?.length ? `<details class="hongan-import-list"><summary>${label}（${items.length}${items.length >= 200 ? "+" : ""}）</summary><div>${items.slice(0, 8).map((item) => `<span>${esc(item.name)}${item.targetAdvisor ? ` · ${esc(item.targetAdvisor)}` : item.advisors?.length ? ` · ${esc(item.advisors.join("、"))}` : ""}${item.sourceAdvisors?.length ? ` · 现场开户人：${esc(item.sourceAdvisors.join("、"))}` : ""}</span>`).join("")}</div></details>` : "";
-  workspace.innerHTML = `<div class="result-box hongan-import-banner"><strong>已识别港安活动分表</strong><div class="hint">${esc(preview.sheetName || "")}${preview.sheetStats?.length ? ` · ${preview.sheetStats.map((item) => `${esc(item.name)}（${item.rows}）`).join("、")}` : ""}</div><div class="hint import-normalization-note">${esc(preview.textNormalization || "繁体中文已统一转换为简体中文")}</div></div><section class="hongan-import-summary"><div class="hongan-import-stats">${stat("活动记录", activity.totalRows)}${stat("唯一客户", activity.uniqueNames)}${stat("可自动补全", counts.autoFill, "positive")}${stat("已有一致顾问", counts.unchanged)}${stat("需人工复核", (counts.conflicts || 0) + (counts.ambiguous || 0), "warning")}${stat("系统未找到", counts.unmatched, "muted")}</div>${sample(activity.conflicts, "顾问冲突")}${sample(activity.ambiguous, "同名多条记录")}${sample(activity.unmatched, "未匹配客户")}</section><div class="toolbar import-actions"><label class="import-consent hongan-import-consent"><input type="checkbox" id="confirm-hongan-activity"><span>我确认这次只补全唯一匹配且当前为空的港安顾问，不覆盖已有港安顾问、不修改骄阳负责人、不新建客户。</span></label><button class="primary-btn" id="commit-import" ${preview.truncated || !state.user.canManageAdvisorBindings ? "disabled" : ""}>确认补全港安顾问</button></div><div class="table-wrap import-sample"><table><thead><tr>${preview.headers.map((header) => `<th>${esc(header)}</th>`).join("")}</tr></thead><tbody>${preview.rows.slice(0, 5).map((row) => `<tr>${preview.headers.map((header) => `<td>${esc(row[header])}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
+  workspace.innerHTML = `<div class="result-box hongan-import-banner"><strong>已识别港安活动分表</strong><div class="hint">${esc(preview.sheetName || "")}${preview.sheetStats?.length ? ` · ${preview.sheetStats.map((item) => `${esc(item.name)}（${item.rows}）`).join("、")}` : ""}</div><div class="hint import-normalization-note">${esc(preview.textNormalization || "繁体中文已统一转换为简体中文")}</div></div><section class="hongan-import-summary"><div class="hongan-import-stats">${stat("活动记录", activity.totalRows)}${stat("唯一客户", activity.uniqueNames)}${stat("可自动补全", counts.autoFill, "positive")}${stat("已有一致顾问", counts.unchanged)}${stat("需人工复核", (counts.conflicts || 0) + (counts.ambiguous || 0), "warning")}${stat("可选择新建", counts.createEligible, "muted")}</div>${sample(activity.conflicts, "顾问冲突")}${sample(activity.ambiguous, "同名多条记录")}${sample(activity.unmatched, "未匹配客户")}</section><div class="hongan-import-options"><label class="import-consent"><input type="checkbox" id="create-hongan-customers"><span><strong>将 ${Number(counts.createEligible || 0)} 位未找到的姓名先建为客户</strong><small>仅保存姓名、港安顾问和活动来源；TW 编号及联系方式以后补，骄阳负责人进入待分配。</small></span></label><label class="import-consent hongan-import-consent"><input type="checkbox" id="confirm-hongan-activity"><span>我确认不覆盖已有港安顾问、不读取“骄阳现场开户人”作为负责人，也不写入金额或定增状态。</span></label></div><div class="toolbar import-actions"><button class="primary-btn" id="commit-import" ${preview.truncated || !state.user.canManageAdvisorBindings ? "disabled" : ""}>确认导入此工作表</button></div><div class="table-wrap import-sample"><table><thead><tr>${preview.headers.map((header) => `<th>${esc(header)}</th>`).join("")}</tr></thead><tbody>${preview.rows.slice(0, 5).map((row) => `<tr>${preview.headers.map((header) => `<td>${esc(row[header])}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
   const checkbox = workspace.querySelector("#confirm-hongan-activity");
   const button = workspace.querySelector("#commit-import");
+  if (button) button.disabled = true;
   checkbox?.addEventListener("change", () => { button.disabled = !checkbox.checked || preview.truncated || !state.user.canManageAdvisorBindings; });
   if (!state.user.canManageAdvisorBindings) button.title = "需要顾问绑定管理权限";
   button?.addEventListener("click", commitImport);
@@ -620,7 +621,7 @@ async function commitImport() {
   const allowUnidentifiedRows = Boolean(document.querySelector("#allow-unidentified-rows")?.checked);
   const importProfile = preview.importProfile || preview.profile || "standard";
   try {
-    const data = await api("/api/imports/commit", {method:"POST", body: JSON.stringify({filename:file.name, ownerId, mode: importProfile === "standard" && preview.dataQuality?.hasTwSnapshot ? "snapshot" : "append", importProfile, advisorAliasMappings, allowUnidentifiedRows, confirmHonganActivity: Boolean(document.querySelector("#confirm-hongan-activity")?.checked), confirmPinyinHolding: Boolean(document.querySelector("#confirm-pinyin-holding")?.checked), rows})});
+    const data = await api("/api/imports/commit", {method:"POST", body: JSON.stringify({filename:file.name, ownerId, mode: importProfile === "standard" && preview.dataQuality?.hasTwSnapshot ? "snapshot" : "append", importProfile, advisorAliasMappings, allowUnidentifiedRows, confirmHonganActivity: Boolean(document.querySelector("#confirm-hongan-activity")?.checked), createUnmatchedHonganCustomers: Boolean(document.querySelector("#create-hongan-customers")?.checked), confirmPinyinHolding: Boolean(document.querySelector("#confirm-pinyin-holding")?.checked), rows})});
     const potentialCount = data.created.reduce((total, item) => total + (item.potentialDuplicates?.length || 0), 0);
     document.querySelector("#bulk-preview").insertAdjacentHTML("afterbegin", `<div class="result-box"><strong>导入完成</strong><div class="hint">新增 ${data.created.length} 条 · 更新 ${data.updated?.length || 0} 条 · 无变化 ${data.unchangedCount || 0} 条 · 冲突 ${data.conflicts.length} 条 · 错误 ${data.errors.length} 条${data.assignedCount ? ` · 已分配骄阳负责人 ${data.assignedCount} 条` : ""}${data.dataQuality?.unidentifiedRowsImported ? ` · 无联系方式 ${data.dataQuality.unidentifiedRowsImported} 条` : ""}${data.dataQuality?.duplicateTwRowsMerged ? ` · 重复 TW 已合并 ${data.dataQuality.duplicateTwRowsMerged} 行` : ""}${potentialCount ? ` · 发现 ${potentialCount} 条可能重名记录，请人工确认` : ""}</div></div>`);
     toast("数据已并入客户数据表");
@@ -631,7 +632,29 @@ async function commitImport() {
 }
 
 async function renderFields(content) { const data = await api("/api/customer-fields?includeInactive=true"); content.innerHTML = `<div class="section-heading"><div><h3>客户表头管理</h3><p>新增字段会立即成为客户数据表的一列；停用只隐藏列，已有数据不会删除。</p></div><button class="primary-btn" id="add-field">＋ 新增表头</button></div><div class="notice">姓名、手机号、顾问归属、开户状态和定增推进是系统核心字段，不能删除。这里管理的是各阶段需要的补充数据。</div><section class="section"><div class="section-header"><h3>自定义表头</h3><span class="hint">${data.items.filter((item) => item.active).length} 个启用 · ${data.items.filter((item) => !item.active).length} 个停用</span></div><div class="field-list">${data.items.length ? data.items.map((field) => `<div class="field-row ${field.active ? "" : "inactive"}"><span class="field-grip">⋮⋮</span><div><strong>${esc(field.label)}</strong><small>${{text:"文本",number:"数字",date:"日期",select:"单选"}[field.fieldType]}${field.options.length ? ` · ${field.options.map(esc).join(" / ")}` : ""}</small></div><span>${field.active ? tag("使用中","teal") : tag("已停用","gray")}</span><button class="secondary-btn" data-toggle-field="${esc(field.id)}" data-active="${field.active}">${field.active ? "停用" : "恢复"}</button></div>`).join("") : `<div class="empty">还没有自定义表头。新增后，商务经理可直接在客户数据表里填写。</div>`}</div></section>`; document.querySelector("#add-field").addEventListener("click", openFieldForm); content.querySelectorAll("[data-toggle-field]").forEach((button) => button.addEventListener("click", async () => { try { await api(`/api/customer-fields/${button.dataset.toggleField}`, {method:"PATCH",body:JSON.stringify({active:button.dataset.active !== "true"})}); state.meta = await api("/api/meta"); await renderFields(content); toast(button.dataset.active === "true" ? "表头已停用，历史数据仍保留" : "表头已恢复"); } catch (err) { toast(err.message); } })); }
-function openFieldForm() { openModal(`<div class="modal field-modal"><div class="modal-header"><div><h3>新增客户表头</h3><span class="hint">选择最符合数据用途的类型，创建后类型不可修改。</span></div><button class="close-btn" data-close>×</button></div><form id="field-form"><div class="modal-body"><div class="field"><label>表头名称 *</label><input name="label" required maxlength="50" placeholder="例如：护照有效期"></div><div class="field"><label>数据类型</label><div class="type-picker"><label><input type="radio" name="fieldType" value="text" checked><span><b>Aa</b>文本<small>姓名、说明、编号</small></span></label><label><input type="radio" name="fieldType" value="number"><span><b>123</b>数字<small>金额、数量</small></span></label><label><input type="radio" name="fieldType" value="date"><span><b>日</b>日期<small>到期日、登记日</small></span></label><label><input type="radio" name="fieldType" value="select"><span><b>⌄</b>单选<small>固定状态或分类</small></span></label></div></div><div class="field" id="field-options" hidden><label>可选项 *</label><textarea name="options" placeholder="每行一个选项，例如：&#10;已提交&#10;审核中&#10;已完成"></textarea></div></div><div class="modal-footer"><button class="secondary-btn" type="button" data-close>取消</button><button class="primary-btn">创建表头</button></div></form></div>`); document.querySelectorAll('[name="fieldType"]').forEach((radio) => radio.addEventListener("change", () => { document.querySelector("#field-options").hidden = radio.value !== "select"; })); document.querySelector("#field-form").addEventListener("submit", async (event) => { event.preventDefault(); const form = new FormData(event.currentTarget); const payload = {label:form.get("label"),fieldType:form.get("fieldType"),options:String(form.get("options") || "").split("\n")}; try { await api("/api/customer-fields", {method:"POST",body:JSON.stringify(payload)}); closeModal(); state.meta = await api("/api/meta"); toast("新表头已加入客户数据表"); navigate("fields"); } catch (err) { toast(err.message); } }); }
+function openFieldForm(options = {}) {
+  const initialLabel = String(options.label || "").trim();
+  openModal(`<div class="modal field-modal"><div class="modal-header"><div><h3>新增客户表头</h3><span class="hint">选择最符合数据用途的类型，创建后类型不可修改。</span></div><button class="close-btn" data-close>×</button></div><form id="field-form"><div class="modal-body">${options.fromImport ? `<div class="notice"><strong>Excel 列“${esc(initialLabel)}”还没有对应的系统表头。</strong><br>创建后，本次导入会自动把这一列映射到新表头。</div>` : ""}<div class="field"><label>表头名称 *</label><input name="label" required maxlength="50" value="${esc(initialLabel)}" placeholder="例如：护照有效期"></div><div class="field"><label>数据类型</label><div class="type-picker"><label><input type="radio" name="fieldType" value="text" checked><span><b>Aa</b>文本<small>姓名、说明、编号</small></span></label><label><input type="radio" name="fieldType" value="number"><span><b>123</b>数字<small>金额、数量</small></span></label><label><input type="radio" name="fieldType" value="date"><span><b>日</b>日期<small>到期日、登记日</small></span></label><label><input type="radio" name="fieldType" value="select"><span><b>⌄</b>单选<small>固定状态或分类</small></span></label></div></div><div class="field" id="field-options" hidden><label>可选项 *</label><textarea name="options" placeholder="每行一个选项，例如：&#10;已提交&#10;审核中&#10;已完成"></textarea></div></div><div class="modal-footer"><button class="secondary-btn" type="button" data-close>取消</button><button class="primary-btn">创建表头</button></div></form></div>`);
+  document.querySelectorAll('[name="fieldType"]').forEach((radio) => radio.addEventListener("change", () => { document.querySelector("#field-options").hidden = radio.value !== "select"; }));
+  document.querySelector("#field-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const payload = {label:form.get("label"),fieldType:form.get("fieldType"),options:String(form.get("options") || "").split("\n")};
+    const submitButton = event.currentTarget.querySelector('button[type="submit"], .primary-btn');
+    setBusyButton(submitButton, true, "正在创建...");
+    try {
+      const result = await api("/api/customer-fields", {method:"POST",body:JSON.stringify(payload)});
+      closeModal();
+      state.meta = await api("/api/meta");
+      toast(options.fromImport ? "新表头已创建并选中" : "新表头已加入客户数据表");
+      if (typeof options.onCreated === "function") options.onCreated(result.field);
+      else navigate("fields");
+    } catch (err) {
+      setBusyButton(submitButton, false);
+      toast(err.message);
+    }
+  });
+}
 async function renderAdvisorBindings(content) {
   const data = await api("/api/advisor-bindings");
   const typeLabels = data.customerTypes || {non_placement: "非定增", placement: "定增"};
@@ -1036,18 +1059,20 @@ function openImportReviewResolver(item) {
   const initial = item.customerId ? {customerId: item.customerId, customerName: item.customerName || item.name, twCode: item.twCode, customerCode: item.customerCode, currentAdvisor: item.currentAdvisor} : candidates.length === 1 ? candidates[0] : null;
   const importedAdvisor = reviewImportedAdvisor(item);
   const comparison = item.profile === "hongan_activity" ? `<div class="review-comparison"><div><span>系统当前港安顾问</span><strong>${esc(item.currentAdvisor || initial?.currentAdvisor || "未填写")}</strong></div><div><span>本次导入港安顾问</span><strong>${esc(importedAdvisor)}</strong></div></div>` : "";
-  const activityScope = item.profile === "hongan_activity" ? `<div class="review-scope"><b>本条冲突字段：港安顾问</b><span>客户姓名、TW 编号仅用于确认客户身份。金额、开户状态、骄阳现场开户人、见证人、定增信息和备注不参与本次比较，也不会被本次操作修改。</span>${item.sourceAdvisors?.length ? `<small>原表骄阳现场开户人：${esc(item.sourceAdvisors.join("、"))}（仅展示，不作为当前负责人）</small>` : ""}</div>` : "";
-  const isPlacementWorkflow = ["placement_intent", "placement_completed", "placement_lost"].includes(item.profile);
   const raw = item.rawRow || {};
+  const honganSelectedFields = item.profile === "hongan_activity" ? Object.keys(raw).filter((key) => !["name", "sourceSheet", "sourceRow"].includes(key)) : [];
+  const honganHasSupplemental = honganSelectedFields.some((key) => key !== "hkAdvisor" && (key === "customValues" ? Object.values(raw.customValues || {}).some((value) => String(value ?? "").trim()) : String(raw[key] ?? "").trim()));
+  const activityScope = item.profile === "hongan_activity" ? `<div class="review-scope"><b>本条准备写入：${esc(honganSelectedFields.length ? `${honganSelectedFields.length} 个已选字段` : "港安顾问")}</b><span>客户姓名只用于确认客户身份。系统只写入导入时明确勾选且有值的字段；“骄阳现场开户人”不会成为当前负责人。</span>${item.sourceAdvisors?.length ? `<small>原表骄阳现场开户人：${esc(item.sourceAdvisors.join("、"))}（仅展示，不作为当前负责人）</small>` : ""}</div>` : "";
+  const isPlacementWorkflow = ["placement_intent", "placement_completed", "placement_lost"].includes(item.profile);
   const workflowScope = isPlacementWorkflow ? `<div class="review-scope"><b>本条准备写入的定增信息</b><span>${item.profile === "placement_intent" ? `意向金额 ${money(raw.intentAmount || 0)}，状态设为“有意向”；不建立批次关系。` : item.profile === "placement_completed" ? `批次“${esc(raw.batchName || "未填写")}”，意向 ${money(raw.intentAmount || 0)}，实际参与 ${money(raw.actualAmount || 0)}。` : `退出去向“${esc(raw.lossCategory || "未填写")}”，原因“${esc([raw.lossObstacle, raw.lossDetail].filter(Boolean).join("；") || "未填写")}”。`}<br>“关联并写入”只更新你明确选中的系统客户，不会自动新建，也不会修改骄阳负责人。</span></div>` : "";
   const rawDetails = [item.sourceSheet ? `来源分表：${item.sourceSheet}` : "", item.sourceRow ? `来源行：第 ${item.sourceRow} 行` : "", item.rows ? `活动表同名记录数：${item.rows}` : "", item.quantity != null ? `持仓数量：${item.quantity}` : "", reviewDetailMessage(item)].filter(Boolean).join(" · ");
   const directCustomer = initial && !candidates.length ? `<div class="review-candidate-heading">系统已关联客户</div><button type="button" class="review-customer-option selected" data-review-customer="${esc(initial.customerId)}"><span><strong>${esc(initial.customerName || reviewName(item))}</strong><small>${esc(initial.twCode || initial.customerCode || "无 TW 编号")}</small></span><small>${esc(initial.currentAdvisor || "港安顾问未填写")}</small></button>` : "";
   const customerOptions = candidates.length ? `<div class="review-candidate-heading">系统找到的候选客户</div>${candidates.map((candidate) => `<button type="button" class="review-customer-option ${initial?.customerId === candidate.customerId ? "selected" : ""}" data-review-customer="${esc(candidate.customerId)}"><span><strong>${esc(candidate.customerName || "未命名")}</strong><small>${esc(candidate.twCode || candidate.customerCode || "无 TW 编号")}</small></span><small>${esc(candidate.currentAdvisor || "港安顾问未填写")}</small></button>`).join("")}` : directCustomer || `<div class="review-no-match"><strong>尚未选择系统客户</strong><span>搜索结果中选中一位客户后，才能把这条定增信息写给他。</span></div>`;
-  const profileHint = item.profile === "hongan_activity" ? "这里只处理港安顾问，不会修改骄阳当前负责人。" : item.profile === "holding_pinyin" ? "确认后只会写入这条客户的持仓快照。" : isPlacementWorkflow ? "确认客户身份后，系统会按本表用途写入这一条定增记录。" : "确认后只会处理这一条导入记录。";
+  const profileHint = item.profile === "hongan_activity" ? "确认后会写入本次勾选的资料，但不会修改骄阳当前负责人。" : item.profile === "holding_pinyin" ? "确认后只会写入这条客户的持仓快照。" : isPlacementWorkflow ? "确认客户身份后，系统会按本表用途写入这一条定增记录。" : "确认后只会处理这一条导入记录。";
   const canCreateCustomer = item.category === "unmatched" && Boolean(raw.name || raw.wechatNickname || item.name);
   const keepLabel = item.category === "unmatched" ? "不写入并完成复核" : "保留系统值并完成复核";
   const applyLabel = item.profile === "hongan_activity" ? "写入已选客户" : item.canApply ? "关联已选客户并写入" : "完成复核";
-  openModal(`<div class="modal review-resolver-modal"><div class="modal-header"><div><div class="eyebrow">MANUAL REVIEW</div><h3>${item.profile === "hongan_activity" ? "核对港安顾问" : isPlacementWorkflow ? "核对定增名单" : "复核导入记录"}</h3><span class="hint">${esc(reviewName(item))} · ${esc(reviewProfileLabel(item.profile))}</span></div><button class="close-btn" data-close>×</button></div><div class="modal-body">${reviewDecisionMarkup(item)}<div class="review-resolver-note"><strong>${esc(item.categoryLabel || "待复核")}</strong><span>${esc(reviewIssueText(item))}</span><small>${esc(profileHint)}</small></div>${comparison}${activityScope}${workflowScope}${rawDetails ? `<div class="review-source-detail">${esc(rawDetails)}</div>` : ""}<section class="review-link-section"><div class="review-candidate-heading">关联已有客户</div><p>这一步不会新建客户。请先搜索，并在结果中明确选中一位客户。</p><form id="review-customer-form"><div class="review-search-row"><input id="review-customer-search" type="search" value="${esc(initial?.customerName || reviewName(item))}" placeholder="搜索姓名、TW 编号或手机号" aria-label="搜索已有客户"><button class="secondary-btn" type="submit">搜索</button></div></form><div id="review-customer-results" class="review-customer-results">${customerOptions}</div></section>${canCreateCustomer ? `<section class="review-create-customer"><div><strong>确认系统里还没有这个人？</strong><span>先建立一条客户记录，保存后会自动返回本页并选中该客户；定增信息仍需再次确认才会写入。</span></div><button class="secondary-btn" type="button" id="review-create-customer">＋ 先新建客户</button></section>` : ""}${item.profile === "hongan_activity" ? `<div class="field review-advisor-field"><label for="review-advisor">准备写入的港安顾问</label><input id="review-advisor" value="${esc(item.targetAdvisor || (item.advisors || [""])[0] || "")}" placeholder="填写港安顾问姓名"></div>` : ""}</div><div class="modal-footer"><button class="secondary-btn" type="button" id="review-keep">${keepLabel}</button><button class="secondary-btn" type="button" data-close>取消</button><button class="primary-btn" type="button" id="review-apply" ${item.canApply && !initial?.customerId ? "disabled" : ""}>${applyLabel}</button></div></div>`);
+  openModal(`<div class="modal review-resolver-modal"><div class="modal-header"><div><div class="eyebrow">MANUAL REVIEW</div><h3>${item.profile === "hongan_activity" ? "核对港安活动资料" : isPlacementWorkflow ? "核对定增名单" : "复核导入记录"}</h3><span class="hint">${esc(reviewName(item))} · ${esc(reviewProfileLabel(item.profile))}</span></div><button class="close-btn" data-close>×</button></div><div class="modal-body">${reviewDecisionMarkup(item)}<div class="review-resolver-note"><strong>${esc(item.categoryLabel || "待复核")}</strong><span>${esc(reviewIssueText(item))}</span><small>${esc(profileHint)}</small></div>${comparison}${activityScope}${workflowScope}${rawDetails ? `<div class="review-source-detail">${esc(rawDetails)}</div>` : ""}<section class="review-link-section"><div class="review-candidate-heading">关联已有客户</div><p>这一步不会新建客户。请先搜索，并在结果中明确选中一位客户。</p><form id="review-customer-form"><div class="review-search-row"><input id="review-customer-search" type="search" value="${esc(initial?.customerName || reviewName(item))}" placeholder="搜索姓名、TW 编号或手机号" aria-label="搜索已有客户"><button class="secondary-btn" type="submit">搜索</button></div></form><div id="review-customer-results" class="review-customer-results">${customerOptions}</div></section>${canCreateCustomer ? `<section class="review-create-customer"><div><strong>确认系统里还没有这个人？</strong><span>先建立一条客户记录，保存后会自动返回本页并选中该客户；导入时勾选的资料仍需再次确认才会写入。</span></div><button class="secondary-btn" type="button" id="review-create-customer">＋ 先新建客户</button></section>` : ""}${item.profile === "hongan_activity" ? `<div class="field review-advisor-field"><label for="review-advisor">准备写入的港安顾问（原表未填时可留空）</label><input id="review-advisor" value="${esc(item.targetAdvisor || (item.advisors || [""])[0] || "")}" placeholder="填写港安顾问姓名"></div>` : ""}</div><div class="modal-footer"><button class="secondary-btn" type="button" id="review-keep">${keepLabel}</button><button class="secondary-btn" type="button" data-close>取消</button><button class="primary-btn" type="button" id="review-apply" ${item.canApply && !initial?.customerId ? "disabled" : ""}>${applyLabel}</button></div></div>`);
   let selectedId = initial?.customerId || "";
   const results = document.querySelector("#review-customer-results");
   const applyButton = document.querySelector("#review-apply");
@@ -1068,7 +1093,7 @@ function openImportReviewResolver(item) {
     openQuickCustomerForm(defaults, (customer) => openImportReviewResolver({...item, customerId: customer.id, customerName: customer.name || customer.wechat_nickname, customerCode: customer.customer_code, twCode: customer.tw_code, currentAdvisor: customer.hongan_advisor, candidates: []}));
   });
   document.querySelector("#review-keep")?.addEventListener("click", () => resolveImportReview(item.id, "keep", selectedId, ""));
-  document.querySelector("#review-apply")?.addEventListener("click", () => { if (!item.canApply) { resolveImportReview(item.id, "keep", selectedId, "已在客户表完成人工检查"); return; } if (!selectedId) { toast("请先搜索并选中一位系统客户"); return; } const advisor = document.querySelector("#review-advisor")?.value.trim() || ""; if (item.profile === "hongan_activity" && !advisor) { toast("请填写本次要采用的港安顾问"); return; } resolveImportReview(item.id, "apply", selectedId, advisor); });
+  document.querySelector("#review-apply")?.addEventListener("click", () => { if (!item.canApply) { resolveImportReview(item.id, "keep", selectedId, "已在客户表完成人工检查"); return; } if (!selectedId) { toast("请先搜索并选中一位系统客户"); return; } const advisor = document.querySelector("#review-advisor")?.value.trim() || ""; if (item.profile === "hongan_activity" && !advisor && !honganHasSupplemental) { toast("这条记录没有其他已选资料，请填写本次要采用的港安顾问"); return; } resolveImportReview(item.id, "apply", selectedId, advisor); });
 }
 
 async function resolveImportReview(reviewId, action, customerId = "", honganAdvisor = "") {
@@ -1099,6 +1124,12 @@ const WIZARD_CORE_FIELDS = [
   ["lostReason", "流失原因"], ["hkAdvisor", "港安顾问"],
   ["sourceAdvisorLabel", "原表骄阳顾问（历史标签）"], ["notes", "备注"],
 ];
+const WIZARD_HONGAN_ACTIVITY_FIELDS = new Set([
+  "name", "wechatNickname", "phone", "email", "company", "stage", "priority",
+  "accountStatus", "accountBroker", "accountOpenedAt", "brokerDepositAmount",
+  "capitalDestination", "intentStatus", "placementStatus", "intentAmount", "fundedAmount",
+  "actualAmount", "lostReason", "hkAdvisor", "sourceAdvisorLabel", "notes",
+]);
 const WIZARD_WORKFLOW_OPTIONS = [
   ["standard", "普通客户资料补充"],
   ["placement_intent", "定增意向名单"],
@@ -1115,13 +1146,19 @@ const WIZARD_WORKFLOW_HELP = {
 function wizardCurrentSheet() { const wizard = state.importWizard; return wizard?.selectedSheets?.[wizard.currentIndex] || ""; }
 function wizardPreview() { return state.importWizard?.previews?.[wizardCurrentSheet()] || null; }
 function wizardWorkspace() { return document.querySelector("#import-workspace"); }
-function wizardTargetOptions(preview, selected = "") {
+function wizardTargetOptions(preview, selected = "", allowedCoreFields = null) {
+  const coreFields = allowedCoreFields ? WIZARD_CORE_FIELDS.filter(([value]) => allowedCoreFields.has(value)) : WIZARD_CORE_FIELDS;
   const customFields = (preview.customerFields || []).map((field) => [`custom:${field.id}`, `自定义字段：${field.label}`]);
   const snapshots = (preview.holdingSnapshots || []).flatMap((snapshot, index) => [
     snapshot.quantityHeader ? [`snapshot:${index}:quantity`, `持仓快照：${snapshot.snapshotDate} 股数`] : null,
     snapshot.marketValueHeader ? [`snapshot:${index}:marketValue`, `持仓快照：${snapshot.snapshotDate} 市值`] : null,
   ].filter(Boolean));
-  return [["", "不导入"], ...WIZARD_CORE_FIELDS, ...customFields, ...snapshots].map(([value, label]) => `<option value="${esc(value)}" ${selected === value ? "selected" : ""}>${esc(label)}</option>`).join("");
+  return [["", "不导入"], ...coreFields, ...customFields, ...snapshots].map(([value, label]) => `<option value="${esc(value)}" ${selected === value ? "selected" : ""}>${esc(label)}</option>`).join("");
+}
+function wizardSuggestedTarget(preview, header) {
+  const core = Object.entries(preview.suggestedMapping || {}).find(([, source]) => source === header)?.[0];
+  const custom = Object.entries(preview.suggestedCustomMapping || {}).find(([, source]) => source === header)?.[0];
+  return core || (custom ? `custom:${custom}` : "");
 }
 function wizardHeader(preview, ...aliases) {
   const keys = aliases.map((value) => String(value).replaceAll(" ", "").toLowerCase());
@@ -1153,9 +1190,8 @@ function applyWizardWorkflowDefaults(preview, sourceMap, profile) {
 function wizardDefaultConfig(preview) {
   const sourceMap = {};
   (preview.headers || []).forEach((header) => {
-    const core = Object.entries(preview.suggestedMapping || {}).find(([, source]) => source === header)?.[0];
-    const custom = Object.entries(preview.suggestedCustomMapping || {}).find(([, source]) => source === header)?.[0];
-    sourceMap[header] = core || (custom ? `custom:${custom}` : "");
+    const suggested = wizardSuggestedTarget(preview, header);
+    sourceMap[header] = preview.importProfile === "hongan_activity" && !["name", "hkAdvisor"].includes(suggested) ? "" : suggested;
   });
   const workflowProfile = preview.suggestedWorkflowProfile || preview.importProfile || preview.profile || "standard";
   (preview.holdingSnapshots || []).forEach((snapshot, index) => {
@@ -1171,6 +1207,7 @@ function wizardDefaultConfig(preview) {
     rangeStart: rows.length ? 1 : 0,
     rangeEnd: rows.length,
     allowUnidentifiedRows: false,
+    createUnmatchedHonganCustomers: false,
     ownerId: "unassigned",
   };
 }
@@ -1192,14 +1229,16 @@ function wizardReadConfig() {
   const owner = document.querySelector("#wizard-default-owner");
   const allowUnidentified = document.querySelector("#wizard-allow-unidentified");
   const workflowProfile = document.querySelector("#wizard-workflow-profile");
+  const createHonganCustomers = document.querySelector("#wizard-create-hongan-customers");
   if (owner) config.ownerId = owner.value;
   if (allowUnidentified) config.allowUnidentifiedRows = allowUnidentified.checked;
   if (workflowProfile) config.workflowProfile = workflowProfile.value;
+  if (createHonganCustomers) config.createUnmatchedHonganCustomers = createHonganCustomers.checked;
   return config;
 }
 function wizardRows(preview, config) {
   const selectedRows = config.selectedRows instanceof Set ? config.selectedRows : new Set(config.selectedRows || []);
-  return (preview.rows || []).filter((_, index) => selectedRows.has(index)).map((raw) => {
+  return (preview.rows || []).map((raw, index) => ({raw, index})).filter(({index}) => selectedRows.has(index)).map(({raw, index}) => {
     const row = {customValues: {}};
     Object.entries(config.sourceMap || {}).forEach(([source, target]) => {
       if (!target) return;
@@ -1218,6 +1257,10 @@ function wizardRows(preview, config) {
       };
     }).filter((snapshot) => snapshot.quantity || snapshot.marketValue);
     if (snapshots.length) row.holdingSnapshots = snapshots;
+    if (preview.importProfile === "hongan_activity") {
+      row.sourceSheet = preview.sheetName || wizardCurrentSheet();
+      row.sourceRow = Number(raw.__sourceRow || 0) || index + 1;
+    }
     return row;
   });
 }
@@ -1300,15 +1343,33 @@ const WIZARD_GRID_PAGE_SIZE = 50;
 function wizardGridMarkup(preview, config) {
   const headers = preview.headers || [];
   const rows = preview.rows || [];
+  const allowedCoreFields = preview.importProfile === "hongan_activity" ? WIZARD_HONGAN_ACTIVITY_FIELDS : null;
+  const isAuxiliaryHeader = (header) => preview.importProfile === "hongan_activity" && ["序号", "序列号"].includes(String(header || "").replaceAll(" ", ""));
   const pageCount = Math.max(1, Math.ceil(rows.length / WIZARD_GRID_PAGE_SIZE));
   config.page = Math.min(Math.max(1, Number(config.page) || 1), pageCount);
   const pageStart = (config.page - 1) * WIZARD_GRID_PAGE_SIZE;
   const pageEnd = Math.min(rows.length, pageStart + WIZARD_GRID_PAGE_SIZE);
   const visibleRows = rows.slice(pageStart, pageEnd);
   const mappedColumns = headers.filter((header) => config.sourceMap?.[header]).length;
+  const unmappedHeaders = headers.filter((header) => {
+    if (isAuxiliaryHeader(header)) return false;
+    const suggested = wizardSuggestedTarget(preview, header);
+    return !suggested || (allowedCoreFields && !suggested.startsWith("custom:") && !allowedCoreFields.has(suggested));
+  });
   const headerCells = headers.map((header, columnIndex) => {
     const target = config.sourceMap?.[header] || "";
-    return `<th class="wizard-grid-column ${target ? "is-included" : "is-excluded"}" data-wizard-col-index="${columnIndex}"><label class="wizard-grid-column-name"><input type="checkbox" data-wizard-column-toggle="${columnIndex}" ${target ? "checked" : ""} aria-label="导入列 ${esc(header)}"><span title="${esc(header)}">${esc(header)}</span></label><select data-wizard-source="${esc(header)}" data-wizard-column-select="${columnIndex}" data-last-target="${esc(target)}" aria-label="${esc(header)} 写入到哪个客户字段">${wizardTargetOptions(preview, target)}</select></th>`;
+    const suggestedTarget = wizardSuggestedTarget(preview, header);
+    const usableSuggestedTarget = allowedCoreFields && suggestedTarget && !suggestedTarget.startsWith("custom:") && !allowedCoreFields.has(suggestedTarget) ? "" : suggestedTarget;
+    const auxiliary = isAuxiliaryHeader(header);
+    const needsNewField = !auxiliary && !target && !usableSuggestedTarget;
+    const fieldPrompt = auxiliary
+      ? `<span class="wizard-unmapped-label">辅助序号，不导入</span>`
+      : needsNewField
+      ? state.user.canManageCustomerFields
+        ? `<button class="wizard-add-field" type="button" data-wizard-create-field="${columnIndex}">＋ 添加为新表头</button>`
+        : `<span class="wizard-unmapped-label">无对应表头，请联系有表头管理权限的同事</span>`
+      : !target && usableSuggestedTarget ? `<span class="wizard-mapping-hint">可对应现有字段，勾选本列即可</span>` : "";
+    return `<th class="wizard-grid-column ${target ? "is-included" : "is-excluded"}" data-wizard-col-index="${columnIndex}"><label class="wizard-grid-column-name"><input type="checkbox" data-wizard-column-toggle="${columnIndex}" ${target ? "checked" : ""} ${auxiliary ? "disabled" : ""} aria-label="导入列 ${esc(header)}"><span title="${esc(header)}">${esc(header)}</span></label><select data-wizard-source="${esc(header)}" data-wizard-column-select="${columnIndex}" data-last-target="${esc(target || usableSuggestedTarget)}" ${auxiliary ? "disabled" : ""} aria-label="${esc(header)} 写入到哪个客户字段">${wizardTargetOptions(preview, target, allowedCoreFields)}</select>${fieldPrompt}</th>`;
   }).join("");
   const bodyRows = visibleRows.map((row, pageIndex) => {
     const rowIndex = pageStart + pageIndex;
@@ -1322,7 +1383,28 @@ function wizardGridMarkup(preview, config) {
   }).join("");
   const previousDisabled = config.page <= 1 ? "disabled" : "";
   const nextDisabled = config.page >= pageCount ? "disabled" : "";
-  return `<section class="wizard-grid-section"><header class="wizard-grid-toolbar"><div><strong>选择本次要导入的内容</strong><small>勾选要处理的行；每列表头选择写入字段，取消勾选可排除整列。</small></div><div class="wizard-grid-count" id="wizard-selection-count">已选 ${config.selectedRows.size} 行 · ${mappedColumns} 列</div></header><div class="wizard-row-tools"><div class="wizard-range-control"><span>只选数据行</span><input id="wizard-range-start" type="number" min="1" max="${rows.length}" value="${config.rangeStart || (rows.length ? 1 : 0)}" aria-label="起始行"><span>到</span><input id="wizard-range-end" type="number" min="1" max="${rows.length}" value="${config.rangeEnd || rows.length}" aria-label="结束行"><button class="secondary-btn" type="button" id="wizard-apply-range">应用范围</button></div><div class="wizard-row-actions"><button class="text-btn" type="button" id="wizard-select-all-rows">全选全部</button><button class="text-btn" type="button" id="wizard-clear-rows">取消全选</button></div></div>${preview.truncated ? `<div class="notice">此工作表超过 5,000 行。当前只显示并处理前 5,000 行，请先拆分文件再导入其余记录。</div>` : ""}<div class="wizard-grid-scroll"><table class="wizard-grid-table"><thead><tr><th class="wizard-grid-corner"><label><input type="checkbox" id="wizard-page-toggle" aria-label="全选本页"><span>行</span></label></th>${headerCells}</tr></thead><tbody>${bodyRows || `<tr><td class="wizard-grid-empty" colspan="${headers.length + 1}">这张工作表没有可导入的数据行。</td></tr>`}</tbody></table></div><footer class="wizard-grid-pagination"><span>显示第 ${rows.length ? pageStart + 1 : 0}-${pageEnd} 行，共 ${rows.length} 行</span><div><button class="secondary-btn" type="button" id="wizard-prev-page" ${previousDisabled} aria-label="上一页">‹</button><span>第 ${config.page} / ${pageCount} 页</span><button class="secondary-btn" type="button" id="wizard-next-page" ${nextDisabled} aria-label="下一页">›</button></div></footer></section>`;
+  const unmappedNotice = unmappedHeaders.length ? `<div class="wizard-unmapped-notice"><strong>${unmappedHeaders.length} 列尚未对应系统表头</strong><span>不需要的列保持未勾选；需要导入时，请在该列表头下选择已有字段或“添加为新表头”。</span></div>` : "";
+  return `<section class="wizard-grid-section"><header class="wizard-grid-toolbar"><div><strong>选择本次要导入的内容</strong><small>勾选要处理的行；每列表头选择写入字段，取消勾选可排除整列。</small></div><div class="wizard-grid-count" id="wizard-selection-count">已选 ${config.selectedRows.size} 行 · ${mappedColumns} 列</div></header><div class="wizard-row-tools"><div class="wizard-range-control"><span>只选数据行</span><input id="wizard-range-start" type="number" min="1" max="${rows.length}" value="${config.rangeStart || (rows.length ? 1 : 0)}" aria-label="起始行"><span>到</span><input id="wizard-range-end" type="number" min="1" max="${rows.length}" value="${config.rangeEnd || rows.length}" aria-label="结束行"><button class="secondary-btn" type="button" id="wizard-apply-range">应用范围</button></div><div class="wizard-row-actions"><button class="text-btn" type="button" id="wizard-select-all-rows">全选全部</button><button class="text-btn" type="button" id="wizard-clear-rows">取消全选</button></div></div>${unmappedNotice}${preview.truncated ? `<div class="notice">此工作表超过 5,000 行。当前只显示并处理前 5,000 行，请先拆分文件再导入其余记录。</div>` : ""}<div class="wizard-grid-scroll"><table class="wizard-grid-table"><thead><tr><th class="wizard-grid-corner"><label><input type="checkbox" id="wizard-page-toggle" aria-label="全选本页"><span>行</span></label></th>${headerCells}</tr></thead><tbody>${bodyRows || `<tr><td class="wizard-grid-empty" colspan="${headers.length + 1}">这张工作表没有可导入的数据行。</td></tr>`}</tbody></table></div><footer class="wizard-grid-pagination"><span>显示第 ${rows.length ? pageStart + 1 : 0}-${pageEnd} 行，共 ${rows.length} 行</span><div><button class="secondary-btn" type="button" id="wizard-prev-page" ${previousDisabled} aria-label="上一页">‹</button><span>第 ${config.page} / ${pageCount} 页</span><button class="secondary-btn" type="button" id="wizard-next-page" ${nextDisabled} aria-label="下一页">›</button></div></footer></section>`;
+}
+
+function openWizardFieldForColumn(preview, config, header, rerender) {
+  if (!state.user.canManageCustomerFields) {
+    toast("当前账号没有表头管理权限，请联系管理员新增表头");
+    return;
+  }
+  openFieldForm({
+    label: header,
+    fromImport: true,
+    onCreated: (field) => {
+      Object.values(state.importWizard?.previews || {}).forEach((item) => {
+        item.customerFields = item.customerFields || [];
+        if (!item.customerFields.some((existing) => existing.id === field.id)) item.customerFields.push(field);
+      });
+      preview.suggestedCustomMapping = {...(preview.suggestedCustomMapping || {}), [field.id]: header};
+      config.sourceMap[header] = `custom:${field.id}`;
+      rerender();
+    },
+  });
 }
 
 function renderWizardGenericSheet(preview) {
@@ -1344,6 +1426,10 @@ function renderWizardGenericSheet(preview) {
   const rows = preview.rows || [];
   const headers = preview.headers || [];
   const invalidateImpact = () => { const root = workspace.querySelector("#wizard-impact"); if (root) root.innerHTML = ""; state.importWizard.impact = null; };
+  workspace.querySelectorAll("[data-wizard-create-field]").forEach((button) => button.addEventListener("click", () => {
+    const header = headers[Number(button.dataset.wizardCreateField)];
+    openWizardFieldForColumn(preview, config, header, () => renderWizardGenericSheet(preview));
+  }));
   const updateSelectionState = () => {
     const mappedColumns = headers.filter((header) => config.sourceMap?.[header]).length;
     const count = workspace.querySelector("#wizard-selection-count");
@@ -1472,13 +1558,106 @@ function renderWizardSpecialSheet(preview) {
   const isActivity = preview.importProfile === "hongan_activity";
   const activity = preview.honganActivity || {};
   const counts = isActivity ? activity.counts || {} : preview.pinyinHolding?.counts || {};
-  const stats = isActivity ? [["活动记录", activity.totalRows], ["可自动补全", counts.autoFill], ["已有一致", counts.unchanged], ["需复核", (counts.conflicts || 0) + (counts.ambiguous || 0)], ["未匹配", counts.unmatched]] : [["持仓记录", preview.totalRows], ["可写入", counts.matched], ["同名待确认", counts.ambiguous], ["未匹配", counts.unmatched]];
-  const message = isActivity ? "此标签页符合港安活动分表格式。系统只处理“保险经纪人/港安顾问”，不会修改骄阳当前负责人、开户人、金额或定增信息。" : "此标签页是没有 TW 编号的拼音持仓表。系统只会写入唯一匹配客户的持仓快照，不会新建客户。";
+  const stats = isActivity ? [["整表记录", activity.totalRows], ["可自动补全", counts.autoFill], ["已有一致", counts.unchanged], ["需复核", (counts.conflicts || 0) + (counts.ambiguous || 0)], ["可选择新建", counts.createEligible], ["未填港安顾问", counts.noAdvisor]] : [["持仓记录", preview.totalRows], ["可写入", counts.matched], ["同名待确认", counts.ambiguous], ["未匹配", counts.unmatched]];
+  const message = isActivity ? "先在原表预览中勾选需要处理的行和列。系统按姓名匹配客户；默认只选择姓名与港安顾问，其他资料由你明确选择后才写入。" : "此标签页是没有 TW 编号的拼音持仓表。系统只会写入唯一匹配客户的持仓快照，不会新建客户。";
   const allowed = isActivity ? state.user.canManageAdvisorBindings : true;
-  workspace.querySelector(".section-body").innerHTML = `${wizardProgressMarkup(preview)}<div class="wizard-step-header"><div><span class="wizard-kicker">专用安全导入</span><h4>${isActivity ? "港安活动分表" : "中阳拼音持仓表"}</h4><p>${esc(message)}</p></div><span class="import-profile">专用规则</span></div><section class="wizard-special-summary"><div class="wizard-impact-grid">${stats.map(([label, value]) => `<div><b>${Number(value || 0)}</b><span>${esc(label)}</span></div>`).join("")}</div>${(preview.warnings || []).length ? `<ul>${preview.warnings.map((warning) => `<li>${esc(warning.message)}</li>`).join("")}</ul>` : ""}</section><label class="import-consent wizard-special-consent"><input id="wizard-confirm-special" type="checkbox" ${allowed ? "" : "disabled"}><span>${isActivity ? "我确认只补全唯一匹配且当前为空的港安顾问，不覆盖已有港安顾问，也不修改骄阳负责人。" : "我确认只写入唯一匹配的拼音持仓记录；同名或未匹配记录会进入导入复核。"}</span></label>${allowed ? "" : `<div class="notice">此账号尚未开通“顾问绑定”权限，不能执行港安顾问补全。</div>`}<div class="wizard-footer"><button class="secondary-btn" id="wizard-back-sheets">返回工作表选择</button><button class="primary-btn" id="wizard-commit-special" ${allowed ? "" : "disabled"}>确认导入此工作表</button></div>`;
+  const canCreateActivityCustomers = allowed && state.user.customerScope === "all";
+  const config = isActivity ? wizardConfig(preview) : null;
+  const createOption = isActivity && Number(counts.createEligible || 0) ? `<label class="import-consent wizard-create-customer-option"><input id="wizard-create-hongan-customers" type="checkbox" ${config.createUnmatchedHonganCustomers ? "checked" : ""} ${canCreateActivityCustomers ? "" : "disabled"}><span><strong>将所选行中未找到的姓名先建为客户</strong><small>新客户会保存你勾选的资料和活动来源，并标记为“等待券商 TW 编号”；骄阳负责人仍进入待分配。以后导入带 TW 的客户表时，唯一姓名且顾问一致的记录会补回同一位客户。${canCreateActivityCustomers ? "" : " 当前账号需先开通全量数据范围。"}</small></span></label>` : "";
+  const grid = isActivity ? wizardGridMarkup(preview, config) : "";
+  workspace.querySelector(".section-body").innerHTML = `${wizardProgressMarkup(preview)}<div class="wizard-step-header"><div><span class="wizard-kicker">${isActivity ? "步骤 2 / 3" : "专用安全导入"}</span><h4>${isActivity ? "港安活动分表" : "中阳拼音持仓表"}</h4><p>${esc(message)}</p></div><span class="import-profile">专用规则</span></div><section class="wizard-special-summary"><div class="wizard-impact-grid">${stats.map(([label, value]) => `<div><b>${Number(value || 0)}</b><span>${esc(label)}</span></div>`).join("")}</div>${(preview.warnings || []).length ? `<ul>${preview.warnings.map((warning) => `<li>${esc(warning.message)}</li>`).join("")}</ul>` : ""}${isActivity ? `<p class="wizard-special-summary-note">以上是整张表的初始预判；实际导入只处理下方勾选的行和列。</p>` : ""}</section>${grid}<div class="wizard-special-options">${createOption}<label class="import-consent wizard-special-consent"><input id="wizard-confirm-special" type="checkbox" ${allowed ? "" : "disabled"}><span>${isActivity ? "我确认只写入上方明确勾选的列；已有港安顾问不会自动覆盖，“骄阳现场开户人”只有映射到历史标签时才保存，且不会改变当前负责人。" : "我确认只写入唯一匹配的拼音持仓记录；同名或未匹配记录会进入导入复核。"}</span></label></div>${allowed ? "" : `<div class="notice">此账号尚未开通“顾问绑定”权限，不能执行港安顾问补全。</div>`}<div class="wizard-footer"><button class="secondary-btn" id="wizard-back-sheets">返回工作表选择</button><button class="primary-btn" id="wizard-commit-special" ${allowed ? "" : "disabled"}>确认导入此工作表</button></div>`;
   workspace.querySelector("#wizard-back-sheets")?.addEventListener("click", renderWizardSheetPicker);
+  if (isActivity) {
+    const rows = preview.rows || [];
+    const headers = preview.headers || [];
+    const rerender = () => renderWizardSpecialSheet(preview);
+    const updateSelectionState = () => {
+      const mappedColumns = headers.filter((header) => config.sourceMap?.[header]).length;
+      const count = workspace.querySelector("#wizard-selection-count");
+      if (count) count.textContent = `已选 ${config.selectedRows.size} 行 · ${mappedColumns} 列`;
+      workspace.querySelectorAll("[data-wizard-row]").forEach((input) => input.closest("tr")?.classList.toggle("is-excluded", !input.checked));
+      const pageInputs = [...workspace.querySelectorAll("[data-wizard-row]")];
+      const pageToggle = workspace.querySelector("#wizard-page-toggle");
+      if (pageToggle) {
+        pageToggle.checked = Boolean(pageInputs.length) && pageInputs.every((input) => input.checked);
+        pageToggle.indeterminate = pageInputs.some((input) => input.checked) && !pageToggle.checked;
+      }
+    };
+    workspace.querySelectorAll("[data-wizard-create-field]").forEach((button) => button.addEventListener("click", () => {
+      const header = headers[Number(button.dataset.wizardCreateField)];
+      openWizardFieldForColumn(preview, config, header, rerender);
+    }));
+    workspace.querySelectorAll("[data-wizard-row]").forEach((input) => input.addEventListener("change", () => {
+      const rowIndex = Number(input.dataset.wizardRow);
+      if (input.checked) config.selectedRows.add(rowIndex); else config.selectedRows.delete(rowIndex);
+      updateSelectionState();
+    }));
+    workspace.querySelector("#wizard-page-toggle")?.addEventListener("change", (event) => {
+      workspace.querySelectorAll("[data-wizard-row]").forEach((input) => {
+        input.checked = event.currentTarget.checked;
+        const rowIndex = Number(input.dataset.wizardRow);
+        if (input.checked) config.selectedRows.add(rowIndex); else config.selectedRows.delete(rowIndex);
+      });
+      updateSelectionState();
+    });
+    workspace.querySelectorAll("[data-wizard-column-select]").forEach((select) => select.addEventListener("change", () => {
+      const columnIndex = Number(select.dataset.wizardColumnSelect);
+      const header = headers[columnIndex];
+      config.sourceMap[header] = select.value;
+      if (select.value) select.dataset.lastTarget = select.value;
+      const toggle = workspace.querySelector(`[data-wizard-column-toggle="${columnIndex}"]`);
+      if (toggle) toggle.checked = Boolean(select.value);
+      workspace.querySelectorAll(`[data-wizard-col-index="${columnIndex}"]`).forEach((cell) => {
+        cell.classList.toggle("is-included", Boolean(select.value));
+        cell.classList.toggle("is-excluded", !select.value);
+      });
+      updateSelectionState();
+    }));
+    workspace.querySelectorAll("[data-wizard-column-toggle]").forEach((toggle) => toggle.addEventListener("change", () => {
+      const columnIndex = Number(toggle.dataset.wizardColumnToggle);
+      const select = workspace.querySelector(`[data-wizard-column-select="${columnIndex}"]`);
+      if (!toggle.checked) {
+        if (select.value) select.dataset.lastTarget = select.value;
+        select.value = "";
+        select.dispatchEvent(new Event("change"));
+        return;
+      }
+      const restoredTarget = select.dataset.lastTarget || "";
+      if (!restoredTarget) {
+        toggle.checked = false;
+        const header = headers[columnIndex];
+        if (state.user.canManageCustomerFields) openWizardFieldForColumn(preview, config, header, rerender);
+        else toast("这一列没有对应的系统表头，请联系有表头管理权限的同事新增表头");
+        return;
+      }
+      select.value = restoredTarget;
+      select.dispatchEvent(new Event("change"));
+    }));
+    workspace.querySelector("#wizard-select-all-rows")?.addEventListener("click", () => { config.selectedRows = new Set(rows.map((_, index) => index)); config.rangeStart = rows.length ? 1 : 0; config.rangeEnd = rows.length; rerender(); });
+    workspace.querySelector("#wizard-clear-rows")?.addEventListener("click", () => { config.selectedRows = new Set(); rerender(); });
+    workspace.querySelector("#wizard-apply-range")?.addEventListener("click", () => {
+      const start = Number(workspace.querySelector("#wizard-range-start")?.value);
+      const end = Number(workspace.querySelector("#wizard-range-end")?.value);
+      if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end > rows.length) { toast(`请输入 1 到 ${rows.length} 之间的有效起止行`); return; }
+      config.rangeStart = start; config.rangeEnd = end; config.page = Math.ceil(start / WIZARD_GRID_PAGE_SIZE);
+      config.selectedRows = new Set(Array.from({length: end - start + 1}, (_, index) => start - 1 + index));
+      rerender();
+    });
+    workspace.querySelector("#wizard-prev-page")?.addEventListener("click", () => { wizardReadConfig(); config.page -= 1; rerender(); });
+    workspace.querySelector("#wizard-next-page")?.addEventListener("click", () => { wizardReadConfig(); config.page += 1; rerender(); });
+    workspace.querySelector("#wizard-create-hongan-customers")?.addEventListener("change", (event) => { config.createUnmatchedHonganCustomers = event.currentTarget.checked; });
+    updateSelectionState();
+  }
   workspace.querySelector("#wizard-commit-special")?.addEventListener("click", () => {
     if (!workspace.querySelector("#wizard-confirm-special")?.checked) { toast("请先确认本次专用导入的处理范围"); return; }
+    if (isActivity) {
+      const currentConfig = wizardReadConfig();
+      const targets = Object.values(currentConfig.sourceMap || {}).filter(Boolean);
+      if (!targets.includes("name")) { toast("港安活动分表必须选择一列作为客户姓名"); return; }
+      if (!currentConfig.selectedRows.size) { toast("请至少勾选一行要导入的记录"); return; }
+      const duplicateTargets = targets.filter((target, index) => targets.indexOf(target) !== index);
+      if (duplicateTargets.length) { toast("同一个系统字段不能映射两列，请保留一列或选择“不导入”"); return; }
+    }
     commitWizardSheet();
   });
 }
@@ -1487,7 +1666,10 @@ async function commitWizardSheet() {
   const preview = wizardPreview();
   if (!wizard || !preview) return;
   let payload;
-  if (preview.importProfile === "hongan_activity") payload = {filename: `${wizard.file.name} · ${preview.sheetName}`, importProfile: "hongan_activity", confirmHonganActivity: true, rows: preview.activityRows || []};
+  if (preview.importProfile === "hongan_activity") {
+    const config = wizardReadConfig();
+    payload = {filename: `${wizard.file.name} · ${preview.sheetName}`, importProfile: "hongan_activity", confirmHonganActivity: true, createUnmatchedHonganCustomers: Boolean(config.createUnmatchedHonganCustomers), rows: wizardRows(preview, config)};
+  }
   else if (preview.importProfile === "holding_pinyin") {
     const quantityHeader = preview.suggestedMapping?.holdingQuantity;
     const nameHeader = preview.suggestedMapping?.name;

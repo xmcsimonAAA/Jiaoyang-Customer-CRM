@@ -562,6 +562,7 @@ class ImportCommitPayload(BaseModel):
     advisorAliasMappings: dict[str, str] = Field(default_factory=dict)
     allowUnidentifiedRows: bool = False
     confirmHonganActivity: bool = False
+    createUnmatchedHonganCustomers: bool = False
     confirmPinyinHolding: bool = False
 
 
@@ -1592,6 +1593,93 @@ def add_tw_identifier(conn: sqlite3.Connection, customer_id: str, tw_code: str) 
         )
 
 
+def pending_hongan_customer_for_tw(conn: Any, row: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    """Find a customer created from an activity sheet before a TW number existed."""
+    name_key = normalized_activity_name(row.get("name", ""))
+    if not name_key:
+        return None, ""
+    candidates = [dict(item) for item in conn.execute(
+        """SELECT c.* FROM customers c
+        WHERE c.archived_at IS NULL AND c.source='线下沙龙'
+        AND c.source_detail LIKE ?
+        AND REPLACE(REPLACE(LOWER(TRIM(c.name)), ' ', ''), '　', '')=?
+        AND NOT EXISTS (
+            SELECT 1 FROM customer_identifiers i WHERE i.customer_id=c.id AND i.kind='tw'
+        )""",
+        (f"{HONGAN_ACTIVITY_SOURCE_PREFIX}%", name_key),
+    ).fetchall()]
+    candidates = [item for item in candidates if normalized_activity_name(item.get("name", "")) == name_key]
+    if not candidates:
+        return None, ""
+    if len(candidates) > 1:
+        return None, "同名的待补 TW 客户不止一条，请在导入复核中人工选择。"
+    candidate = candidates[0]
+    incoming_advisor = simplify_text(row.get("hkAdvisor", row.get("hongan_advisor", ""))).strip().casefold()
+    current_advisor = simplify_text(candidate.get("hongan_advisor", "")).strip().casefold()
+    if incoming_advisor and current_advisor and incoming_advisor != current_advisor:
+        return None, "姓名与待补 TW 客户相同，但港安顾问不同，请人工确认。"
+    return candidate, ""
+
+
+def reconcile_pending_hongan_customer(
+    conn: Any, current: dict[str, Any], row: dict[str, Any], tw_code: str, user: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Attach a TW number and fill only blank identity fields on a pending activity customer."""
+    phone = str(clean_import_cell(row.get("phone", "")) or "").strip()
+    email = str(clean_import_cell(row.get("email", "")) or "").strip()
+    if phone and not str(current.get("phone", "") or "").strip() and duplicate_matches(conn, phone, "", current["id"]):
+        raise HTTPException(409, "手机号已属于另一位客户，请在导入复核中人工确认。")
+    if email and not str(current.get("email", "") or "").strip() and duplicate_matches(conn, "", email, current["id"]):
+        raise HTTPException(409, "邮箱已属于另一位客户，请在导入复核中人工确认。")
+
+    updates: dict[str, Any] = {}
+    fill_when_blank = {
+        "wechat_nickname": row.get("wechatNickname", ""),
+        "phone": phone,
+        "email": email,
+        "company": row.get("company", ""),
+        "account_broker": row.get("accountBroker", ""),
+        "account_opened_at": row.get("accountOpenedAt"),
+    }
+    for field, raw_value in fill_when_blank.items():
+        value = clean_import_cell(raw_value)
+        if value not in (None, "") and not str(current.get(field, "") or "").strip():
+            updates[field] = value
+
+    account_status = str(row.get("accountStatus", "") or "").strip()
+    if account_status in ACCOUNT_STATUSES and account_status != current.get("account_status"):
+        updates["account_status"] = account_status
+    incoming_advisor = str(row.get("hkAdvisor", row.get("hongan_advisor", "")) or "").strip()
+    if incoming_advisor and not str(current.get("hongan_advisor", "") or "").strip():
+        require_hongan_advisor_permission(user, incoming_advisor)
+        updates["hongan_advisor"] = incoming_advisor
+    try:
+        deposit_amount = parse_import_amount(row.get("brokerDepositAmount", 0), "入金金额")
+    except HTTPException:
+        deposit_amount = 0
+    if deposit_amount > 0 and float(current.get("broker_deposit_amount", 0) or 0) == 0:
+        updates["broker_deposit_amount"] = deposit_amount
+    current_notes = str(current.get("notes", "") or "").strip()
+    if "等待券商 TW 编号" in current_notes.splitlines():
+        updates["notes"] = "\n".join(line for line in current_notes.splitlines() if line.strip() != "等待券商 TW 编号").strip()
+
+    changes = {key: {"from": current.get(key), "to": value} for key, value in updates.items()}
+    timestamp = now_iso()
+    if updates:
+        assignments = ", ".join(f"{key}=?" for key in updates)
+        conn.execute(
+            f"UPDATE customers SET {assignments}, updated_at=?, version=version+1 WHERE id=?",
+            (*updates.values(), timestamp, current["id"]),
+        )
+    else:
+        conn.execute("UPDATE customers SET updated_at=?, version=version+1 WHERE id=?", (timestamp, current["id"]))
+    add_tw_identifier(conn, current["id"], tw_code)
+    add_identifiers(conn, current["id"], phone if "phone" in updates else "", email if "email" in updates else "")
+    changes["tw_code"] = {"from": "", "to": tw_code}
+    audit(conn, user, "customer.pending_tw_reconciled", "customer", current["id"], {"twCode": tw_code, "changes": changes})
+    return changes
+
+
 def update_broker_snapshot_customer(conn: sqlite3.Connection, current: dict[str, Any], row: dict[str, Any], tw_code: str, user: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Apply only broker-authoritative fields; preserve internal ownership and workflow."""
     updates: dict[str, Any] = {}
@@ -2039,6 +2127,8 @@ def legacy_import_review_items(job: dict[str, Any]) -> list[dict[str, Any]]:
         quality = json.loads(job.get("data_quality_json") or "{}")
     except (TypeError, json.JSONDecodeError):
         quality = {}
+    if quality.get("reviewItemsPersisted"):
+        return []
     activity = quality.get("activity") or {}
     result = []
     for category in ("conflicts", "ambiguous", "unmatched"):
@@ -2818,15 +2908,15 @@ HEADER_ALIASES = {
     "email": ["邮箱", "电子邮箱", "email"], "company": ["公司", "公司名称", "机构", "单位"],
     "source": ["客户来源", "来源", "渠道"], "sourceDetail": ["来源明细", "活动名称", "渠道名称"],
     "stage": ["客户阶段", "当前阶段", "生命周期", "状态"], "priority": ["优先级", "客户级别"],
-    "accountStatus": ["开户状态", "是否完成开户", "港券开户状态", "证券开户状态"], "accountBroker": ["开户券商", "香港券商", "券商", "开户证券"], "accountOpenedAt": ["开户日期", "注册日期"],
+    "accountStatus": ["开户状态", "是否完成开户", "是否开券商户", "港券开户状态", "证券开户状态"], "accountBroker": ["开户券商", "香港券商", "券商", "开户证券"], "accountOpenedAt": ["开户日期", "注册日期"],
     "twCode": ["TW编号", "TW客户编号", "客户唯一编号", "客户编号", "客户编码", "客户代码", "客户号"],
     "brokerDepositAmount": ["入金金额/USD", "入金金额", "港券入金金额", "券商账户资产", "客户权益资产", "账户权益资产", "账户资产", "权益资产"], "capitalDestination": ["资金流向", "资金去向"],
-    "hkAdvisor": ["港安顾问", "保险经纪人"], "sourceAdvisorLabel": ["骄阳顾问", "商务顾问", "客户顾问"],
+    "hkAdvisor": ["港安顾问", "保险经纪人"], "sourceAdvisorLabel": ["骄阳顾问", "骄阳现场开户人", "商务顾问", "客户顾问"],
     "intentStatus": ["定增意向", "意向状态", "顾问判断"], "placementStatus": ["定增推进", "节点进度", "定增状态"], "batchName": ["定增批次", "批次名称", "批次"],
     "status": ["本批状态", "参与状态", "定增参与状态", "是否参与定增", "是否参加定增", "参与定增"],
-    "intentAmount": ["意向金额", "意向额度", "意向额度(USD)"], "fundedAmount": ["到账金额", "到账金额(USD)"],
+    "intentAmount": ["意向金额", "意向定增金额", "意向额度", "意向额度(USD)"], "fundedAmount": ["到账金额", "到账金额(USD)"],
     "actualAmount": ["实际参与金额", "实际定增", "定增金额"], "lostReason": ["流失原因", "取消原因"],
-    "notes": ["备注", "情况说明", "最新跟进"],
+    "notes": ["备注", "备注说明", "情况说明", "最新跟进"],
 }
 
 
@@ -3503,6 +3593,8 @@ HONGAN_ACTIVITY_HEADERS = {
     "notes": ("备注说明", "备注"),
 }
 
+HONGAN_ACTIVITY_SOURCE_PREFIX = "港安活动分表 · "
+
 
 def normalized_activity_name(value: Any) -> str:
     """Normalize names only for matching; the original display value is retained."""
@@ -3610,16 +3702,16 @@ def hongan_activity_match_diagnostics(conn: Any, rows: list[dict[str, Any]], lim
         advisors = group["advisors"]
         candidates = by_name.get(key, [])
         summary = {"name": group["name"], "advisors": advisors, "sourceAdvisors": group.get("sourceAdvisors", []), "rows": group["rows"], "sourceSheet": group.get("sourceSheet", "")}
+        candidate_items = [{
+            "customerId": candidate["id"],
+            "customerCode": candidate.get("customer_code", ""),
+            "customerName": candidate.get("name", ""),
+            "twCode": candidate.get("tw_code", "") or "",
+            "currentAdvisor": candidate.get("hongan_advisor", "") or "",
+        } for candidate in candidates]
         if not advisors:
-            result["noAdvisor"].append(summary)
+            result["noAdvisor"].append({**summary, "candidateCount": len(candidates), "candidates": candidate_items})
         elif len(candidates) != 1:
-            candidate_items = [{
-                "customerId": candidate["id"],
-                "customerCode": candidate.get("customer_code", ""),
-                "customerName": candidate.get("name", ""),
-                "twCode": candidate.get("tw_code", "") or "",
-                "currentAdvisor": candidate.get("hongan_advisor", "") or "",
-            } for candidate in candidates]
             result["ambiguous" if len(candidates) > 1 else "unmatched"].append({
                 **summary, "candidateCount": len(candidates), "candidates": candidate_items,
             })
@@ -3630,11 +3722,172 @@ def hongan_activity_match_diagnostics(conn: Any, rows: list[dict[str, Any]], lim
             target = advisors[0]
             detail = {**summary, "customerId": candidates[0]["id"], "customerCode": candidates[0]["customer_code"], "currentAdvisor": current, "targetAdvisor": target}
             result["autoFill" if not current else "unchanged" if simplify_text(current) == simplify_text(target) else "conflicts"].append(detail)
+    creation_candidates = [*result["unmatched"], *(item for item in result["noAdvisor"] if item.get("candidateCount") == 0)]
+    counts = {key: len(value) for key, value in result.items()}
+    counts["createEligible"] = len(creation_candidates)
     return {
         "totalRows": len(rows), "uniqueNames": len(grouped), "rowsWithAdvisor": sum(item["rows"] for item in grouped.values() if item["advisors"]),
-        "counts": {key: len(value) for key, value in result.items()},
+        "counts": counts,
+        "creationCandidates": creation_candidates if limit is None else creation_candidates[:limit],
         **{key: value if limit is None else value[:limit] for key, value in result.items()},
     }
+
+
+HONGAN_ACTIVITY_IMPORT_FIELDS = {
+    "wechatNickname": "wechat_nickname", "phone": "phone", "email": "email", "company": "company",
+    "stage": "stage", "priority": "priority", "accountStatus": "account_status", "accountBroker": "account_broker",
+    "accountOpenedAt": "account_opened_at", "brokerDepositAmount": "broker_deposit_amount",
+    "capitalDestination": "capital_destination", "intentStatus": "intent_status", "placementStatus": "placement_status",
+    "intentAmount": "intent_amount", "fundedAmount": "funded_amount", "actualAmount": "actual_amount",
+    "lostReason": "lost_reason", "sourceAdvisorLabel": "source_advisor_label", "notes": "notes",
+}
+HONGAN_ACTIVITY_AMOUNT_FIELDS = {
+    "brokerDepositAmount": "入金金额", "intentAmount": "意向金额", "fundedAmount": "到账金额", "actualAmount": "实际参与金额",
+}
+
+
+def normalized_hongan_activity_import_value(field: str, raw_value: Any) -> Any:
+    value = clean_import_cell(raw_value)
+    if value in (None, ""):
+        return None
+    if field in HONGAN_ACTIVITY_AMOUNT_FIELDS:
+        return parse_import_amount(value, HONGAN_ACTIVITY_AMOUNT_FIELDS[field])
+    if field == "accountOpenedAt":
+        normalized = normalize_import_date(value)
+        if not normalized:
+            raise HTTPException(422, "开户日期必须使用 YYYY-MM-DD 格式。")
+        return normalized
+    if field == "accountStatus":
+        normalized = ACCOUNT_STATUS_IMPORT_MAP.get(str(value).strip(), str(value).strip())
+        if normalized not in ACCOUNT_STATUSES:
+            raise HTTPException(422, f"开户状态“{value}”不在系统选项中。")
+        return normalized
+    if field == "intentStatus" and str(value).strip() not in INTENT_STATUSES:
+        raise HTTPException(422, f"定增意向“{value}”不在系统选项中。")
+    if field == "placementStatus" and str(value).strip() not in PLACEMENT_STATUSES:
+        raise HTTPException(422, f"定增推进“{value}”不在系统选项中。")
+    if field == "stage" and str(value).strip() not in STAGES:
+        raise HTTPException(422, f"客户阶段“{value}”不在系统选项中。")
+    return str(value).strip()
+
+
+def merge_hongan_activity_selected_rows(rows: list[dict[str, Any]]) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    """Merge repeated names only when their selected values agree."""
+    grouped: dict[str, dict[str, Any]] = {}
+    conflicts: list[dict[str, Any]] = []
+    for raw_row in rows:
+        key = normalized_activity_name(raw_row.get("name", ""))
+        if not key:
+            continue
+        target = grouped.setdefault(key, {
+            "name": str(clean_import_cell(raw_row.get("name", "")) or "").strip(),
+            "sourceSheet": str(raw_row.get("sourceSheet", "") or "").strip(),
+            "sourceRow": raw_row.get("sourceRow"), "customValues": {},
+        })
+        for field in ("hkAdvisor", *HONGAN_ACTIVITY_IMPORT_FIELDS):
+            if field not in raw_row:
+                continue
+            value = clean_import_cell(raw_row.get(field))
+            if value in (None, ""):
+                continue
+            previous = target.get(field)
+            if previous not in (None, "") and simplify_text(previous).strip().casefold() != simplify_text(value).strip().casefold():
+                conflicts.append({"name": target["name"], "field": field, "detail": f"同一姓名在所选行中出现不同的“{field}”值，该字段未写入。"})
+                target.pop(field, None)
+                target.setdefault("__conflictedFields", set()).add(field)
+            elif field not in target.get("__conflictedFields", set()):
+                target[field] = value
+        for field_id, value in (raw_row.get("customValues") or {}).items():
+            value = clean_import_cell(value)
+            if value in (None, ""):
+                continue
+            previous = target["customValues"].get(field_id)
+            conflict_key = f"custom:{field_id}"
+            if previous not in (None, "") and simplify_text(previous).strip().casefold() != simplify_text(value).strip().casefold():
+                conflicts.append({"name": target["name"], "field": conflict_key, "detail": "同一姓名在所选行中的自定义字段值不一致，该字段未写入。"})
+                target["customValues"].pop(field_id, None)
+                target.setdefault("__conflictedFields", set()).add(conflict_key)
+            elif conflict_key not in target.get("__conflictedFields", set()):
+                target["customValues"][field_id] = value
+    for row in grouped.values():
+        row.pop("__conflictedFields", None)
+        if not row["customValues"]:
+            row.pop("customValues")
+    return grouped, conflicts
+
+
+def apply_hongan_activity_selected_values(
+    conn: Any, current: dict[str, Any], raw_row: dict[str, Any], user: dict[str, Any], allow_advisor_overwrite: bool = False,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any] | None]:
+    """Apply only explicitly selected, non-empty activity values to one matched customer."""
+    updates: dict[str, Any] = {}
+    incoming_advisor = str(clean_import_cell(raw_row.get("hkAdvisor", "")) or "").strip()
+    current_advisor = str(current.get("hongan_advisor", "") or "").strip()
+    if incoming_advisor and (not current_advisor or allow_advisor_overwrite) and simplify_text(incoming_advisor) != simplify_text(current_advisor):
+        require_hongan_advisor_permission(user, incoming_advisor)
+        updates["hongan_advisor"] = incoming_advisor
+    for field, database_field in HONGAN_ACTIVITY_IMPORT_FIELDS.items():
+        if field not in raw_row:
+            continue
+        value = normalized_hongan_activity_import_value(field, raw_row.get(field))
+        if value is None or current.get(database_field) == value:
+            continue
+        updates[database_field] = value
+    phone = str(updates.get("phone", current.get("phone", "")) or "").strip()
+    email = str(updates.get("email", current.get("email", "")) or "").strip()
+    if ("phone" in updates or "email" in updates) and duplicate_matches(conn, phone, email, current["id"]):
+        raise HTTPException(409, "手机号或邮箱已属于另一位客户，请转入人工复核。")
+
+    incoming_custom = {field_id: value for field_id, value in (raw_row.get("customValues") or {}).items() if clean_import_cell(value) not in (None, "")}
+    custom_before: dict[str, str | None] = {}
+    custom_changes: dict[str, dict[str, Any]] = {}
+    if incoming_custom:
+        placeholders = ",".join("?" for _ in incoming_custom)
+        fields = conn.execute(f"SELECT * FROM customer_fields WHERE active=1 AND id IN ({placeholders})", tuple(incoming_custom)).fetchall()
+        field_map = {field["id"]: field for field in fields}
+        if len(field_map) != len(incoming_custom):
+            raise HTTPException(422, "包含不存在或已停用的自定义表头，请刷新后重新选择。")
+        existing_values = {
+            row["field_id"]: row["value_text"] for row in conn.execute(
+                f"SELECT field_id, value_text FROM customer_field_values WHERE customer_id=? AND field_id IN ({placeholders})",
+                (current["id"], *incoming_custom),
+            ).fetchall()
+        }
+        for field_id, raw_value in incoming_custom.items():
+            value = normalize_custom_value(field_map[field_id], raw_value)
+            previous = existing_values.get(field_id)
+            if previous == value:
+                continue
+            custom_before[field_id] = previous
+            custom_changes[f"custom:{field_id}"] = {"from": previous or "", "to": value}
+
+    changes = {field: {"from": current.get(field), "to": value} for field, value in updates.items()}
+    changes.update(custom_changes)
+    if not changes:
+        return {}, None
+    before_version = int(current.get("version", 1))
+    timestamp = now_iso()
+    if updates:
+        assignments = ", ".join(f"{field}=?" for field in updates)
+        conn.execute(f"UPDATE customers SET {assignments}, updated_at=?, version=version+1 WHERE id=?", (*updates.values(), timestamp, current["id"]))
+    else:
+        conn.execute("UPDATE customers SET updated_at=?, version=version+1 WHERE id=?", (timestamp, current["id"]))
+    if custom_changes:
+        save_custom_values(conn, current["id"], {field_id: incoming_custom[field_id] for field_id in custom_before}, user)
+    if "phone" in updates:
+        conn.execute("DELETE FROM customer_identifiers WHERE customer_id=? AND kind='phone'", (current["id"],))
+    if "email" in updates:
+        conn.execute("DELETE FROM customer_identifiers WHERE customer_id=? AND kind='email'", (current["id"],))
+    if "phone" in updates or "email" in updates:
+        add_identifiers(conn, current["id"], phone, email)
+    snapshot = {
+        "before": {field: current.get(field) for field in updates}, "customBefore": custom_before,
+        "beforeVersion": before_version, "afterVersion": before_version + 1,
+    }
+    audit(conn, user, "customer.hongan_activity_fields_updated", "customer", current["id"], {
+        "sourceSheet": raw_row.get("sourceSheet", ""), "sourceRow": raw_row.get("sourceRow"), "changes": changes,
+    })
+    return changes, snapshot
 
 
 def decode_import_upload(filename: str, data_base64: str) -> bytes:
@@ -3677,32 +3930,65 @@ def import_preview(payload: ImportPreviewPayload, user: dict[str, Any] = Depends
     except Exception as exc:
         raise HTTPException(422, "无法解析该文件，请确认文件未损坏，或另存为新的 .xlsx 后重试。") from exc
     if activity_workbook:
-        activity_headers = ["客户姓名", "保险经纪人", "是否开券商户", "入金金额", "骄阳现场开户人", "中阳见证人", "客户类型", "是否签署定增协议", "意向定增金额", "备注说明", "来源分表", "来源行"]
         with db() as conn:
             activity_diagnostics = hongan_activity_match_diagnostics(conn, activity_workbook["rows"])
+            custom_fields = conn.execute("SELECT * FROM customer_fields WHERE active=1 ORDER BY display_order, created_at").fetchall()
         counts = activity_diagnostics["counts"]
         warnings = [
-            {"code": "hongan_activity", "message": f"已读取 {activity_workbook['recognizedSheets']} 个活动分表；只会补全唯一匹配的港安顾问，不会修改骄阳负责人。", "count": counts["autoFill"]},
+            {"code": "hongan_activity", "message": f"已读取 {activity_workbook['recognizedSheets']} 个活动分表；会补全唯一匹配的港安顾问，是否新建未匹配客户由您确认。", "count": counts["autoFill"]},
         ]
         if counts["conflicts"]:
             warnings.append({"code": "hongan_activity_conflict", "message": "港安顾问发生变化或同一客户在不同活动中出现多个顾问，请人工复核。", "count": counts["conflicts"]})
         if counts["ambiguous"]:
             warnings.append({"code": "hongan_activity_ambiguous", "message": "同名客户对应多条系统记录，未自动更新。", "count": counts["ambiguous"]})
         if counts["unmatched"]:
-            warnings.append({"code": "hongan_activity_unmatched", "message": "活动表中的客户暂未在系统找到，未自动新建。", "count": counts["unmatched"]})
+            warnings.append({"code": "hongan_activity_unmatched", "message": "活动表中的客户暂未在系统找到；可选择先建为待补 TW 客户。", "count": counts["unmatched"]})
+        if counts["noAdvisor"]:
+            warnings.append({"code": "hongan_activity_no_advisor", "message": "部分记录没有保险经纪人；选择新建后会保留为空，之后可补充。", "count": counts["noAdvisor"]})
+        activity_headers = ["客户姓名", "保险经纪人", "是否开券商户", "入金金额", "骄阳现场开户人", "中阳见证人", "客户类型", "是否签署定增协议", "意向定增金额", "备注说明", "来源分表", "来源行"]
+        suggested_mapping: dict[str, str] = {"name": "客户姓名", "hkAdvisor": "保险经纪人"}
+        custom_mapping: dict[str, str] = {}
         preview_rows = [{header: row.get({
             "客户姓名": "name", "保险经纪人": "hkAdvisor", "是否开券商户": "accountStatus", "入金金额": "brokerDepositAmount",
             "骄阳现场开户人": "sourceAdvisorLabel", "中阳见证人": "witness", "客户类型": "customerType", "是否签署定增协议": "signed",
             "意向定增金额": "intentAmount", "备注说明": "notes", "来源分表": "sourceSheet", "来源行": "sourceRow",
         }[header], "") for header in activity_headers} for row in activity_workbook["rows"][:IMPORT_ROW_LIMIT]]
+        if payload.sheetName:
+            source_headers, source_rows, selected_sheet_name = parse_import_file(payload.filename, content, payload.sheetName)
+            full_mapping: dict[str, str] = {}
+            for field, aliases in HEADER_ALIASES.items():
+                match = next((header for header in source_headers if header_alias_matches(header, aliases)), None)
+                if match:
+                    full_mapping[field] = match
+            name_header = full_mapping.get("name", "")
+            preview_rows = []
+            for source_index, source_row in enumerate(source_rows, start=1):
+                values = {header: (source_row[index] if index < len(source_row) and source_row[index] is not None else "") for index, header in enumerate(source_headers)}
+                name = str(clean_import_cell(values.get(name_header, "")) or "").strip()
+                if not name or normalized_activity_name(name) in {"序号", "合计", "总计"}:
+                    continue
+                activity_row = activity_workbook["rows"][len(preview_rows)] if len(preview_rows) < len(activity_workbook["rows"]) else None
+                values["__sourceRow"] = activity_row.get("sourceRow", source_index) if activity_row else source_index
+                preview_rows.append(values)
+            activity_headers = source_headers
+            suggested_mapping = full_mapping
+            for field in custom_fields:
+                match = next((header for header in source_headers if simplify_text(header).strip().casefold() == simplify_text(field["label"]).strip().casefold()), None)
+                if match:
+                    custom_mapping[field["id"]] = match
+            activity_workbook["rows"] = activity_workbook["rows"][:IMPORT_ROW_LIMIT]
+            selected_sheet_name = simplify_text(selected_sheet_name).strip()
+        else:
+            selected_sheet_name = f"港安活动分表（{activity_workbook['recognizedSheets']} 张）"
         return {
-            "headers": activity_headers, "suggestedMapping": {}, "suggestedCustomMapping": {}, "customerFields": [],
-            "rows": preview_rows, "totalRows": len(activity_workbook["rows"]), "truncated": len(activity_workbook["rows"]) > IMPORT_ROW_LIMIT,
+            "headers": activity_headers, "suggestedMapping": suggested_mapping, "suggestedCustomMapping": custom_mapping,
+            "customerFields": [field_dict(row) for row in custom_fields],
+            "rows": preview_rows[:IMPORT_ROW_LIMIT], "totalRows": len(preview_rows), "truncated": len(preview_rows) > IMPORT_ROW_LIMIT,
             "activityRows": activity_workbook["rows"][:IMPORT_ROW_LIMIT],
-            "sheetName": simplify_text(payload.sheetName).strip() if payload.sheetName else f"港安活动分表（{activity_workbook['recognizedSheets']} 张）", "sheetStats": activity_workbook["sheets"],
+            "sheetName": selected_sheet_name, "sheetStats": activity_workbook["sheets"],
             "textNormalization": "繁体中文已统一转换为简体中文", "profile": "hongan_activity", "importProfile": "hongan_activity",
             "warnings": warnings, "honganActivity": activity_diagnostics,
-            "dataQuality": {"importProfile": "hongan_activity", "hasTwSnapshot": False, "honganAutoFill": counts["autoFill"], "honganUnchanged": counts["unchanged"], "honganConflicts": counts["conflicts"], "honganAmbiguous": counts["ambiguous"], "honganUnmatched": counts["unmatched"]},
+            "dataQuality": {"importProfile": "hongan_activity", "hasTwSnapshot": False, "honganAutoFill": counts["autoFill"], "honganUnchanged": counts["unchanged"], "honganConflicts": counts["conflicts"], "honganAmbiguous": counts["ambiguous"], "honganUnmatched": counts["unmatched"], "honganNoAdvisor": counts["noAdvisor"], "honganCreateEligible": counts["createEligible"]},
         }
     try:
         headers, raw_rows, sheet_name = parse_import_file(payload.filename, content, payload.sheetName)
@@ -3762,58 +4048,148 @@ def import_preview(payload: ImportPreviewPayload, user: dict[str, Any] = Depends
 
 def commit_hongan_activity_import(payload: ImportCommitPayload, user: dict[str, Any]) -> dict[str, Any]:
     if not payload.confirmHonganActivity:
-        raise HTTPException(422, "请确认仅补全港安顾问，再提交这批活动分表。")
+        raise HTTPException(422, "请先确认港安活动分表的处理范围。")
     require_advisor_binding_manager(user)
+    if payload.createUnmatchedHonganCustomers and user.get("customerScope") != "all":
+        raise HTTPException(403, "只有全量数据范围的账号可以把活动名单新建到待分配池。")
     if not payload.rows:
         raise HTTPException(422, "活动分表中没有可导入的客户记录。")
-    diagnostics: dict[str, Any]
     created: list[dict[str, Any]] = []
     updated: list[dict[str, Any]] = []
     conflicts: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     unchanged_count = 0
-    assigned_count = 0
     with db() as conn:
         diagnostics = hongan_activity_match_diagnostics(conn, payload.rows, limit=None)
-        review_items = [make_import_review_item("hongan_activity", "conflict", item) for item in diagnostics["conflicts"]]
-        review_items.extend(make_import_review_item("hongan_activity", "ambiguous", item) for item in diagnostics["ambiguous"])
-        review_items.extend(make_import_review_item("hongan_activity", "unmatched", item) for item in diagnostics["unmatched"])
-        auto_fill_ids = {item["customerId"]: item for item in diagnostics["autoFill"]}
-        for customer_id, item in auto_fill_ids.items():
-            advisor = str(item.get("targetAdvisor", "") or "").strip()
-            if not advisor:
-                continue
-            current = conn.execute("SELECT id, customer_code, hongan_advisor, owner_id, owner_name, owner_team FROM customers WHERE id=? AND archived_at IS NULL", (customer_id,)).fetchone()
+        merged_rows, repeated_value_conflicts = merge_hongan_activity_selected_rows(payload.rows)
+
+        def review_for(category: str, item: dict[str, Any]) -> dict[str, Any]:
+            raw_row = merged_rows.get(normalized_activity_name(item.get("name", "")), {})
+            return make_import_review_item("hongan_activity", category, item, raw_row)
+
+        review_items: list[dict[str, Any]] = []
+        for conflict in repeated_value_conflicts:
+            error = {"name": conflict.get("name", ""), "message": conflict.get("detail", "同一姓名的所选字段值不一致，未写入该字段。"), "field": conflict.get("field", "")}
+            errors.append(error)
+            review_items.append(review_for("error", {**conflict, "detail": error["message"]}))
+        review_items.extend(review_for("conflict", item) for item in diagnostics["conflicts"])
+        review_items.extend(review_for("ambiguous", item) for item in diagnostics["ambiguous"])
+        if not payload.createUnmatchedHonganCustomers:
+            pending_creation = [*diagnostics["unmatched"], *(item for item in diagnostics["noAdvisor"] if item.get("candidateCount") == 0)]
+            review_items.extend(review_for("unmatched", item) for item in pending_creation)
+
+        matched_items: dict[str, dict[str, Any]] = {}
+        for category in ("autoFill", "unchanged", "conflicts"):
+            for item in diagnostics[category]:
+                if item.get("customerId"):
+                    matched_items[item["customerId"]] = item
+        for item in diagnostics["noAdvisor"]:
+            candidates = item.get("candidates") or []
+            if len(candidates) == 1:
+                matched_items[candidates[0]["customerId"]] = {**item, **candidates[0]}
+
+        field_snapshots: dict[str, dict[str, Any]] = {}
+        for customer_id, item in matched_items.items():
+            current_row = conn.execute("SELECT * FROM customers WHERE id=? AND archived_at IS NULL", (customer_id,)).fetchone()
+            current = dict(current_row) if current_row else None
             if not current:
                 errors.append({"name": item.get("name", ""), "message": "客户已不存在或已归档，未更新。"})
                 continue
-            if str(current["hongan_advisor"] or "").strip():
-                if simplify_text(str(current["hongan_advisor"])) == simplify_text(advisor):
-                    unchanged_count += 1
+            raw_row = merged_rows.get(normalized_activity_name(item.get("name", "")), {"name": item.get("name", "")})
+            conn.execute("SAVEPOINT hongan_activity_update")
+            try:
+                changes, snapshot = apply_hongan_activity_selected_values(conn, current, raw_row, user)
+                conn.execute("RELEASE SAVEPOINT hongan_activity_update")
+                if changes:
+                    field_snapshots[customer_id] = snapshot or {}
+                    updated.append({"id": customer_id, "customerCode": current["customer_code"], "name": item.get("name", ""), "changes": changes})
                 else:
-                    conflicts.append({"name": item.get("name", ""), "customerCode": current["customer_code"], "currentAdvisor": current["hongan_advisor"], "targetAdvisor": advisor, "detail": "客户资料在预览后发生变化，未覆盖已有顾问。"})
-                continue
-            timestamp = now_iso()
-            update_result = conn.execute("UPDATE customers SET hongan_advisor=?, updated_at=?, version=version+1 WHERE id=? AND archived_at IS NULL AND COALESCE(hongan_advisor, '')=''", (advisor, timestamp, customer_id))
-            if getattr(update_result, "rowcount", 1) != 1:
-                errors.append({"name": item.get("name", ""), "message": "客户资料更新失败，请刷新后重试。"})
-                continue
-            changes = {"hongan_advisor": {"from": "", "to": advisor}}
-            updated.append({"id": customer_id, "customerCode": current["customer_code"], "name": item.get("name", ""), "changes": changes})
-            audit(conn, user, "customer.hongan_advisor_updated_from_activity", "customer", customer_id, {"sourceSheet": item.get("sourceSheet"), "targetAdvisor": advisor, "sourceJiaoyangAdvisor": item.get("sourceAdvisors", []), "sourceRows": item.get("rows", 0)})
+                    unchanged_count += 1
+            except (HTTPException, ValueError) as exc:
+                conn.execute("ROLLBACK TO SAVEPOINT hongan_activity_update")
+                conn.execute("RELEASE SAVEPOINT hongan_activity_update")
+                message = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+                errors.append({"name": item.get("name", ""), "message": message})
+                review_items.append(make_import_review_item("hongan_activity", "error", {**item, "detail": message}, raw_row))
+
+        if payload.createUnmatchedHonganCustomers:
+            for item in diagnostics["creationCandidates"]:
+                advisors = [str(value or "").strip() for value in item.get("advisors", []) if str(value or "").strip()]
+                target_advisor = advisors[0] if len(advisors) == 1 else ""
+                source_sheet = str(item.get("sourceSheet", "") or "").strip()
+                raw_row = merged_rows.get(normalized_activity_name(item.get("name", "")), {"name": item.get("name", "")})
+                conn.execute("SAVEPOINT hongan_activity_create")
+                try:
+                    create_values: dict[str, Any] = {"name": item.get("name", ""), "hkAdvisor": target_advisor}
+                    for field in HONGAN_ACTIVITY_IMPORT_FIELDS:
+                        if field not in raw_row:
+                            continue
+                        value = normalized_hongan_activity_import_value(field, raw_row.get(field))
+                        if value is not None:
+                            create_values[field] = value
+                    create_values["source"] = "线下沙龙"
+                    create_values["sourceDetail"] = f"{HONGAN_ACTIVITY_SOURCE_PREFIX}{source_sheet or raw_row.get('sourceSheet') or '未标日期'}"
+                    create_values.setdefault("stage", "新客户")
+                    source_notes = str(create_values.get("notes", "") or "").strip()
+                    create_values["notes"] = f"{source_notes}\n等待券商 TW 编号".strip()
+                    record = create_customer_record(conn, create_values, dict(UNASSIGNED_OWNER), user)
+                    save_custom_values(conn, record["id"], raw_row.get("customValues", {}), user)
+                    conn.execute("RELEASE SAVEPOINT hongan_activity_create")
+                    created.append({
+                        "id": record["id"], "customerCode": record["customer_code"], "name": record["name"],
+                        "awaitingTw": True, "sourceSheet": source_sheet,
+                    })
+                    if len(advisors) > 1:
+                        review_items.append(make_import_review_item("hongan_activity", "conflict", {
+                            **item,
+                            "customerId": record["id"], "customerCode": record["customer_code"],
+                            "currentAdvisor": "", "detail": "同一姓名在活动表中出现多个港安顾问，新客户已建立，但顾问保持为空。",
+                        }, raw_row))
+                    audit(conn, user, "customer.created_from_hongan_activity", "customer", record["id"], {
+                        "sourceSheet": source_sheet, "honganAdvisor": target_advisor, "awaitingTw": True,
+                    })
+                except (HTTPException, ValueError) as exc:
+                    conn.execute("ROLLBACK TO SAVEPOINT hongan_activity_create")
+                    conn.execute("RELEASE SAVEPOINT hongan_activity_create")
+                    message = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+                    errors.append({"name": item.get("name", ""), "message": message})
+                    review_items.append(make_import_review_item("hongan_activity", "error", {
+                        **item, "detail": message,
+                    }, raw_row))
         job_id = str(uuid4())
         job_created_at = datetime.now(timezone.utc).astimezone().isoformat(timespec="microseconds")
-        quality = {"mode": "hongan_activity", "profile": "hongan_activity", "activity": diagnostics, "unchangedRows": unchanged_count, "assignedOwners": 0}
-        conflict_items = diagnostics["conflicts"] + diagnostics["ambiguous"] + diagnostics["unmatched"]
+        created_ids = [item["id"] for item in created]
+        quality = {
+            "mode": "hongan_activity", "profile": "hongan_activity", "activity": diagnostics,
+            "unchangedRows": unchanged_count, "assignedOwners": 0,
+            "createdAwaitingTw": len(created), "createUnmatchedCustomers": payload.createUnmatchedHonganCustomers,
+            "selectedFields": sorted({key for row in payload.rows for key in row if key not in {"name", "sourceSheet", "sourceRow"}}),
+            "honganFieldSnapshots": field_snapshots, "reviewItemsPersisted": True,
+        }
+        review_conflict_count = sum(1 for item in review_items if item.get("category") != "error")
         conn.execute(
             """INSERT INTO import_jobs(id, filename, owner_id, owner_name, total_rows, created_count, updated_count, conflict_count, error_count, imported_by, imported_by_name, created_at, data_quality_json, created_customer_ids_json, updated_customer_ids_json, opened_customer_ids_json, review_items_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (job_id, payload.filename, UNASSIGNED_OWNER_ID, UNASSIGNED_OWNER["name"], len(payload.rows), 0, len(updated), len(conflicts) + len(conflict_items), len(errors), user["id"], user["name"], job_created_at, json.dumps(quality, ensure_ascii=False), "[]", json.dumps([item["id"] for item in updated], ensure_ascii=False), "[]", json.dumps(review_items, ensure_ascii=False, default=str)),
+            (job_id, payload.filename, UNASSIGNED_OWNER_ID, UNASSIGNED_OWNER["name"], len(payload.rows), len(created), len(updated), len(conflicts) + review_conflict_count, len(errors), user["id"], user["name"], job_created_at, json.dumps(quality, ensure_ascii=False), json.dumps(created_ids, ensure_ascii=False), json.dumps([item["id"] for item in updated], ensure_ascii=False), "[]", json.dumps(review_items, ensure_ascii=False, default=str)),
         )
-        audit(conn, user, "import.hongan_activity_completed", "import_job", job_id, {"updated": len(updated), "assigned": 0, "unchanged": unchanged_count, "conflicts": len(conflicts) + len(conflict_items), "errors": len(errors)})
-    review_items = [{"name": item.get("name", ""), "detail": "港安顾问信息不一致，未覆盖已有顾问。", "currentAdvisor": item.get("currentAdvisor", ""), "targetAdvisor": item.get("targetAdvisor", "")} for item in diagnostics["conflicts"]]
-    review_items.extend({"name": item.get("name", ""), "detail": "同名客户或活动顾问信息不唯一，未自动更新。"} for item in diagnostics["ambiguous"] + diagnostics["unmatched"])
-    return {"jobId": job_id, "mode": "hongan_activity", "profile": "hongan_activity", "created": created, "updated": updated, "assignedCount": 0, "openedCount": 0, "unchangedCount": unchanged_count, "conflicts": conflicts + review_items, "errors": errors, "dataQuality": {"profile": "hongan_activity", "updated": len(updated), "assignedOwners": 0, "unchanged": unchanged_count}}
+        if created_ids:
+            placeholders = ", ".join("?" for _ in created_ids)
+            conn.execute(f"UPDATE customers SET import_job_id=? WHERE id IN ({placeholders})", (job_id, *created_ids))
+        audit(conn, user, "import.hongan_activity_completed", "import_job", job_id, {
+            "created": len(created), "updated": len(updated), "assigned": 0, "unchanged": unchanged_count,
+            "conflicts": len(conflicts) + review_conflict_count, "errors": len(errors),
+        })
+    response_conflicts = [{"name": item.get("name", ""), "detail": "港安顾问信息不一致，未覆盖已有顾问。", "currentAdvisor": item.get("currentAdvisor", ""), "targetAdvisor": item.get("targetAdvisor", "")} for item in diagnostics["conflicts"]]
+    response_conflicts.extend({"name": item.get("name", ""), "detail": "同名客户或活动顾问信息不唯一，未自动更新。"} for item in diagnostics["ambiguous"])
+    if not payload.createUnmatchedHonganCustomers:
+        response_conflicts.extend({"name": item.get("name", ""), "detail": "系统未找到客户，未自动新建。"} for item in diagnostics["unmatched"])
+        response_conflicts.extend({"name": item.get("name", ""), "detail": "记录未填写港安顾问且系统未找到客户，未自动新建。"} for item in diagnostics["noAdvisor"] if item.get("candidateCount") == 0)
+    return {
+        "jobId": job_id, "mode": "hongan_activity", "profile": "hongan_activity", "created": created, "updated": updated,
+        "assignedCount": 0, "openedCount": 0, "unchangedCount": unchanged_count,
+        "conflicts": conflicts + response_conflicts, "errors": errors,
+        "dataQuality": {"profile": "hongan_activity", "createdAwaitingTw": len(created), "updated": len(updated), "assignedOwners": 0, "unchanged": unchanged_count},
+    }
 
 
 def commit_pinyin_holding_import(payload: ImportCommitPayload, user: dict[str, Any]) -> dict[str, Any]:
@@ -4230,7 +4606,8 @@ def import_impact(payload: ImportImpactPayload, user: dict[str, Any] = Depends(c
     counts = {
         "new": 0, "update": 0, "unchanged": 0, "needsConfirmation": 0,
         "missingIdentity": 0, "missingTw": 0, "unknownTw": 0, "potentialDuplicate": 0,
-        "duplicateTw": 0, "filteredRows": len(payload.rows), "mergedRows": duplicate_merge_count,
+        "duplicateTw": 0, "pendingTwReconciled": 0,
+        "filteredRows": len(payload.rows), "mergedRows": duplicate_merge_count,
     }
     samples: dict[str, list[dict[str, Any]]] = {key: [] for key in ("new", "update", "needsConfirmation", "missingTw", "unknownTw", "potentialDuplicate")}
 
@@ -4274,6 +4651,19 @@ def import_impact(payload: ImportImpactPayload, user: dict[str, Any] = Depends(c
                 if existing:
                     counts["update"] += 1
                     add_sample("update", index, row, customerCode=existing["customer_code"], twCode=tw_code)
+                    continue
+                pending_customer, pending_error = pending_hongan_customer_for_tw(conn, row)
+                if pending_error:
+                    counts["needsConfirmation"] += 1
+                    add_sample("needsConfirmation", index, row, twCode=tw_code, detail=pending_error)
+                    continue
+                if pending_customer:
+                    counts["update"] += 1
+                    counts["pendingTwReconciled"] += 1
+                    add_sample(
+                        "update", index, row, customerCode=pending_customer["customer_code"], twCode=tw_code,
+                        detail="将把 TW 编号补到活动表先建的客户，不会新建重复客户",
+                    )
                     continue
             display_name = str(row.get("name", "") or row.get("wechatNickname", "")).strip()
             if not display_name:
@@ -4336,7 +4726,7 @@ def import_commit(payload: ImportCommitPayload, user: dict[str, Any] = Depends(c
     created, updated, conflicts, errors = [], [], [], []
     updated_customer_ids, opened_customer_ids = [], []
     unchanged_count = 0
-    quality = {"placeholderRowsSkipped": 0, "nicknameFallbackRows": 0, "unidentifiedRowsImported": 0, "twMatchedRows": 0, "twNewRows": 0, "twDuplicateRows": 0, "twMissingRows": 0, "duplicateTwRowsMerged": merged_duplicate_count}
+    quality = {"placeholderRowsSkipped": 0, "nicknameFallbackRows": 0, "unidentifiedRowsImported": 0, "twMatchedRows": 0, "twReconciledRows": 0, "twNewRows": 0, "twDuplicateRows": 0, "twMissingRows": 0, "duplicateTwRowsMerged": merged_duplicate_count}
     has_tw_snapshot = mode == "snapshot" or any(normalize_tw_code(row.get("twCode", "")) for row in import_rows)
     seen_tw_codes: set[str] = set()
     with db() as conn:
@@ -4410,6 +4800,32 @@ def import_commit(payload: ImportCommitPayload, user: dict[str, Any] = Depends(c
                         conn.execute("ROLLBACK TO SAVEPOINT import_row")
                         conn.execute("RELEASE SAVEPOINT import_row")
                         errors.append({"row": index, "message": str(exc.detail)})
+                        continue
+                pending_customer, pending_error = pending_hongan_customer_for_tw(conn, row)
+                if pending_error:
+                    conflicts.append({"row": index, "name": row.get("name", "") or tw_code, "detail": pending_error})
+                    continue
+                if pending_customer:
+                    conn.execute("SAVEPOINT import_row")
+                    try:
+                        changes = reconcile_pending_hongan_customer(conn, pending_customer, row, tw_code, user)
+                        supplemental_changed = apply_import_supplemental_updates(conn, pending_customer["id"], row, user)
+                        conn.execute("RELEASE SAVEPOINT import_row")
+                        quality["twMatchedRows"] += 1
+                        quality["twReconciledRows"] += 1
+                        updated.append({
+                            "row": index, "id": pending_customer["id"], "customerCode": pending_customer["customer_code"],
+                            "changes": changes or {"supplemental": supplemental_changed},
+                        })
+                        updated_customer_ids.append(pending_customer["id"])
+                        if changes.get("account_status", {}).get("to") == "已开户":
+                            opened_customer_ids.append(pending_customer["id"])
+                        continue
+                    except (HTTPException, ValueError) as exc:
+                        conn.execute("ROLLBACK TO SAVEPOINT import_row")
+                        conn.execute("RELEASE SAVEPOINT import_row")
+                        message = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+                        conflicts.append({"row": index, "name": row.get("name", "") or tw_code, "detail": message})
                         continue
                 quality["twNewRows"] += 1
             if not str(row.get("name", "")).strip() and not str(row.get("wechatNickname", "")).strip():
@@ -4581,10 +4997,16 @@ def resolve_import_review(review_id: str, payload: ImportReviewResolvePayload, u
             if profile == "hongan_activity":
                 require_advisor_binding_manager(user)
                 advisor = str(payload.honganAdvisor or target.get("targetAdvisor") or ((target.get("advisors") or [""])[0]) or "").strip()
-                if not advisor:
-                    raise HTTPException(422, "这条记录没有可确认的港安顾问。")
-                conn.execute("UPDATE customers SET hongan_advisor=?, updated_at=?, version=version+1 WHERE id=?", (advisor, now_iso(), customer["id"]))
-                audit(conn, user, "import_review.hongan_advisor_applied", "customer", customer["id"], {"reviewId": review_id, "advisor": advisor})
+                raw_row = dict(target.get("rawRow") or {})
+                if advisor:
+                    raw_row["hkAdvisor"] = advisor
+                has_selected_values = advisor or any(
+                    clean_import_cell(raw_row.get(field)) not in (None, "") for field in HONGAN_ACTIVITY_IMPORT_FIELDS
+                ) or any(clean_import_cell(value) not in (None, "") for value in (raw_row.get("customValues") or {}).values())
+                if not has_selected_values:
+                    raise HTTPException(422, "这条记录没有可写入的已选字段。")
+                changes, _ = apply_hongan_activity_selected_values(conn, dict(customer), raw_row, user, allow_advisor_overwrite=True)
+                audit(conn, user, "import_review.hongan_activity_applied", "customer", customer["id"], {"reviewId": review_id, "advisor": advisor, "changes": changes})
             elif profile in {"holding_pinyin", "asset", "holding"}:
                 raw_row = target.get("rawRow") or {}
                 snapshots = target.get("snapshot") and [target["snapshot"]] or raw_row.get("holdingSnapshots") or []
@@ -4710,15 +5132,70 @@ def rollback_import(job_id: str, user: dict[str, Any] = Depends(current_user)) -
         if not created_ids and quality.get("mode") != "hongan_activity":
             raise HTTPException(422, "该导入记录没有可撤回的客户，可能是系统升级前的历史记录。")
         if quality.get("mode") == "hongan_activity":
-            restored, protected = [], []
+            restored, archived, protected = [], [], []
             timestamp = now_iso()
             previous_job = conn.execute("SELECT created_at FROM import_jobs WHERE created_at < ? ORDER BY created_at DESC LIMIT 1", (job["created_at"],)).fetchone()
             previous_job_created_at = previous_job["created_at"] if previous_job else ""
+            for customer_id in created_ids:
+                customer = conn.execute(
+                    "SELECT id, customer_code, created_by, created_at, updated_at, version, archived_at FROM customers WHERE id=?",
+                    (customer_id,),
+                ).fetchone()
+                if not customer or customer["archived_at"]:
+                    continue
+                followup_count = conn.execute("SELECT COUNT(*) FROM followups WHERE customer_id=?", (customer_id,)).fetchone()[0]
+                snapshot_count = conn.execute("SELECT COUNT(*) FROM customer_holding_snapshots WHERE customer_id=?", (customer_id,)).fetchone()[0]
+                identifier_count = conn.execute("SELECT COUNT(*) FROM customer_identifiers WHERE customer_id=?", (customer_id,)).fetchone()[0]
+                changed_after_import = (
+                    customer["created_by"] != job["imported_by"] or customer["version"] != 1
+                    or customer["updated_at"] != customer["created_at"] or followup_count or snapshot_count or identifier_count
+                )
+                if changed_after_import:
+                    protected.append({"id": customer_id, "customerCode": customer["customer_code"], "reason": "导入后已补编号、编辑、跟进或产生持仓"})
+                    continue
+                conn.execute(
+                    "UPDATE customers SET archived_at=?, updated_at=?, version=version+1 WHERE id=? AND archived_at IS NULL",
+                    (timestamp, timestamp, customer_id),
+                )
+                archived.append({"id": customer_id, "customerCode": customer["customer_code"]})
             try:
                 updated_ids = json.loads(job["updated_customer_ids_json"] or "[]")
             except (TypeError, json.JSONDecodeError):
                 updated_ids = []
+            field_snapshots = quality.get("honganFieldSnapshots") or {}
+            restored_snapshot_ids: set[str] = set()
+            for customer_id, snapshot in field_snapshots.items():
+                customer = conn.execute("SELECT * FROM customers WHERE id=? AND archived_at IS NULL", (customer_id,)).fetchone()
+                if not customer:
+                    continue
+                if int(customer["version"]) != int(snapshot.get("afterVersion", customer["version"])):
+                    protected.append({"id": customer_id, "customerCode": customer["customer_code"], "reason": "导入后已有编辑或重新分配"})
+                    continue
+                before = snapshot.get("before") or {}
+                if before:
+                    setters = ", ".join(f"{field}=?" for field in before)
+                    conn.execute(f"UPDATE customers SET {setters}, updated_at=?, version=version+1 WHERE id=?", (*before.values(), timestamp, customer_id))
+                else:
+                    conn.execute("UPDATE customers SET updated_at=?, version=version+1 WHERE id=?", (timestamp, customer_id))
+                for field_id, previous_value in (snapshot.get("customBefore") or {}).items():
+                    if previous_value is None:
+                        conn.execute("DELETE FROM customer_field_values WHERE customer_id=? AND field_id=?", (customer_id, field_id))
+                    else:
+                        conn.execute(
+                            "INSERT INTO customer_field_values(customer_id, field_id, value_text, updated_by, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(customer_id, field_id) DO UPDATE SET value_text=excluded.value_text, updated_by=excluded.updated_by, updated_at=excluded.updated_at",
+                            (customer_id, field_id, previous_value, user["id"], timestamp),
+                        )
+                if "phone" in before:
+                    conn.execute("DELETE FROM customer_identifiers WHERE customer_id=? AND kind='phone'", (customer_id,))
+                if "email" in before:
+                    conn.execute("DELETE FROM customer_identifiers WHERE customer_id=? AND kind='email'", (customer_id,))
+                if "phone" in before or "email" in before:
+                    add_identifiers(conn, customer_id, str(before.get("phone", customer["phone"]) or ""), str(before.get("email", customer["email"]) or ""))
+                restored.append({"id": customer_id, "customerCode": customer["customer_code"], "fields": [*before, *(f"custom:{field_id}" for field_id in (snapshot.get("customBefore") or {}))]})
+                restored_snapshot_ids.add(customer_id)
             for customer_id in updated_ids:
+                if customer_id in restored_snapshot_ids or customer_id in field_snapshots:
+                    continue
                 customer = conn.execute("SELECT id, customer_code, hongan_advisor, owner_id, owner_name, owner_team, updated_at FROM customers WHERE id=? AND archived_at IS NULL", (customer_id,)).fetchone()
                 if not customer:
                     continue
@@ -4738,8 +5215,8 @@ def rollback_import(job_id: str, user: dict[str, Any] = Depends(current_user)) -
                     conn.execute(f"UPDATE customers SET {setters}, updated_at=?, version=version+1 WHERE id=?", (*restored_fields.values(), timestamp, customer_id))
                     restored.append({"id": customer_id, "customerCode": customer["customer_code"], "fields": list(restored_fields)})
             conn.execute("UPDATE import_jobs SET rolled_back_at=?, rolled_back_by=? WHERE id=?", (timestamp, user["id"], job_id))
-            audit(conn, user, "import.rolled_back", "import_job", job_id, {"restored": len(restored), "protected": len(protected), "profile": "hongan_activity"})
-            return {"jobId": job_id, "restored": restored, "archived": [], "protected": protected, "alreadyRolledBack": False}
+            audit(conn, user, "import.rolled_back", "import_job", job_id, {"archived": len(archived), "restored": len(restored), "protected": len(protected), "profile": "hongan_activity"})
+            return {"jobId": job_id, "restored": restored, "archived": archived, "protected": protected, "alreadyRolledBack": False}
         archived, protected = [], []
         timestamp = now_iso()
         for customer_id in created_ids:
