@@ -55,6 +55,7 @@ POSTGRES_SCHEMA_STATEMENTS = [
         name TEXT NOT NULL,
         phone TEXT NOT NULL DEFAULT '',
         email TEXT NOT NULL DEFAULT '',
+        name_pinyin TEXT NOT NULL DEFAULT '',
         company TEXT NOT NULL DEFAULT '',
         source TEXT NOT NULL DEFAULT '',
         source_detail TEXT NOT NULL DEFAULT '',
@@ -95,6 +96,7 @@ POSTGRES_SCHEMA_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_customers_team ON customers(owner_team, archived_at)",
     "CREATE INDEX IF NOT EXISTS idx_customers_name ON customers(name)",
     "ALTER TABLE customers ADD COLUMN IF NOT EXISTS import_job_id TEXT",
+    "ALTER TABLE customers ADD COLUMN IF NOT EXISTS name_pinyin TEXT NOT NULL DEFAULT ''",
     "CREATE INDEX IF NOT EXISTS idx_customers_import_job ON customers(import_job_id, archived_at)",
     """
     CREATE TABLE IF NOT EXISTS customer_identifiers (

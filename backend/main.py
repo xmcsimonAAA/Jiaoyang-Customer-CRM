@@ -97,6 +97,32 @@ OPENCC_T2S = OpenCC("t2s")
 TRADITIONAL_VARIANT_OVERRIDES = str.maketrans({"暱": "昵"})
 
 
+def pinyin_search_key(value: Any) -> str:
+    """Normalize Chinese or romanized text for space-insensitive pinyin search."""
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if lazy_pinyin is not None and re.search(r"[\u3400-\u9fff]", text):
+        text = "".join(lazy_pinyin(OPENCC_T2S.convert(text).translate(TRADITIONAL_VARIANT_OVERRIDES)))
+    return re.sub(r"[^a-z0-9]", "", text.casefold())
+
+
+def customer_name_pinyin(name: Any, nickname: Any = "") -> str:
+    """Return readable pinyin, reusing an existing exact romanized name when available."""
+    source = unicodedata.normalize("NFKC", str(name or "")).strip()
+    nickname_text = unicodedata.normalize("NFKC", str(nickname or "")).strip()
+    if not source:
+        source = nickname_text
+    if not source:
+        return ""
+    if nickname_text and re.fullmatch(r"[A-Za-z][A-Za-z .,'’\-]*", nickname_text):
+        if not name or pinyin_search_key(nickname_text) == pinyin_search_key(name):
+            return " ".join(re.findall(r"[A-Za-z0-9]+", nickname_text)).upper()
+    simplified = OPENCC_T2S.convert(source).translate(TRADITIONAL_VARIANT_OVERRIDES)
+    if lazy_pinyin is not None and re.search(r"[\u3400-\u9fff]", simplified):
+        parts = [re.sub(r"[^A-Za-z0-9]", "", part) for part in lazy_pinyin(simplified)]
+        return " ".join(part.upper() for part in parts if part)
+    return " ".join(re.findall(r"[A-Za-z0-9]+", simplified)).upper()
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
@@ -149,6 +175,7 @@ def init_sqlite_db() -> None:
                 name TEXT NOT NULL,
                 phone TEXT NOT NULL DEFAULT '',
                 email TEXT NOT NULL DEFAULT '',
+                name_pinyin TEXT NOT NULL DEFAULT '',
                 company TEXT NOT NULL DEFAULT '',
                 source TEXT NOT NULL DEFAULT '',
                 source_detail TEXT NOT NULL DEFAULT '',
@@ -406,18 +433,96 @@ def init_sqlite_db() -> None:
             "broker_deposit_amount": "REAL NOT NULL DEFAULT 0",
             "capital_destination": "TEXT NOT NULL DEFAULT ''",
             "wechat_nickname": "TEXT NOT NULL DEFAULT ''",
+            "name_pinyin": "TEXT NOT NULL DEFAULT ''",
             "import_job_id": "TEXT",
         }
         for column, definition in migrations.items():
             if column not in customer_columns:
                 conn.execute(f"ALTER TABLE customers ADD COLUMN {column} {definition}")
+        for customer in conn.execute("SELECT id, name, wechat_nickname, name_pinyin FROM customers").fetchall():
+            generated = customer_name_pinyin(customer["name"], customer["wechat_nickname"])
+            if generated != str(customer["name_pinyin"] or ""):
+                conn.execute("UPDATE customers SET name_pinyin=? WHERE id=?", (generated, customer["id"]))
         conn.execute("CREATE INDEX IF NOT EXISTS idx_customers_import_job ON customers(import_job_id, archived_at)")
+
+
+PRIORITY_INFERIOR_SQLITE = """
+CREATE TABLE IF NOT EXISTS priority_inferior_batches (
+    id TEXT PRIMARY KEY,
+    batch_date TEXT NOT NULL UNIQUE,
+    source_file TEXT NOT NULL DEFAULT '',
+    source_hash TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS priority_inferior_participations (
+    id TEXT PRIMARY KEY,
+    batch_id TEXT NOT NULL REFERENCES priority_inferior_batches(id),
+    customer_id TEXT REFERENCES customers(id),
+    tw_code TEXT NOT NULL DEFAULT '',
+    customer_name TEXT NOT NULL DEFAULT '',
+    broker_account_status TEXT NOT NULL DEFAULT '',
+    deposit_amount REAL,
+    on_site_opener TEXT NOT NULL DEFAULT '',
+    insurance_broker TEXT NOT NULL DEFAULT '',
+    zhongyang_witness TEXT NOT NULL DEFAULT '',
+    customer_type TEXT NOT NULL DEFAULT '',
+    agreement_signed TEXT NOT NULL DEFAULT '',
+    agreement_amount_usd REAL,
+    jiaoyang_owner TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    source_row INTEGER,
+    raw_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    UNIQUE(batch_id, tw_code, customer_name)
+);
+CREATE INDEX IF NOT EXISTS idx_priority_participations_batch ON priority_inferior_participations(batch_id);
+CREATE INDEX IF NOT EXISTS idx_priority_participations_tw ON priority_inferior_participations(tw_code);
+CREATE INDEX IF NOT EXISTS idx_priority_participations_insurance_broker ON priority_inferior_participations(insurance_broker);
+CREATE INDEX IF NOT EXISTS idx_priority_participations_jiaoyang_owner ON priority_inferior_participations(jiaoyang_owner);
+CREATE TABLE IF NOT EXISTS priority_inferior_asset_snapshots (
+    id TEXT PRIMARY KEY,
+    snapshot_date TEXT NOT NULL,
+    tw_code TEXT NOT NULL,
+    customer_id TEXT REFERENCES customers(id),
+    total_asset_usd REAL NOT NULL DEFAULT 0,
+    source_file TEXT NOT NULL DEFAULT '',
+    source_hash TEXT NOT NULL DEFAULT '',
+    source_rows_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    UNIQUE(snapshot_date, tw_code)
+);
+CREATE TABLE IF NOT EXISTS priority_inferior_secondary_snapshots (
+    id TEXT PRIMARY KEY,
+    snapshot_date TEXT NOT NULL,
+    tw_code TEXT NOT NULL,
+    customer_id TEXT REFERENCES customers(id),
+    security_name TEXT NOT NULL DEFAULT 'XMax',
+    quantity REAL NOT NULL DEFAULT 0,
+    source_file TEXT NOT NULL DEFAULT '',
+    source_hash TEXT NOT NULL DEFAULT '',
+    source_row INTEGER,
+    created_at TEXT NOT NULL,
+    UNIQUE(snapshot_date, tw_code, security_name)
+);
+CREATE INDEX IF NOT EXISTS idx_priority_secondary_date ON priority_inferior_secondary_snapshots(snapshot_date);
+"""
+
+
+def init_priority_inferior_db() -> None:
+    with db() as conn:
+        conn.executescript(PRIORITY_INFERIOR_SQLITE)
 
 
 def init_postgres_db() -> None:
     with db() as conn:
         for statement in POSTGRES_SCHEMA_STATEMENTS:
             conn.execute(statement)
+        for statement in [s.strip() for s in PRIORITY_INFERIOR_SQLITE.split(';') if s.strip()]:
+            conn.execute(statement.replace('REAL', 'DOUBLE PRECISION').replace('INTEGER', 'INTEGER'))
+        for customer in conn.execute("SELECT id, name, wechat_nickname, name_pinyin FROM customers").fetchall():
+            generated = customer_name_pinyin(customer["name"], customer["wechat_nickname"])
+            if generated != str(customer["name_pinyin"] or ""):
+                conn.execute("UPDATE customers SET name_pinyin=? WHERE id=?", (generated, customer["id"]))
 
 
 def init_db() -> None:
@@ -425,6 +530,7 @@ def init_db() -> None:
         init_postgres_db()
         return
     init_sqlite_db()
+    init_priority_inferior_db()
 
 
 init_db()
@@ -914,6 +1020,56 @@ def current_user(
     if not user or not user["active"]:
         raise HTTPException(401, "账号不存在或已停用。")
     return enrich_user(user)
+
+
+@app.get("/api/priority-inferior/batches")
+def priority_inferior_batches(user: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
+    """List independent priority-inferior batches with J-column based totals."""
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT b.id, b.batch_date, b.source_file,
+               COUNT(p.id) FILTER (WHERE p.agreement_amount_usd IS NOT NULL AND p.agreement_amount_usd > 0) AS participant_count,
+               COALESCE(SUM(p.agreement_amount_usd), 0) AS agreement_amount_usd
+               FROM priority_inferior_batches b
+               LEFT JOIN priority_inferior_participations p ON p.batch_id = b.id
+               GROUP BY b.id ORDER BY b.batch_date DESC""" if uses_postgres(DATABASE_URL) else
+            """SELECT b.id, b.batch_date, b.source_file,
+               SUM(CASE WHEN p.agreement_amount_usd IS NOT NULL AND p.agreement_amount_usd > 0 THEN 1 ELSE 0 END) AS participant_count,
+               COALESCE(SUM(p.agreement_amount_usd), 0) AS agreement_amount_usd
+               FROM priority_inferior_batches b
+               LEFT JOIN priority_inferior_participations p ON p.batch_id = b.id
+               GROUP BY b.id ORDER BY b.batch_date DESC"""
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.get("/api/priority-inferior/batches/{batch_id}/participations")
+def priority_inferior_participations(batch_id: str, user: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT p.*, c.name AS linked_customer_name, c.owner_name AS current_owner_name
+               FROM priority_inferior_participations p
+               LEFT JOIN customers c ON c.id = p.customer_id
+               WHERE p.batch_id = ? ORDER BY p.source_row, p.customer_name""", (batch_id,)
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.get("/api/priority-inferior/customers/{tw_code}")
+def priority_inferior_customer_history(tw_code: str, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    with db() as conn:
+        batches = conn.execute(
+            """SELECT p.*, b.batch_date FROM priority_inferior_participations p
+               JOIN priority_inferior_batches b ON b.id = p.batch_id
+               WHERE p.tw_code = ? ORDER BY b.batch_date DESC""", (tw_code.strip(),)
+        ).fetchall()
+        assets = conn.execute(
+            "SELECT * FROM priority_inferior_asset_snapshots WHERE tw_code = ? ORDER BY snapshot_date DESC", (tw_code.strip(),)
+        ).fetchall()
+        secondary = conn.execute(
+            "SELECT * FROM priority_inferior_secondary_snapshots WHERE tw_code = ? ORDER BY snapshot_date DESC", (tw_code.strip(),)
+        ).fetchall()
+    return {"twCode": tw_code.strip(), "priorityInferior": [dict(r) for r in batches], "assets": [dict(r) for r in assets], "secondary": [dict(r) for r in secondary]}
 
 
 def require_supervisor(user: dict[str, Any]) -> None:
@@ -1645,6 +1801,8 @@ def reconcile_pending_hongan_customer(
         value = clean_import_cell(raw_value)
         if value not in (None, "") and not str(current.get(field, "") or "").strip():
             updates[field] = value
+    if "wechat_nickname" in updates:
+        updates["name_pinyin"] = customer_name_pinyin(current.get("name", ""), updates["wechat_nickname"])
 
     account_status = str(row.get("accountStatus", "") or "").strip()
     if account_status in ACCOUNT_STATUSES and account_status != current.get("account_status"):
@@ -1686,6 +1844,7 @@ def update_broker_snapshot_customer(conn: sqlite3.Connection, current: dict[str,
     name = str(clean_import_cell(row.get("name", "")) or "").strip()
     if name and not str(current["name"] or "").strip():
         updates["name"] = name
+        updates["name_pinyin"] = customer_name_pinyin(name, current.get("wechat_nickname", ""))
     account_status = str(row.get("accountStatus", "") or "").strip()
     if account_status in ACCOUNT_STATUSES and account_status != current["account_status"]:
         updates["account_status"] = account_status
@@ -1714,6 +1873,7 @@ def create_customer_record(conn: sqlite3.Connection, payload: dict[str, Any], ow
     tw_code = normalize_tw_code(payload.get("twCode", ""))
     record = {
         "id": customer_id, "customer_code": tw_code or next_customer_code(conn), "name": name, "phone": phone, "email": email, "wechat_nickname": nickname,
+        "name_pinyin": customer_name_pinyin(name, nickname),
         "company": str(payload.get("company", "")).strip(), "source": str(payload.get("source", "")).strip(),
         "source_detail": str(payload.get("sourceDetail", payload.get("source_detail", ""))).strip(),
         "stage": str(payload.get("stage", "新客户")) or "新客户", "priority": str(payload.get("priority", "普通")) or "普通",
@@ -1736,10 +1896,10 @@ def create_customer_record(conn: sqlite3.Connection, payload: dict[str, Any], ow
         "notes": str(payload.get("notes", "")).strip(), "created_by": user["id"], "created_at": created_at, "updated_at": created_at, "import_job_id": None,
     }
     conn.execute(
-        """INSERT INTO customers(id, customer_code, name, phone, email, wechat_nickname, company, source, source_detail, stage, priority, owner_id, owner_name, owner_team,
+        """INSERT INTO customers(id, customer_code, name, phone, email, wechat_nickname, name_pinyin, company, source, source_detail, stage, priority, owner_id, owner_name, owner_team,
         account_status, account_broker, account_opened_at, broker_deposit_amount, capital_destination, intent_status, placement_status, target_batch_id, intent_amount, funded_amount, actual_amount, lost_reason, closed_at, hongan_advisor, source_advisor_label,
         notes, created_by, created_at, updated_at, import_job_id)
-        VALUES (:id, :customer_code, :name, :phone, :email, :wechat_nickname, :company, :source, :source_detail, :stage, :priority, :owner_id, :owner_name, :owner_team,
+        VALUES (:id, :customer_code, :name, :phone, :email, :wechat_nickname, :name_pinyin, :company, :source, :source_detail, :stage, :priority, :owner_id, :owner_name, :owner_team,
         :account_status, :account_broker, :account_opened_at, :broker_deposit_amount, :capital_destination, :intent_status, :placement_status, :target_batch_id, :intent_amount, :funded_amount, :actual_amount, :lost_reason, :closed_at, :hongan_advisor, :source_advisor_label,
         :notes, :created_by, :created_at, :updated_at, :import_job_id)""", record,
     )
@@ -2190,7 +2350,9 @@ def list_customers(
     values: list[Any] = list(params)
     for term in customer_search_terms(search):
         filters.append("""(
-            c.name LIKE ? OR c.wechat_nickname LIKE ? OR c.phone LIKE ? OR c.email LIKE ? OR c.company LIKE ?
+            c.name LIKE ? OR c.wechat_nickname LIKE ? OR c.name_pinyin LIKE ?
+            OR REPLACE(REPLACE(REPLACE(LOWER(c.name_pinyin), ' ', ''), '-', ''), '''', '') LIKE ?
+            OR c.phone LIKE ? OR c.email LIKE ? OR c.company LIKE ?
             OR c.customer_code LIKE ? OR c.owner_name LIKE ? OR c.source_advisor_label LIKE ? OR c.hongan_advisor LIKE ?
             OR EXISTS (
                 SELECT 1 FROM customer_collaborators cc_search
@@ -2203,7 +2365,8 @@ def list_customers(
                 AND LOWER(tw_i.normalized_value) LIKE LOWER(?)
             )
         )""")
-        values.extend([f"%{term}%"] * 11 + [f"%{term}%"])
+        pattern = f"%{term}%"
+        values.extend([pattern] * 3 + [f"%{pinyin_search_key(term)}%"] + [pattern] * 10)
     if stage:
         filters.append("c.stage = ?")
         values.append(stage)
@@ -2452,6 +2615,11 @@ def update_customer(customer_id: str, payload: CustomerPatch, user: dict[str, An
             raise HTTPException(403, "港安顾问属于外部引荐关系，请由具备顾问绑定权限的成员维护。")
         if "hongan_advisor" in values and values["hongan_advisor"] != current["hongan_advisor"] and not change_reason:
             raise HTTPException(422, "修改港安顾问必须填写变更原因。")
+        if "name" in values or "wechat_nickname" in values:
+            values["name_pinyin"] = customer_name_pinyin(
+                values.get("name", current["name"]), values.get("wechat_nickname", current["wechat_nickname"]),
+            )
+            allowed.add("name_pinyin")
         phone, email = values.get("phone", current["phone"]), values.get("email", current["email"])
         matches = duplicate_matches(conn, phone, email, customer_id)
         if matches:
@@ -3103,10 +3271,7 @@ def holding_header_matches(header: Any) -> bool:
 
 def normalized_pinyin_name(value: Any) -> str:
     """Create a comparison key for broker pinyin names without altering display names."""
-    text = unicodedata.normalize("NFKC", str(value or ""))
-    if lazy_pinyin is not None:
-        text = "".join(lazy_pinyin(simplify_text(text)))
-    return re.sub(r"[^a-z0-9]", "", text.casefold())
+    return pinyin_search_key(value)
 
 
 def is_pinyin_name(value: Any) -> bool:
@@ -3672,6 +3837,56 @@ def parse_hongan_activity_workbook(content: bytes, selected_sheets: list[str] | 
     return {"rows": activity_rows, "sheets": sheet_stats, "recognizedSheets": recognized_sheets}
 
 
+def parse_priority_inferior_workbook(content: bytes, selected_sheets: list[str] | None = None) -> dict[str, Any] | None:
+    """Parse dated 港安 ICC sheets for the independent priority-inferior board.
+
+    The J column is authoritative for USD agreement amount. All ICC columns are
+    retained in ``raw`` so future fields do not require changing the importer.
+    """
+    sheets = parse_xlsx_without_styles(content)
+    selected = {simplify_text(name).strip() for name in selected_sheets or [] if str(name).strip()}
+    batches: list[dict[str, Any]] = []
+    for sheet_name, raw_rows in sheets:
+        if selected and simplify_text(sheet_name).strip() not in selected:
+            continue
+        if not re.fullmatch(r"20\d{2}[./-]\d{1,2}[./-]\d{1,2}", simplify_text(sheet_name).strip()):
+            continue
+        rows = [[clean_import_cell(v) for v in row] for row in raw_rows]
+        header_idx = next((i for i, row in enumerate(rows[:10]) if len(row) >= 10 and simplify_text(row[1]) == "客户姓名" and simplify_text(row[9]) == "优先劣后金额"), None)
+        if header_idx is None:
+            continue
+        records = []
+        for source_row, row in enumerate(rows[header_idx + 1:], start=header_idx + 2):
+            if len(row) < 2 or not str(row[1] or "").strip():
+                continue
+            name = str(row[1]).strip()
+            if name in {"合计", "总计"}:
+                continue
+            amount = row[9] if len(row) > 9 else ""
+            try:
+                amount = float(amount) if amount not in (None, "") else None
+            except (TypeError, ValueError):
+                amount = None
+            records.append({
+                "batchDate": re.sub(r"[./]", "-", simplify_text(sheet_name).strip()),
+                "customerName": name,
+                "brokerAccountStatus": row[2] if len(row) > 2 else "",
+                "depositAmount": row[3] if len(row) > 3 else "",
+                "onSiteOpener": row[4] if len(row) > 4 else "",
+                "insuranceBroker": row[5] if len(row) > 5 else "",
+                "zhongyangWitness": row[6] if len(row) > 6 else "",
+                "customerType": row[7] if len(row) > 7 else "",
+                "agreementSigned": row[8] if len(row) > 8 else "",
+                "agreementAmountUsd": amount,
+                "jiaoyangOwner": row[10] if len(row) > 10 else "",
+                "notes": row[11] if len(row) > 11 else "",
+                "sourceRow": source_row,
+                "raw": row,
+            })
+        batches.append({"batchDate": re.sub(r"[./]", "-", simplify_text(sheet_name).strip()), "rows": records})
+    return {"batches": batches, "rows": [r for b in batches for r in b["rows"]]} if batches else None
+
+
 def hongan_activity_match_diagnostics(conn: Any, rows: list[dict[str, Any]], limit: int | None = 200) -> dict[str, Any]:
     customers = [dict(row) for row in conn.execute(
         """SELECT c.id, c.customer_code, c.name, c.wechat_nickname, c.hongan_advisor,
@@ -3833,6 +4048,8 @@ def apply_hongan_activity_selected_values(
         if value is None or current.get(database_field) == value:
             continue
         updates[database_field] = value
+    if "wechat_nickname" in updates:
+        updates["name_pinyin"] = customer_name_pinyin(current.get("name", ""), updates["wechat_nickname"])
     phone = str(updates.get("phone", current.get("phone", "")) or "").strip()
     email = str(updates.get("email", current.get("email", "")) or "").strip()
     if ("phone" in updates or "email" in updates) and duplicate_matches(conn, phone, email, current["id"]):

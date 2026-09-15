@@ -187,7 +187,6 @@ def test_customer_lifecycle_visibility_and_permissions():
     assert detail.status_code == 200
     assert detail.json()["customer"]["owner_id"] == second["id"]
     assert len(detail.json()["assignments"]) == 2
-
     csv_payload = {"filename": "customers.csv", "dataBase64": base64.b64encode("客户姓名,手机号\n客户乙,13900000002".encode()).decode()}
     assert client.post("/api/imports/preview", headers=manager_headers, json=csv_payload).status_code == 403
 
@@ -205,6 +204,36 @@ def test_customer_lifecycle_visibility_and_permissions():
     assert audit.status_code == 200
     actions = {item["action"] for item in audit.json()["items"]}
     assert {"customer.created", "followup.created", "customer.assigned", "permission.updated"} <= actions
+
+
+def test_customer_pinyin_is_generated_and_search_ignores_spaces():
+    admin_headers, _ = login("admin", "admin123")
+    created = client.post(
+        "/api/customers",
+        headers=admin_headers,
+        json={"name": "王芳", "wechatNickname": "朋友圈里的小王"},
+    )
+    assert created.status_code == 201, created.text
+    customer = created.json()["customer"]
+    assert customer["name_pinyin"] == "WANG FANG"
+    assert customer["wechat_nickname"] == "朋友圈里的小王"
+
+    compact_search = client.get("/api/customers?search=wangfang", headers=admin_headers)
+    assert compact_search.status_code == 200, compact_search.text
+    assert customer["id"] in {item["id"] for item in compact_search.json()["items"]}
+
+    detail = client.get(f"/api/customers/{customer['id']}", headers=admin_headers)
+    assert detail.status_code == 200, detail.text
+    updated = client.patch(
+        f"/api/customers/{customer['id']}",
+        headers=admin_headers,
+        json={"name": "赵永博", "version": detail.json()["customer"]["version"]},
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["customer"]["name_pinyin"] == "ZHAO YONG BO"
+    updated_search = client.get("/api/customers?search=zhaoyongbo", headers=admin_headers)
+    assert updated_search.status_code == 200, updated_search.text
+    assert customer["id"] in {item["id"] for item in updated_search.json()["items"]}
 
 
 def test_supervisor_team_scope_and_manager_cannot_assign():
