@@ -459,8 +459,12 @@ def init_postgres_db() -> None:
 def init_db() -> None:
     if uses_postgres(DATABASE_URL):
         init_postgres_db()
-        return
-    init_sqlite_db()
+    else:
+        init_sqlite_db()
+    from backend.workspace import SCHEMA as workspace_schema
+    with db() as conn:
+        for statement in workspace_schema:
+            conn.execute(statement)
 
 
 init_db()
@@ -2672,6 +2676,7 @@ def merge_customers(payload: MergePayload, user: dict[str, Any] = Depends(curren
             if not target[field] and source[field]:
                 conn.execute(f"UPDATE customers SET {field} = ? WHERE id = ?", (source[field], target["id"]))
         conn.execute("UPDATE followups SET customer_id = ? WHERE customer_id = ?", (target["id"], source["id"]))
+        conn.execute("UPDATE workspace_followups SET subject_key=? WHERE subject_key=?", ('crm:'+target['id'], 'crm:'+source['id']))
         conn.execute("UPDATE assignments SET customer_id = ? WHERE customer_id = ?", (target["id"], source["id"]))
         existing = {(row["kind"], row["normalized_value"]) for row in conn.execute("SELECT kind, normalized_value FROM customer_identifiers WHERE customer_id = ?", (target["id"],))}
         for ident in conn.execute("SELECT kind, normalized_value, display_value, created_at FROM customer_identifiers WHERE customer_id = ?", (source["id"],)).fetchall():
@@ -2713,6 +2718,11 @@ def merge_customers(payload: MergePayload, user: dict[str, Any] = Depends(curren
         conn.execute("INSERT INTO merge_events VALUES (?, ?, ?, ?, ?, ?, ?)", (str(uuid4()), source["id"], target["id"], payload.reason.strip(), user["id"], user["name"], merged_at))
         audit(conn, user, "customer.merged", "customer", target["id"], {"sourceCustomerId": source["id"], "reason": payload.reason})
     return {"ok": True, "targetCustomerId": target["id"]}
+
+
+def customer_followup_count(conn, customer_id):
+    from backend.workspace import customer_note_count
+    return conn.execute('SELECT COUNT(*) FROM followups WHERE customer_id=?',(customer_id,)).fetchone()[0] + customer_note_count(conn, customer_id)
 
 
 @app.get("/api/followups")
@@ -5193,7 +5203,7 @@ def rollback_import(job_id: str, user: dict[str, Any] = Depends(current_user)) -
                 ).fetchone()
                 if not customer or customer["archived_at"]:
                     continue
-                followup_count = conn.execute("SELECT COUNT(*) FROM followups WHERE customer_id=?", (customer_id,)).fetchone()[0]
+                followup_count = customer_followup_count(conn, customer_id)
                 snapshot_count = conn.execute("SELECT COUNT(*) FROM customer_holding_snapshots WHERE customer_id=?", (customer_id,)).fetchone()[0]
                 identifier_count = conn.execute("SELECT COUNT(*) FROM customer_identifiers WHERE customer_id=?", (customer_id,)).fetchone()[0]
                 changed_after_import = (
@@ -5273,7 +5283,7 @@ def rollback_import(job_id: str, user: dict[str, Any] = Depends(current_user)) -
             customer = conn.execute("SELECT id, customer_code, created_by, created_at, updated_at, version, archived_at FROM customers WHERE id = ?", (customer_id,)).fetchone()
             if not customer or customer["archived_at"]:
                 continue
-            followup_count = conn.execute("SELECT COUNT(*) FROM followups WHERE customer_id = ?", (customer_id,)).fetchone()[0]
+            followup_count = customer_followup_count(conn, customer_id)
             snapshot_count = conn.execute("SELECT COUNT(*) FROM customer_holding_snapshots WHERE customer_id = ?", (customer_id,)).fetchone()[0]
             changed_after_import = customer["created_by"] != job["imported_by"] or customer["version"] != 1 or customer["updated_at"] != customer["created_at"] or followup_count or snapshot_count
             if changed_after_import:

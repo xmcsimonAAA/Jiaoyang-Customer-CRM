@@ -5,7 +5,7 @@ const state = {
   viewHistory: [], muskzoomEntryUrl: "https://muskzoom.com",
 };
 const app = document.querySelector("#app");
-const VIEWS = new Set(["dashboard", "customers", "placement", "priority", "followups", "imports", "reviews", "assignments", "fields", "bindings", "permissions", "audit"]);
+const VIEWS = new Set(["directory", "dashboard", "customers", "placement", "priority", "followups", "imports", "reviews", "assignments", "fields", "bindings", "permissions", "audit"]);
 const WORKSPACE_STATE_KEY = "jy_customer_workspace_state";
 const WORKSPACE_STATE_FIELDS = ["view", "customerPage", "search", "workflow", "metric", "stage", "ownerId", "accountStatus", "intentStatus", "placementStatus", "source", "honganAdvisor", "contactState", "importJobId", "importJobMode"];
 let restoredScrollY = null;
@@ -59,23 +59,8 @@ const customerDisplayName = (row) => {
 };
 
 async function runGlobalCustomerSearch(value) {
-  const query = String(value || "").trim();
-  if (!query) { toast("请输入客户姓名、手机号、公司或客户编号"); return; }
-  state.search = query;
-  state.stage = "";
-  state.workflow = "all";
-  state.metric = "";
-  state.ownerId = "";
-  state.accountStatus = "";
-  state.intentStatus = "";
-  state.placementStatus = "";
-  state.source = "";
-  state.honganAdvisor = "";
-  state.contactState = "";
-  state.importJobId = "";
-  state.importJobMode = "all";
-  state.customerPage = 1;
-  await navigate("customers");
+  state.search = String(value || '').trim();
+  await navigate('directory');
 }
 
 async function api(path, options = {}) {
@@ -98,7 +83,7 @@ function renderLogin(error = "", authConfig = {}) {
     app.innerHTML = `<main class="login"><section class="login-panel"><div class="brand"><div class="brand-mark">JY</div><div><h1>骄阳</h1><p>客户生命周期工作台</p></div></div><div class="login-kicker">SECURE WORKSPACE / 01</div><div class="login-sso-message"><h2>请从 MuskZoom 进入</h2><p>${esc(error || "客户系统仅支持使用 MuskZoom 工作账号单点登录。")}</p><a class="primary-btn full" href="${esc(entryUrl)}">返回 MuskZoom <span>→</span></a></div></section></main>`;
     return;
   }
-  app.innerHTML = `<main class="login"><section class="login-panel"><div class="brand"><div class="brand-mark">JY</div><div><h1>骄阳</h1><p>定增客户生命周期工作台</p></div></div><div class="login-kicker">SECURE WORKSPACE / 01</div><form id="login-form"><div class="field"><label for="username">MuskZoom 账号</label><input id="username" name="username" autocomplete="username" required placeholder="输入工作账号"></div><div class="field"><label for="password">密码</label><input id="password" name="password" type="password" autocomplete="current-password" required placeholder="输入密码"></div><div class="login-error">${esc(error)}</div><button class="primary-btn full" type="submit">进入客户工作台 <span>→</span></button></form><p class="hint" style="margin-top:18px">请使用 MuskZoom 中已启用的工作账号登录。账号权限由 MuskZoom 统一管理。</p></section></main>`;
+  app.innerHTML = `<main class="login"><section class="login-panel"><div class="brand"><div class="brand-mark">JY</div><div><h1>骄阳</h1><p>客户业务工作台</p></div></div><div class="login-kicker">SECURE WORKSPACE / 01</div><form id="login-form"><div class="field"><label for="username">MuskZoom 账号</label><input id="username" name="username" autocomplete="username" required placeholder="输入工作账号"></div><div class="field"><label for="password">密码</label><input id="password" name="password" type="password" autocomplete="current-password" required placeholder="输入密码"></div><div class="login-error">${esc(error)}</div><button class="primary-btn full" type="submit">进入客户工作台 <span>→</span></button></form><p class="hint" style="margin-top:18px">请使用 MuskZoom 中已启用的工作账号登录。账号权限由 MuskZoom 统一管理。</p></section></main>`;
   document.querySelector("#login-form").addEventListener("submit", async (event) => { event.preventDefault(); const form = new FormData(event.currentTarget); try { const data = await api("/api/auth/login", {method:"POST", body: JSON.stringify({username: form.get("username"), password: form.get("password")})}); state.token = data.token; state.user = data.user; localStorage.setItem("jy_customer_token", state.token); restoreWorkspaceState(); await bootApp(); } catch (err) { renderLogin(err.message); } });
 }
 
@@ -110,7 +95,7 @@ function renderShell() {
   const canManageBindings = Boolean(state.user.canManageAdvisorBindings);
   const canManagePermissions = Boolean(state.user.canManageCrmPermissions);
   const canGoBack = state.viewHistory.length > 0 || state.view !== "dashboard";
-  app.innerHTML = `<div class="shell flux-shell"><aside class="sidebar"><div class="side-brand"><div class="brand-mark">JY</div><div><strong>骄阳</strong><span>客户生命周期系统</span></div></div><div class="nav-caption">WORKSPACE</div><nav class="nav">${navButton("dashboard", "⌗", "工作台", state.view === "dashboard")}${navButton("customers", "▦", "客户数据表", state.view === "customers")}${navButton("placement", "◈", "定增批次", state.view === "placement")}${navButton("priority", "▤", "优先劣后", state.view === "priority")}${navButton("followups", "◌", "跟进工作", state.view === "followups")}${navButton("imports", "＋", "录入中心", state.view === "imports")}${state.user.canImportCustomers || canManagePermissions ? navButton("reviews", "!", "导入复核", state.view === "reviews") : ""}</nav><div class="nav-caption secondary">CONTROL</div><nav class="nav">${canManageAssignments ? navButton("assignments", "⇆", "客户归属", state.view === "assignments") : ""}${state.user.canManageCustomerFields ? navButton("fields", "⊞", "表头管理", state.view === "fields") : ""}${canManageBindings ? navButton("bindings", "⇄", "顾问绑定", state.view === "bindings") : ""}${canManagePermissions ? navButton("permissions", "⚙", "权限设置", state.view === "permissions") : ""}${canManagePermissions ? navButton("audit", "≡", "审计日志", state.view === "audit") : ""}</nav><section class="rail-promo"><div class="rail-promo-icon">✦</div><strong>客户推进助手</strong><p>把每次跟进都沉淀成可汇报的业务进度。</p><button data-view="followups">打开工作台</button></section><div class="side-user"><div class="online-dot"></div><strong>${esc(state.user.name)}</strong><span>${esc(state.user.roleLabel)} · ${esc(state.user.team)}</span><button class="muskzoom-link" id="return-muskzoom" type="button" title="返回 MuskZoom" aria-label="返回 MuskZoom">返回 MuskZoom <span aria-hidden="true">↩</span></button><button id="logout">退出登录</button></div></aside><main class="main"><header class="topbar"><button class="top-icon-button topbar-back" id="crm-back" type="button" title="返回 CRM 上一页" aria-label="返回 CRM 上一页" ${canGoBack ? "" : "disabled"}>←</button><div class="profile-chip"><div class="profile-avatar">${esc(state.user.name.slice(0, 1))}</div><div><strong>${esc(state.user.name)}</strong><span>${esc(state.user.roleLabel)} · ${esc(state.user.team)}</span></div></div><div class="topbar-center"><div class="eyebrow">JY CUSTOMER OPERATIONS</div><h2 id="page-title">工作台</h2><span class="context">数据范围：${state.user.customerScope === "self" ? "我的客户" : state.user.customerScope === "team" ? `本组 · ${esc(state.user.team)}` : "全量客户"}</span></div><div class="top-actions"><form class="top-search" id="global-search" role="search"><input id="global-customer-search" type="search" value="${esc(state.search)}" autocomplete="off" placeholder="搜索客户" aria-label="搜索姓名、手机号、公司或客户编号"><button type="submit" title="搜索客户" aria-label="搜索客户">⌕</button></form><span class="data-live"><i></i> LIVE</span>${tag(state.user.roleLabel, roleTone(state.user.role))}</div></header><section class="content" id="content"></section><div class="mobile-actions"><button data-view="customers">◎<span>客户表</span></button><button id="mobile-add">＋<span>新增</span></button><button data-view="followups">↗<span>跟进</span></button></div></main></div>`;
+  app.innerHTML = `<div class="shell flux-shell"><aside class="sidebar"><div class="side-brand"><div class="brand-mark">JY</div><div><strong>骄阳</strong><span>客户生命周期系统</span></div></div>${workspaceNavigation()}<section class="rail-promo"><div class="rail-promo-icon">✦</div><strong>客户推进助手</strong><p>把每次跟进都沉淀成可汇报的业务进度。</p><button data-view="followups">打开工作台</button></section><div class="side-user"><div class="online-dot"></div><strong>${esc(state.user.name)}</strong><span>${esc(state.user.roleLabel)} · ${esc(state.user.team)}</span><button class="muskzoom-link" id="return-muskzoom" type="button" title="返回 MuskZoom" aria-label="返回 MuskZoom">返回 MuskZoom <span aria-hidden="true">↩</span></button><button id="logout">退出登录</button></div></aside><main class="main"><header class="topbar"><button class="top-icon-button topbar-back" id="crm-back" type="button" title="返回 CRM 上一页" aria-label="返回 CRM 上一页" ${canGoBack ? "" : "disabled"}>←</button><div class="profile-chip"><div class="profile-avatar">${esc(state.user.name.slice(0, 1))}</div><div><strong>${esc(state.user.name)}</strong><span>${esc(state.user.roleLabel)} · ${esc(state.user.team)}</span></div></div><div class="topbar-center"><div class="eyebrow">JY CUSTOMER OPERATIONS</div><h2 id="page-title">工作台</h2><span class="context">数据范围：${state.user.customerScope === "self" ? "我的客户" : state.user.customerScope === "team" ? `本组 · ${esc(state.user.team)}` : "全量客户"}</span></div><div class="top-actions"><form class="top-search" id="global-search" role="search"><input id="global-customer-search" type="search" value="${esc(state.search)}" autocomplete="off" placeholder="搜索客户" aria-label="搜索姓名、手机号、邮箱或 TW 编号"><button type="submit" title="搜索客户" aria-label="搜索客户">⌕</button></form><span class="data-live"><i></i> LIVE</span>${tag(state.user.roleLabel, roleTone(state.user.role))}</div></header><section class="content" id="content"></section><div class="mobile-actions"><button data-view="directory">◎<span>客户中心</span></button><button id="mobile-add">＋<span>新增</span></button><button data-view="followups">↗<span>跟进</span></button></div></main></div>`;
   const railAssistant = document.querySelector(".rail-promo button");
   railAssistant.dataset.view = "dashboard";
   railAssistant.textContent = "打开推进助手";
@@ -160,13 +145,14 @@ async function navigate(view, options = {}) {
   }
   state.view = view; if (view === "customers" && previousView !== "customers" && !options.preserveWorkflow) { state.workflow = "all"; state.metric = ""; }
   if (!options.preserveRoute && window.location.hash !== `#${view}`) history.replaceState(null, "", `${window.location.pathname}${window.location.search}#${view}`);
-  renderShell(); const title = {dashboard:"工作台", customers:"客户数据表", placement:"定增批次", priority:"优先劣后", followups:"跟进工作", imports:"录入中心", reviews:"导入复核", assignments:"客户归属", fields:"表头管理", bindings:"顾问绑定", permissions:"权限设置", audit:"审计日志"}[view]; document.querySelector("#page-title").textContent = title;
+  renderShell(); const title = {dashboard:"工作台", directory:"客户中心 · 全部客户", customers:"定增 · 业务客户", placement:"定增", priority:"优先劣后", followups:"我的跟进", imports:"定增 · 资料录入", reviews:"导入复核", assignments:"客户归属", fields:"表头管理", bindings:"顾问绑定", permissions:"权限设置", audit:"审计日志"}[view]; document.querySelector("#page-title").textContent = title;
   const content = document.querySelector("#content"); content.innerHTML = `<div class="empty">正在同步数据...</div>`;
-  try { if (view === "dashboard") await renderDashboard(content); else if (view === "customers") await renderCustomers(content); else if (view === "placement") await renderBatches(content); else if (view === "priority") await renderPriority(content); else if (view === "followups") await renderFollowups(content); else if (view === "imports") renderImports(content); else if (view === "reviews") await renderImportReviews(content); else if (view === "assignments") await renderCustomerAssignments(content); else if (view === "fields") await renderFields(content); else if (view === "bindings") await renderAdvisorBindings(content); else if (view === "permissions") await renderPermissions(content); else if (view === "audit") await renderAudit(content); } catch (err) { content.innerHTML = `<section class="section"><div class="empty">${esc(err.message)}</div></section>`; }
+  try { if (view === "directory") await renderCustomerDirectory(content); else if (view === "dashboard") { await renderDashboard(content); await workspaceDashboard(content); } else if (view === "customers") await renderCustomers(content); else if (view === "placement") await renderBatches(content); else if (view === "priority") await renderPriority(content); else if (view === "followups") await renderUnifiedFollowups(content); else if (view === "imports") renderImports(content); else if (view === "reviews") await renderImportReviews(content); else if (view === "assignments") await renderCustomerAssignments(content); else if (view === "fields") await renderFields(content); else if (view === "bindings") await renderAdvisorBindings(content); else if (view === "permissions") await renderPermissions(content); else if (view === "audit") await renderAudit(content); } catch (err) { content.innerHTML = `<section class="section"><div class="empty">${esc(err.message)}</div></section>`; }
   if (view === "imports" && state.user.canImportCustomers && !state.user.canManageCrmPermissions && !document.querySelector("#import-history")) {
     content.insertAdjacentHTML("beforeend", `<section class="section import-history" id="import-history"><div class="empty">正在读取导入批次...</div></section>`);
     renderImportHistory();
   }
+  placementNavigation(content);
   const scrollY = options.restoreScrollY;
   if (scrollY !== null && scrollY !== undefined) requestAnimationFrame(() => { window.scrollTo(0, scrollY); saveWorkspaceState(); });
   else if (previousView !== view) { window.scrollTo(0, 0); saveWorkspaceState(); }
@@ -766,6 +752,9 @@ function openQuickCustomerForm(defaults = {}, onComplete = null) {
   });
 }
 async function openQuickFollowForm(selectedCustomerId = "") {
+  return openWorkspaceNote(selectedCustomerId ? "crm:" + selectedCustomerId : "", placementViews.has(state.view) ? "placement" : "service");
+}
+async function openLegacyFollowForm(selectedCustomerId = "") {
   if (!state.customers.length) {
     const data = await api("/api/customers?page=1&pageSize=20");
     state.customers = data.items || [];
@@ -833,7 +822,7 @@ async function openQuickFollowForm(selectedCustomerId = "") {
   });
 }
 
-function openDetail(id) { api(`/api/customers/${encodeURIComponent(id)}`).then((data) => { state.detail = data; lockPageScroll(); renderDrawer(); renderCustomerRelations(); }).catch((err) => toast(err.message)); }
+function openDetail(id) { api(`/api/customers/${encodeURIComponent(id)}`).then((data) => { state.detail = data; lockPageScroll(); renderDrawer(); renderCustomerRelations(); refreshDrawerWorkspace(id); }).catch((err) => toast(err.message)); }
 function lockPageScroll() {
   if (pageScrollLockDepth === 0) {
     lockedScrollY = window.scrollY;
