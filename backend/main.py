@@ -446,79 +446,10 @@ def init_sqlite_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_customers_import_job ON customers(import_job_id, archived_at)")
 
 
-PRIORITY_INFERIOR_SQLITE = """
-CREATE TABLE IF NOT EXISTS priority_inferior_batches (
-    id TEXT PRIMARY KEY,
-    batch_date TEXT NOT NULL UNIQUE,
-    source_file TEXT NOT NULL DEFAULT '',
-    source_hash TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS priority_inferior_participations (
-    id TEXT PRIMARY KEY,
-    batch_id TEXT NOT NULL REFERENCES priority_inferior_batches(id),
-    customer_id TEXT REFERENCES customers(id),
-    tw_code TEXT NOT NULL DEFAULT '',
-    customer_name TEXT NOT NULL DEFAULT '',
-    broker_account_status TEXT NOT NULL DEFAULT '',
-    deposit_amount REAL,
-    on_site_opener TEXT NOT NULL DEFAULT '',
-    insurance_broker TEXT NOT NULL DEFAULT '',
-    zhongyang_witness TEXT NOT NULL DEFAULT '',
-    customer_type TEXT NOT NULL DEFAULT '',
-    agreement_signed TEXT NOT NULL DEFAULT '',
-    agreement_amount_usd REAL,
-    jiaoyang_owner TEXT NOT NULL DEFAULT '',
-    notes TEXT NOT NULL DEFAULT '',
-    source_row INTEGER,
-    raw_json TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL,
-    UNIQUE(batch_id, tw_code, customer_name)
-);
-CREATE INDEX IF NOT EXISTS idx_priority_participations_batch ON priority_inferior_participations(batch_id);
-CREATE INDEX IF NOT EXISTS idx_priority_participations_tw ON priority_inferior_participations(tw_code);
-CREATE INDEX IF NOT EXISTS idx_priority_participations_insurance_broker ON priority_inferior_participations(insurance_broker);
-CREATE INDEX IF NOT EXISTS idx_priority_participations_jiaoyang_owner ON priority_inferior_participations(jiaoyang_owner);
-CREATE TABLE IF NOT EXISTS priority_inferior_asset_snapshots (
-    id TEXT PRIMARY KEY,
-    snapshot_date TEXT NOT NULL,
-    tw_code TEXT NOT NULL,
-    customer_id TEXT REFERENCES customers(id),
-    total_asset_usd REAL NOT NULL DEFAULT 0,
-    source_file TEXT NOT NULL DEFAULT '',
-    source_hash TEXT NOT NULL DEFAULT '',
-    source_rows_json TEXT NOT NULL DEFAULT '[]',
-    created_at TEXT NOT NULL,
-    UNIQUE(snapshot_date, tw_code)
-);
-CREATE TABLE IF NOT EXISTS priority_inferior_secondary_snapshots (
-    id TEXT PRIMARY KEY,
-    snapshot_date TEXT NOT NULL,
-    tw_code TEXT NOT NULL,
-    customer_id TEXT REFERENCES customers(id),
-    security_name TEXT NOT NULL DEFAULT 'XMax',
-    quantity REAL NOT NULL DEFAULT 0,
-    source_file TEXT NOT NULL DEFAULT '',
-    source_hash TEXT NOT NULL DEFAULT '',
-    source_row INTEGER,
-    created_at TEXT NOT NULL,
-    UNIQUE(snapshot_date, tw_code, security_name)
-);
-CREATE INDEX IF NOT EXISTS idx_priority_secondary_date ON priority_inferior_secondary_snapshots(snapshot_date);
-"""
-
-
-def init_priority_inferior_db() -> None:
-    with db() as conn:
-        conn.executescript(PRIORITY_INFERIOR_SQLITE)
-
-
 def init_postgres_db() -> None:
     with db() as conn:
         for statement in POSTGRES_SCHEMA_STATEMENTS:
             conn.execute(statement)
-        for statement in [s.strip() for s in PRIORITY_INFERIOR_SQLITE.split(';') if s.strip()]:
-            conn.execute(statement.replace('REAL', 'DOUBLE PRECISION').replace('INTEGER', 'INTEGER'))
         for customer in conn.execute("SELECT id, name, wechat_nickname, name_pinyin FROM customers").fetchall():
             generated = customer_name_pinyin(customer["name"], customer["wechat_nickname"])
             if generated != str(customer["name_pinyin"] or ""):
@@ -530,7 +461,6 @@ def init_db() -> None:
         init_postgres_db()
         return
     init_sqlite_db()
-    init_priority_inferior_db()
 
 
 init_db()
@@ -1022,55 +952,6 @@ def current_user(
     return enrich_user(user)
 
 
-@app.get("/api/priority-inferior/batches")
-def priority_inferior_batches(user: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
-    """List independent priority-inferior batches with J-column based totals."""
-    with db() as conn:
-        rows = conn.execute(
-            """SELECT b.id, b.batch_date, b.source_file,
-               COUNT(p.id) FILTER (WHERE p.agreement_amount_usd IS NOT NULL AND p.agreement_amount_usd > 0) AS participant_count,
-               COALESCE(SUM(p.agreement_amount_usd), 0) AS agreement_amount_usd
-               FROM priority_inferior_batches b
-               LEFT JOIN priority_inferior_participations p ON p.batch_id = b.id
-               GROUP BY b.id ORDER BY b.batch_date DESC""" if uses_postgres(DATABASE_URL) else
-            """SELECT b.id, b.batch_date, b.source_file,
-               SUM(CASE WHEN p.agreement_amount_usd IS NOT NULL AND p.agreement_amount_usd > 0 THEN 1 ELSE 0 END) AS participant_count,
-               COALESCE(SUM(p.agreement_amount_usd), 0) AS agreement_amount_usd
-               FROM priority_inferior_batches b
-               LEFT JOIN priority_inferior_participations p ON p.batch_id = b.id
-               GROUP BY b.id ORDER BY b.batch_date DESC"""
-        ).fetchall()
-    return [dict(row) for row in rows]
-
-
-@app.get("/api/priority-inferior/batches/{batch_id}/participations")
-def priority_inferior_participations(batch_id: str, user: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
-    with db() as conn:
-        rows = conn.execute(
-            """SELECT p.*, c.name AS linked_customer_name, c.owner_name AS current_owner_name
-               FROM priority_inferior_participations p
-               LEFT JOIN customers c ON c.id = p.customer_id
-               WHERE p.batch_id = ? ORDER BY p.source_row, p.customer_name""", (batch_id,)
-        ).fetchall()
-    return [dict(row) for row in rows]
-
-
-@app.get("/api/priority-inferior/customers/{tw_code}")
-def priority_inferior_customer_history(tw_code: str, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    with db() as conn:
-        batches = conn.execute(
-            """SELECT p.*, b.batch_date FROM priority_inferior_participations p
-               JOIN priority_inferior_batches b ON b.id = p.batch_id
-               WHERE p.tw_code = ? ORDER BY b.batch_date DESC""", (tw_code.strip(),)
-        ).fetchall()
-        assets = conn.execute(
-            "SELECT * FROM priority_inferior_asset_snapshots WHERE tw_code = ? ORDER BY snapshot_date DESC", (tw_code.strip(),)
-        ).fetchall()
-        secondary = conn.execute(
-            "SELECT * FROM priority_inferior_secondary_snapshots WHERE tw_code = ? ORDER BY snapshot_date DESC", (tw_code.strip(),)
-        ).fetchall()
-    return {"twCode": tw_code.strip(), "priorityInferior": [dict(r) for r in batches], "assets": [dict(r) for r in assets], "secondary": [dict(r) for r in secondary]}
-
 
 def require_supervisor(user: dict[str, Any]) -> None:
     if not user["canManageAssignments"]:
@@ -1175,15 +1056,16 @@ def default_advisor_binding(conn: sqlite3.Connection, hongan_advisor: str, custo
     if not clean_hongan or customer_type != "non_placement":
         return None, None
     validate_advisor_binding_values(customer_type, "default")
-    rows = conn.execute(
-        "SELECT * FROM advisor_bindings WHERE active=1 AND customer_type=? AND assignment_mode='default' AND lower(trim(hongan_advisor))=lower(trim(?)) ORDER BY updated_at DESC",
-        (customer_type, clean_hongan),
-    ).fetchall()
+    from backend.priority_import import normalized as normalize_broker
+    rows = [r for r in conn.execute(
+        "SELECT * FROM advisor_bindings WHERE active=1 AND customer_type=? AND assignment_mode='default' ORDER BY updated_at DESC",
+        (customer_type,),
+    ).fetchall() if normalize_broker(r['hongan_advisor']) == normalize_broker(clean_hongan)]
     if len(rows) != 1:
         return None, None
     rule = rows[0]
     advisor = platform_user_by_id(rule["jiaoyang_advisor_id"]) if rule["jiaoyang_advisor_id"] else None
-    if advisor and not advisor.get("active", False):
+    if advisor and (not advisor.get("active", False) or advisor.get('rolePermission') not in {'manager','supervisor'}):
         advisor = None
     return advisor, dict(rule)
 
@@ -3520,7 +3402,7 @@ def resolve_import_assignment(conn: sqlite3.Connection, row: dict[str, Any], fal
     owner = fallback_owner
     if owner["id"] == UNASSIGNED_OWNER_ID and not matched:
         bound_owner, _ = default_advisor_binding(conn, values.get("hkAdvisor", values.get("hongan_advisor", "")), customer_type_for_values(values))
-        if bound_owner:
+        if bound_owner and (user['customerScope'] == 'all' or (user['customerScope'] == 'team' and bound_owner['team'] == user['team']) or bound_owner['id'] == user['id']):
             owner = bound_owner
     if manager and (user["customerScope"] == "all" or manager["team"] == user["team"]):
         owner = manager
@@ -3836,55 +3718,6 @@ def parse_hongan_activity_workbook(content: bytes, selected_sheets: list[str] | 
         return None
     return {"rows": activity_rows, "sheets": sheet_stats, "recognizedSheets": recognized_sheets}
 
-
-def parse_priority_inferior_workbook(content: bytes, selected_sheets: list[str] | None = None) -> dict[str, Any] | None:
-    """Parse dated 港安 ICC sheets for the independent priority-inferior board.
-
-    The J column is authoritative for USD agreement amount. All ICC columns are
-    retained in ``raw`` so future fields do not require changing the importer.
-    """
-    sheets = parse_xlsx_without_styles(content)
-    selected = {simplify_text(name).strip() for name in selected_sheets or [] if str(name).strip()}
-    batches: list[dict[str, Any]] = []
-    for sheet_name, raw_rows in sheets:
-        if selected and simplify_text(sheet_name).strip() not in selected:
-            continue
-        if not re.fullmatch(r"20\d{2}[./-]\d{1,2}[./-]\d{1,2}", simplify_text(sheet_name).strip()):
-            continue
-        rows = [[clean_import_cell(v) for v in row] for row in raw_rows]
-        header_idx = next((i for i, row in enumerate(rows[:10]) if len(row) >= 10 and simplify_text(row[1]) == "客户姓名" and simplify_text(row[9]) == "优先劣后金额"), None)
-        if header_idx is None:
-            continue
-        records = []
-        for source_row, row in enumerate(rows[header_idx + 1:], start=header_idx + 2):
-            if len(row) < 2 or not str(row[1] or "").strip():
-                continue
-            name = str(row[1]).strip()
-            if name in {"合计", "总计"}:
-                continue
-            amount = row[9] if len(row) > 9 else ""
-            try:
-                amount = float(amount) if amount not in (None, "") else None
-            except (TypeError, ValueError):
-                amount = None
-            records.append({
-                "batchDate": re.sub(r"[./]", "-", simplify_text(sheet_name).strip()),
-                "customerName": name,
-                "brokerAccountStatus": row[2] if len(row) > 2 else "",
-                "depositAmount": row[3] if len(row) > 3 else "",
-                "onSiteOpener": row[4] if len(row) > 4 else "",
-                "insuranceBroker": row[5] if len(row) > 5 else "",
-                "zhongyangWitness": row[6] if len(row) > 6 else "",
-                "customerType": row[7] if len(row) > 7 else "",
-                "agreementSigned": row[8] if len(row) > 8 else "",
-                "agreementAmountUsd": amount,
-                "jiaoyangOwner": row[10] if len(row) > 10 else "",
-                "notes": row[11] if len(row) > 11 else "",
-                "sourceRow": source_row,
-                "raw": row,
-            })
-        batches.append({"batchDate": re.sub(r"[./]", "-", simplify_text(sheet_name).strip()), "rows": records})
-    return {"batches": batches, "rows": [r for b in batches for r in b["rows"]]} if batches else None
 
 
 def hongan_activity_match_diagnostics(conn: Any, rows: list[dict[str, Any]], limit: int | None = 200) -> dict[str, Any]:
@@ -5659,5 +5492,72 @@ def platform_logo():
         raise HTTPException(404, "Logo not configured")
     return FileResponse(match)
 
+
+class ApplyDefaultBindingsPayload(BaseModel):
+    token: str = ''
+
+
+def default_binding_assignment_plan(conn, user):
+    require_advisor_binding_manager(user)
+    require_supervisor(user)
+    if user['customerScope'] != 'all':
+        raise HTTPException(403, '批量应用默认绑定需要全量客户范围。')
+    plan = []
+    for raw in conn.execute("SELECT * FROM customers WHERE archived_at IS NULL ORDER BY id").fetchall():
+        c = dict(raw)
+        if not c['hongan_advisor'].strip():
+            continue
+        owner, rule = default_advisor_binding(conn,c['hongan_advisor'],'non_placement')
+        existing_batch = conn.execute("SELECT id FROM batch_participations WHERE customer_id=? AND status!='未参与' LIMIT 1",(c['id'],)).fetchone()
+        if customer_type_for_values(c) == 'placement' or existing_batch:
+            reason = '定增参与 / 意向客户，保留领导指派'
+        elif c['owner_id'] != UNASSIGNED_OWNER_ID:
+            reason = '已有负责人，保留；历史分配来源待核对'
+        elif c['source_advisor_label'].strip():
+            reason = '原表已有指派姓名，请先核对账号'
+        elif not owner:
+            reason = '未配置唯一有效绑定或账号未关联 / 已停用'
+        else:
+            reason = '可按默认绑定分配'
+        plan.append(dict(id=c['id'],name=c['name'],broker=c['hongan_advisor'],version=c['version'],
+                         beforeOwner=c['owner_name'],ownerId=owner['id'] if owner else '',
+                         ownerName=owner['name'] if owner else '',ownerTeam=owner['team'] if owner else '',
+                         apply=reason=='可按默认绑定分配',reason=reason))
+    token=hashlib.sha256(json.dumps(plan,ensure_ascii=False,sort_keys=True).encode()).hexdigest()
+    return {'items':plan,'token':token,'count':sum(r['apply'] for r in plan)}
+
+
+@app.post('/api/advisor-bindings/apply-existing/preview')
+def preview_existing_bindings(user=Depends(current_user)):
+    with db() as conn:
+        return default_binding_assignment_plan(conn,user)
+
+
+@app.post('/api/advisor-bindings/apply-existing/commit')
+def commit_existing_bindings(payload: ApplyDefaultBindingsPayload,user=Depends(current_user)):
+    with db() as conn:
+        conn.execute('UPDATE priority_write_lock SET version=version+1 WHERE id=1')
+        plan=default_binding_assignment_plan(conn,user)
+        if not payload.token or payload.token != plan['token']:
+            raise HTTPException(409,'归属或绑定已变化，请重新预览。')
+        for item in plan['items']:
+            if not item['apply']:
+                continue
+            now=now_iso()
+            conn.execute('UPDATE customers SET owner_id=?,owner_name=?,owner_team=?,updated_at=?,version=version+1 WHERE id=? AND version=? AND owner_id=?',
+                         (item['ownerId'],item['ownerName'],item['ownerTeam'],now,item['id'],item['version'],UNASSIGNED_OWNER_ID))
+            # Recheck optimistic write before recording a successful assignment.
+            current=conn.execute('SELECT owner_id,version FROM customers WHERE id=?',(item['id'],)).fetchone()
+            if current['owner_id']!=item['ownerId'] or current['version']!=item['version']+1:
+                raise HTTPException(409,'客户已被其他人修改，请重新预览。')
+            conn.execute('INSERT INTO assignments VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+                         (str(uuid4()),item['id'],UNASSIGNED_OWNER_ID,item['beforeOwner'],'待分配池',item['ownerId'],item['ownerName'],item['ownerTeam'],'保险经纪人默认绑定',user['id'],user['name'],now))
+            audit(conn,user,'customer.assigned_from_binding','customer',item['id'],item)
+    return {'assignedCount':plan['count']}
+
+
+from backend.priority_inferior import install as install_priority_inferior
+
+install_priority_inferior(app, db, current_user, access_clause, audit, now_iso, platform_users)
 
 app.mount("/", StaticFiles(directory=ROOT_DIR / "frontend", html=True), name="frontend")
