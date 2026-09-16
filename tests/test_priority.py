@@ -327,3 +327,113 @@ def test_binding_disable_and_inactive_account_remove_auto_access(client, monkeyp
     monkeypatch.setitem(main.DEMO_USERS,'manager',{**original,'active':False})
     row=client.get('/api/priority-inferior/batches/2026-09-09/participations').json()['rows'][0]
     assert not row['serviceOwnerId'] and '停用' in row['assignmentReason']
+
+
+def workspace_note(client, key='tw:TW2026001', business='priority', **extra):
+    return client.post('/api/workspace/followups',json=dict(subjectKey=key,business=business,
+            content='客户已收到资料，下周联系',nextAction='确认资料',**extra))
+
+
+def test_workspace_notes_batch_validation_completion_and_no_placement_change(client):
+    publish(client,[master(),icc()])
+    assert workspace_note(client,batchKey='2026-01-01').status_code==422
+    assert workspace_note(client,business='placement').status_code==404
+    r=workspace_note(client,batchKey='2026-09-09',nextFollowupAt='2026-09-20T09:00:00+08:00')
+    assert r.status_code==201,r.text
+    rows=client.get('/api/workspace/followups').json()['items']
+    assert len(rows)==1 and rows[0]['next_followup_at']=='2026-09-20T01:00:00+00:00'
+    assert client.post('/api/workspace/followups/'+r.json()['id']+'/complete').status_code==200
+    assert client.get('/api/workspace/followups').json()['items'][0]['completed_at']
+    with main.db() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM customers').fetchone()[0]==0
+
+
+def test_workspace_pending_identity_notes_follow_confirmation(client):
+    publish(client,[master(),icc(name='待核实姓名')])
+    d=client.get('/api/priority-inferior/batches/2026-09-09/participations').json()
+    record=d['rows'][0]
+    anchor='icc:2026-09-09/'+record['recordKey']
+    assert workspace_note(client,key=anchor).status_code==201
+    r=client.patch('/api/priority-inferior/batches/2026-09-09/records/'+record['recordKey'],json={
+        'expectedRevision':d['revision'],'changes':{'twCode':'TW2026001'},'reason':'核对客户编号'})
+    assert r.status_code==200,r.text
+    card=client.get('/api/workspace/card',params={'key':'tw:TW2026001'}).json()
+    assert len(card['followups'])==1
+    assert card['followups'][0]['subject_key']=='tw:TW2026001'
+
+
+def test_workspace_product_permissions_and_reassignment(client):
+    publish(client,[master(),service_icc()]);bind_service(client)
+    with main.db() as conn:
+        main.create_customer_record(conn,{'name':'甲','customerCode':'TW2026001'},main.DEMO_USERS['manager2'],client.test_user)
+        c=conn.execute('SELECT id FROM customers').fetchone()
+        conn.execute('UPDATE customers SET customer_code=? WHERE id=?',('TW2026001',c['id']))
+    assert workspace_note(client,business='placement').status_code==201
+    assert workspace_note(client,business='service').status_code==201
+    assert workspace_note(client).status_code==201
+    admin=dict(client.test_user)
+    client.test_user.update(id='demo-manager',customerScope='self',rolePermission='manager',team='演示一组')
+    card=client.get('/api/workspace/card',params={'key':'tw:TW2026001'}).json()
+    assert card['crm']==[] and {r['business'] for r in card['followups']}=={'service','priority'}
+    assert workspace_note(client,business='placement').status_code==404
+    client.test_user.update(id='demo-manager-2')
+    card=client.get('/api/workspace/card',params={'key':'tw:TW2026001'}).json()
+    assert card['priority']==[] and {r['business'] for r in card['followups']}=={'service','placement'}
+    assert workspace_note(client).status_code==404
+    client.test_user.update(admin);bind_service(client,'demo-manager-2')
+    client.test_user.update(id='demo-manager',customerScope='self',rolePermission='manager',team='演示一组')
+    assert client.get('/api/workspace/followups').json()['items']==[]
+
+
+def test_workspace_preserves_legacy_classification_and_customer_stage(client):
+    with main.db() as conn:
+        main.create_customer_record(conn,{'name':'老客户'},main.DEMO_USERS['manager'],client.test_user)
+        c=dict(conn.execute('SELECT * FROM customers').fetchone())
+        conn.execute('INSERT INTO followups VALUES (?,?,?,?,?,?,?,?,?,?,?)',('old',c['id'],'demo-admin','管理员','电话','旧跟进','','',None,c['stage'],main.now_iso()))
+    assert workspace_note(client,key='crm:'+c['id'],business='service').status_code==201
+    result=client.get('/api/workspace/card',params={'key':'crm:'+c['id']})
+    assert result.status_code==200,result.text
+    assert {r['business'] for r in result.json()['followups']}=={'legacy','service'}
+    with main.db() as conn:
+        after=dict(conn.execute('SELECT * FROM customers WHERE id=?',(c['id'],)).fetchone())
+    assert after['stage']==c['stage'] and after['placement_status']==c['placement_status']
+
+
+def test_workspace_input_validation_and_foreign_completion(client):
+    publish(client,[master(),icc()])
+    r=workspace_note(client,nextFollowupAt='2026-09-20T12:00:00')
+    assert r.status_code==422
+    assert client.post('/api/workspace/followups',json={'subjectKey':'tw:TW2026001','business':'priority','content':'  '}).status_code==422
+    r=workspace_note(client,nextFollowupAt='2026-09-20T12:00:00Z')
+    assert r.status_code==201
+    client.test_user.update(id='stranger',customerScope='self',rolePermission='manager',team='其他组')
+    assert client.post('/api/workspace/followups/'+r.json()['id']+'/complete').status_code==404
+    assert client.get('/api/workspace/card',params={'key':'tw:TW2026001'}).status_code==404
+
+
+def test_workspace_followups_protect_activity_rollback_and_crm_import(client):
+    p=publish(client,[master(),icc()])
+    assert workspace_note(client).status_code==201
+    assert client.post('/api/priority-inferior/imports/'+p['id']+'/rollback').status_code==409
+    with main.db() as conn:
+        main.create_customer_record(conn,{'name':'普通服务客户'},main.DEMO_USERS['manager'],client.test_user)
+        c=dict(conn.execute('SELECT * FROM customers').fetchone())
+    assert workspace_note(client,key='crm:'+c['id'],business='service').status_code==201
+    with main.db() as conn:
+        assert main.customer_followup_count(conn,c['id'])==1
+
+
+def test_workspace_shares_assets_without_product_private_records(client):
+    publish(client,[master(),icc(),assets()])
+    with main.db() as conn:
+        main.create_customer_record(conn,{'name':'甲'},main.DEMO_USERS['manager2'],client.test_user)
+        conn.execute("UPDATE customers SET customer_code='TW2026001'")
+    client.test_user.update(id='demo-manager-2',customerScope='self',rolePermission='manager',team='演示一组')
+    p=client.get('/api/workspace/card',params={'key':'tw:TW2026001'}).json()
+    assert p['priority']==[] and p['assets'][0]['assetUsd']=='26.37'
+
+
+def test_workspace_service_note_protects_last_identity_rollback(client):
+    p=publish(client,[master()])
+    assert workspace_note(client,business='service').status_code==201
+    assert client.post('/api/priority-inferior/imports/'+p['id']+'/rollback').status_code==409

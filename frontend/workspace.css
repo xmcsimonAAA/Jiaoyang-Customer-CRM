@@ -1,0 +1,26 @@
+.sidebar .nav-caption { margin-top:22px; margin-bottom:8px; letter-spacing:.12em; }
+.sidebar .product-nav { display:grid; gap:10px; }
+.sidebar .product-nav button { border:1px solid #ffffff35; border-radius:14px; min-height:56px; font-size:16px; font-weight:700; }
+.sidebar .product-nav button.active { background:#d6ef78; color:#242820; border-color:#d6ef78; }
+.workspace-tabs { display:flex; flex-wrap:wrap; gap:8px; margin:18px 0 6px; }
+.workspace-tabs button { background:#fff; border:1px solid #d8dfd9; border-radius:9px; padding:10px 15px; cursor:pointer; }
+.workspace-tabs button.active { background:#243e32; color:#fff; }
+.business-context { background:#f1f5ef; border:1px solid #dce3d9; border-radius:16px; padding:22px; margin-bottom:24px; }
+.business-context h3 { margin:8px 0; font-size:26px; }
+.business-context > span { color:#52634f; font-size:12px; font-weight:700; }
+.workspace-toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:12px; padding:16px; }
+.workspace-toolbar input,.workspace-toolbar select,#card-note-filter { border:1px solid #d4ddd5; border-radius:8px; padding:10px; background:white; max-width:100%; }
+.workspace-note { padding:16px 22px; border-top:1px solid #e0e6e0; }
+.workspace-note p { white-space:pre-wrap; overflow-wrap:anywhere; margin:10px 0; }
+.workspace-followup { border-bottom:1px solid #d7dfd6; }
+.workspace-followup .workspace-note { border:0; padding-top:0; }
+.workspace-home { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:16px; margin-bottom:18px; }
+.workspace-home button { background:#edf2e8; border:1px solid #d4dfcd; border-radius:16px; text-align:left; padding:24px; cursor:pointer; color:#21352a; }
+.workspace-home button:nth-child(2) { background:#e4edce; }
+.workspace-home strong,.workspace-home span { display:block; margin-top:12px; }
+.workspace-home strong { font-size:25px; }
+.workspace-home span { font-size:13px; }
+@media(max-width:800px) { .workspace-home { grid-template-columns:1fr; } .workspace-toolbar { padding:12px; } .business-context { padding:16px; } }
+
+.main > .business-context { margin:24px 28px 0; }
+@media(max-width:800px) { .main > .business-context { margin:16px 12px 0; } }

@@ -21,7 +21,10 @@ from pydantic import BaseModel, Field
 from backend.priority_assignment import SCHEMA as BINDING_SCHEMA, resolve as resolve_assignments, decorate
 from backend.priority_import import FIELDS, iso, normalized, number, parse, sum_values, text, tw
 
+from backend.workspace import SCHEMA as WORKSPACE_SCHEMA, install as install_workspace
+
 SCHEMA = [
+    *WORKSPACE_SCHEMA,
     BINDING_SCHEMA,
     "CREATE TABLE IF NOT EXISTS priority_write_lock (id INTEGER PRIMARY KEY, version INTEGER NOT NULL)",
     "INSERT INTO priority_write_lock VALUES (1,0) ON CONFLICT(id) DO NOTHING",
@@ -395,6 +398,26 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                 head = conn.execute('SELECT head_id FROM priority_datasets WHERE dataset_key=?', (r['dataset_key'],)).fetchone()
                 if head['head_id'] != r['id']:
                     raise HTTPException(409, '这份资料已有后续修订，请先撤销后续修订。')
+            # A rollback must not orphan a customer or activity with followups.
+            anchors = {r['subject_key'] for r in conn.execute('SELECT subject_key FROM workspace_followups').fetchall()}
+            before_heads = heads(conn)
+            after_heads = copy.deepcopy(before_heads)
+            for r in revisions:
+                parent = conn.execute('SELECT rows_json FROM priority_revisions WHERE id=?',(r['parent_id'],)).fetchone()
+                after_heads[r['dataset_key']]['rows'] = json.loads(parent['rows_json']) if parent else []
+            def subject_keys(datasets):
+                keys = set()
+                for d in datasets.values():
+                    for row in d['rows']:
+                        if row.get('twCode'):
+                            keys.add('tw:' + row['twCode'])
+                        if d['kind'] == 'icc':
+                            keys.add(d['dataset_key'] + '/' + row['recordKey'])
+                # Existing CRM identities remain reachable after source rollback.
+                keys.update('tw:' + code for code in links(conn,user))
+                return keys
+            if anchors & (subject_keys(before_heads) - subject_keys(after_heads)):
+                raise HTTPException(409, '资料已有客户跟进，撤销会使跟进失去关联；请修订资料而不是撤销整批。')
             for r in revisions:
                 conn.execute('UPDATE priority_datasets SET head_id=? WHERE dataset_key=?', (r['parent_id'], r['dataset_key']))
             conn.execute("UPDATE priority_uploads SET status='rolled_back' WHERE id=?", (job_id,))
@@ -542,3 +565,5 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
             r = dict(row)
             r['rows'] = json.loads(r.pop('rows_json'))
             return r
+
+    install_workspace(app, db, current_user, access_clause, audit, now_iso, scope_rows, heads)
