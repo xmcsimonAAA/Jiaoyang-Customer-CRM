@@ -1,5 +1,6 @@
 """Shared customer directory and product-scoped notes; legacy notes stay unclassified."""
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from decimal import Decimal
 from typing import Literal
 from uuid import uuid4
 
@@ -39,7 +40,7 @@ def install(app, db, current_user, access_clause, audit, now_iso, priority_scope
     def context(conn, user):
         clause, params = access_clause(user)
         crm = [dict(r) for r in conn.execute(f'''SELECT c.id,c.name,c.customer_code,c.owner_name,c.phone,c.email,
-          c.account_status,c.placement_status,c.target_batch_id,c.stage,i.normalized_value tw_code
+          c.account_status,c.placement_status,c.target_batch_id,c.stage,c.actual_amount,c.intent_status,c.owner_id,i.normalized_value tw_code
           FROM customers c LEFT JOIN customer_identifiers i ON i.customer_id=c.id AND i.kind='tw'
           WHERE c.archived_at IS NULL AND {clause}''', params).fetchall()]
         people, aliases = {}, {}
@@ -50,6 +51,8 @@ def install(app, db, current_user, access_clause, audit, now_iso, priority_scope
             person = people.setdefault(key, dict(key=key, name=c['name'], twCode=code, crm=[], priority=[], assets=[], secondary=[], master=[]))
             if not any(v['id']==c['id'] for v in person['crm']):
                 person['crm'].append(c)
+        from backend.shared_customers import archived_codes
+        blocked=archived_codes(conn)
         source_heads = heads(conn)
         all_heads, _ = priority_scope(conn, source_heads, user)
         # Identity, asset and holding snapshots are shared for an already-visible TW.
@@ -61,6 +64,8 @@ def install(app, db, current_user, access_clause, audit, now_iso, priority_scope
         for d in sorted(all_heads.values(), key=lambda d:d['business_date']):
             for r in d['rows']:
                 code = r.get('twCode')
+                if code in blocked:
+                    continue
                 anchor = 'icc:' + d['business_date'] + '/' + r['recordKey']
                 if not code and d['kind'] != 'icc':
                     continue
@@ -97,6 +102,69 @@ def install(app, db, current_user, access_clause, audit, now_iso, priority_scope
                     placementOwner='、'.join(sorted({c['owner_name'] for c in p['crm'] if c['owner_name']})),
                     priorityOwner=p['priority'][-1].get('serviceOwner','') if p['priority'] else '',
                     businesses=['service'] + (['placement'] if p['crm'] else []) + (['priority'] if p['priority'] else []))
+
+    @app.get('/api/workspace/dashboard')
+    def dashboard(user=Depends(current_user)):
+        with db() as conn:
+            people, aliases = context(conn,user)
+            records = notes(conn,people,aliases)
+            now=datetime.now(timezone.utc)
+            def parsed(value):
+                try:
+                    dt=datetime.fromisoformat(value.replace('Z','+00:00'))
+                    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+                except (ValueError,TypeError,AttributeError):
+                    return None
+            def due(r):
+                dt=parsed(r['next_followup_at'])
+                return not r['legacy'] and not r['completed_at'] and dt and dt<=now
+            active=[p for p in people.values() if p['twCode'] or p['crm']]
+            placement_keys, priority_keys = set(),set()
+            placement_amount=Decimal('0')
+            priority_amount=Decimal('0')
+            placement_records=0
+            pending_priority=0
+            priority_records=0
+            # Fetch once; only use rows belonging to the user's visible CRM records.
+            batches={}
+            for row in conn.execute('SELECT customer_id,status,actual_amount FROM batch_participations').fetchall():
+                batches.setdefault(row['customer_id'],[]).append(dict(row))
+            seen_crm=set()
+            for key,p in people.items():
+                for c in p['crm']:
+                    if c['id'] in seen_crm:
+                        continue
+                    seen_crm.add(c['id'])
+                    history=batches.get(c['id'],[])
+                    joined=[r for r in history if r['status']=='已参与']
+                    # Batch records are authoritative; old master totals are a fallback only.
+                    if history:
+                        if joined:
+                            placement_keys.add(key)
+                            placement_records+=len(joined)
+                        placement_amount+=sum((Decimal(str(r['actual_amount'] or 0)) for r in joined),Decimal('0'))
+                    elif c['placement_status']=='已参与':
+                        placement_keys.add(key)
+                        placement_records+=1
+                        placement_amount+=Decimal(str(c['actual_amount'] or 0))
+                for r in p['priority']:
+                    amount=Decimal(str(r.get('agreementAmountUsd') or 0))
+                    if amount>0:
+                        priority_amount+=amount
+                        priority_records+=1
+                        if p['twCode']:
+                            priority_keys.add(key)
+                        else:
+                            pending_priority+=1
+            start=now-timedelta(days=14)
+            recent=[r for r in records if (parsed(r['created_at']) or datetime.min.replace(tzinfo=timezone.utc))>=start]
+            return dict(customers=len(active),pendingIdentities=sum(not p['twCode'] and not p['crm'] for p in people.values()),
+                        followups=dict(recent14=len(recent),byBusiness={b:sum(r['business']==b for r in recent) for b in ['service','placement','priority','legacy']},
+                                       due=sum(bool(due(r)) for r in records),mineDue=sum(bool(due(r)) and r['author_id']==user['id'] for r in records),
+                                       latest=records[:8]),
+                        placement=dict(participants=len(placement_keys),records=placement_records,actualAmount=str(placement_amount)),
+                        priority=dict(participants=len(priority_keys),records=priority_records,pendingParticipations=pending_priority,agreementUsd=str(priority_amount)),
+                        overlap=len(placement_keys & priority_keys))
 
     @app.get('/api/workspace/customers')
     def directory(user=Depends(current_user)):

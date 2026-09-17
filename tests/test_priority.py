@@ -120,7 +120,7 @@ def test_complete_upload_duplicate_and_unmatched_preserved(client):
     result=client.get('/api/priority-inferior/overview').json()['summary']
     assert result['participants']==1 and result['pending']==1 and result['unmatchedParticipations']==1
     with main.db() as c:
-        assert c.execute('SELECT count(*) FROM customers').fetchone()[0]==0
+        assert c.execute('SELECT count(*) FROM customers').fetchone()[0]==2
         assert c.execute('SELECT count(*) FROM batch_participations').fetchone()[0]==0
         assert len(c.execute('SELECT * FROM priority_revisions').fetchall())==4
         assert 'contentBase64' in c.execute('SELECT sources_json FROM priority_uploads WHERE id=?',(p['id'],)).fetchone()[0]
@@ -337,7 +337,7 @@ def workspace_note(client, key='tw:TW2026001', business='priority', **extra):
 def test_workspace_notes_batch_validation_completion_and_no_placement_change(client):
     publish(client,[master(),icc()])
     assert workspace_note(client,batchKey='2026-01-01').status_code==422
-    assert workspace_note(client,business='placement').status_code==404
+    # Shared roster creates a selectable customer; no participation is inferred.
     r=workspace_note(client,batchKey='2026-09-09',nextFollowupAt='2026-09-20T09:00:00+08:00')
     assert r.status_code==201,r.text
     rows=client.get('/api/workspace/followups').json()['items']
@@ -345,7 +345,8 @@ def test_workspace_notes_batch_validation_completion_and_no_placement_change(cli
     assert client.post('/api/workspace/followups/'+r.json()['id']+'/complete').status_code==200
     assert client.get('/api/workspace/followups').json()['items'][0]['completed_at']
     with main.db() as conn:
-        assert conn.execute('SELECT COUNT(*) FROM customers').fetchone()[0]==0
+        assert conn.execute("SELECT COUNT(*) FROM customers WHERE placement_status='已参与'").fetchone()[0]==0
+        assert conn.execute('SELECT COUNT(*) FROM customers').fetchone()[0]==2
 
 
 def test_workspace_pending_identity_notes_follow_confirmation(client):
@@ -365,9 +366,7 @@ def test_workspace_pending_identity_notes_follow_confirmation(client):
 def test_workspace_product_permissions_and_reassignment(client):
     publish(client,[master(),service_icc()]);bind_service(client)
     with main.db() as conn:
-        main.create_customer_record(conn,{'name':'甲','customerCode':'TW2026001'},main.DEMO_USERS['manager2'],client.test_user)
-        c=conn.execute('SELECT id FROM customers').fetchone()
-        conn.execute('UPDATE customers SET customer_code=? WHERE id=?',('TW2026001',c['id']))
+        conn.execute("UPDATE customers SET owner_id='demo-manager-2',owner_name='演示顾问二',owner_team='演示一组' WHERE customer_code='TW2026001'")
     assert workspace_note(client,business='placement').status_code==201
     assert workspace_note(client,business='service').status_code==201
     assert workspace_note(client).status_code==201
@@ -426,8 +425,7 @@ def test_workspace_followups_protect_activity_rollback_and_crm_import(client):
 def test_workspace_shares_assets_without_product_private_records(client):
     publish(client,[master(),icc(),assets()])
     with main.db() as conn:
-        main.create_customer_record(conn,{'name':'甲'},main.DEMO_USERS['manager2'],client.test_user)
-        conn.execute("UPDATE customers SET customer_code='TW2026001'")
+        conn.execute("UPDATE customers SET owner_id='demo-manager-2',owner_name='演示顾问二',owner_team='演示一组' WHERE customer_code='TW2026001'")
     client.test_user.update(id='demo-manager-2',customerScope='self',rolePermission='manager',team='演示一组')
     p=client.get('/api/workspace/card',params={'key':'tw:TW2026001'}).json()
     assert p['priority']==[] and p['assets'][0]['assetUsd']=='26.37'
@@ -436,4 +434,137 @@ def test_workspace_shares_assets_without_product_private_records(client):
 def test_workspace_service_note_protects_last_identity_rollback(client):
     p=publish(client,[master()])
     assert workspace_note(client,business='service').status_code==201
-    assert client.post('/api/priority-inferior/imports/'+p['id']+'/rollback').status_code==409
+    assert client.post('/api/priority-inferior/imports/'+p['id']+'/rollback').status_code==200
+    card=client.get('/api/workspace/card',params={'key':'tw:TW2026001'}).json()
+    assert len(card['followups'])==1  # Shared master survives source rollback.
+
+
+def test_leader_assignment_without_import_permission_is_narrowly_scoped(client):
+    publish(client,[master(),icc()])
+    data=client.get('/api/priority-inferior/batches/2026-09-09/participations').json()
+    url='/api/priority-inferior/batches/2026-09-09/records/'+data['rows'][0]['recordKey']
+    client.test_user['canImportCustomers']=False
+    payload={'expectedRevision':data['revision'],'changes':{'jiaoyangOwner':'演示顾问二'},'reason':'组长指派服务负责人'}
+    assert client.patch(url,json={**payload,'changes':{'notes':'越权编辑'}}).status_code==403
+    response=client.patch(url,json=payload)
+    assert response.status_code==200,response.text
+    row=client.get('/api/priority-inferior/batches/2026-09-09/participations').json()['rows'][0]
+    assert row['serviceOwnerId']=='demo-manager-2'
+    assert client.patch(url,json=payload).status_code==409
+    client.test_user['canManageAssignments']=False
+    assert client.patch(url,json={**payload,'expectedRevision':response.json()['revision']}).status_code==403
+
+
+def test_shared_roster_100_new_customers_ten_priority_participants(client):
+    roster=source('master.xlsx',[('全部',[(1,dict(A='客户姓名',B='是否完成开户',C='备注'))]+
+           [(i+2,dict(A=f'新增客户{i}',B='已开户',C=f'TW202699{i:03}')) for i in range(100)])])
+    activity=source('icc.xlsx',[('2026.09.09',[(2,dict(zip('ABCDEFGHIJKL',HEADERS)))]+
+             [(i+3,dict(B=f'新增客户{i}',J='100',K='演示顾问')) for i in range(10)])])
+    p=preview(client,[roster,activity])
+    assert p['sharedCustomers']['createdCount']==100
+    with main.db() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM customers').fetchone()[0]==0
+    r=client.post('/api/priority-inferior/imports/'+p['id']+'/commit')
+    assert r.status_code==200,r.text
+    assert r.json()['sharedCustomers']['createdCount']==100
+    dashboard=client.get('/api/workspace/dashboard').json()
+    assert dashboard['customers']==100 and dashboard['priority']['participants']==10
+    assert dashboard['placement']['participants']==0 and dashboard['placement']['actualAmount']=='0'
+    assert dashboard['priority']['agreementUsd']=='1000'
+    assert len(client.get('/api/workspace/customers').json()['items'])==100
+    assert len(client.get('/api/priority-inferior/overview').json()['customers'])==100
+    assert client.get('/api/customers?pageSize=100').json()['total']==100
+    again=preview(client,[roster])
+    assert again['sharedCustomers']['createdCount']==0
+    publish(client,[roster])
+    assert client.get('/api/workspace/dashboard').json()['customers']==100
+
+
+def test_shared_backfill_is_idempotent_and_preserves_owners_amounts_and_names(client):
+    with main.db() as conn:
+        c=main.create_customer_record(conn,{'name':'已有客户','twCode':'TW2026001','placementStatus':'已参与','actualAmount':999},main.DEMO_USERS['manager2'],client.test_user)
+    publish(client,[master()])
+    with main.db() as conn:
+        row=dict(conn.execute('SELECT * FROM customers WHERE id=?',(c['id'],)).fetchone())
+        assert row['name']=='已有客户' and row['actual_amount']==999 and row['owner_id']=='demo-manager-2'
+        from backend.priority_inferior import heads
+        result=main.sync_shared_customers(conn,heads(conn),client.test_user)
+        assert result['createdCount']==0
+        assert conn.execute('SELECT COUNT(*) FROM customers').fetchone()[0]==2
+    d=client.get('/api/workspace/dashboard').json()
+    assert d['placement']['participants']==1 and d['placement']['actualAmount']=='999.0'
+
+
+def test_legacy_roster_is_available_to_priority_import_and_query(client):
+    with main.db() as conn:
+        main.create_customer_record(conn,{'name':'甲','twCode':'TW2026001'},main.DEMO_USERS['manager'],client.test_user)
+    publish(client,[icc()])  # No separate priority master upload required.
+    row=client.get('/api/priority-inferior/batches/2026-09-09/participations').json()['rows'][0]
+    assert row['twCode']=='TW2026001'
+    assert client.get('/api/workspace/dashboard').json()['customers']==1
+
+
+def test_shared_dashboard_followups_products_and_visibility(client):
+    publish(client,[master(),icc()])
+    with main.db() as conn:
+        conn.execute("UPDATE customers SET placement_status='已参与',actual_amount=500,owner_id='demo-manager-2',owner_team='演示一组' WHERE customer_code='TW2026001'")
+    note=workspace_note(client,nextFollowupAt='2020-01-01T00:00:00Z')
+    assert note.status_code==201
+    assert workspace_note(client,business='service').status_code==201
+    d=client.get('/api/workspace/dashboard').json()
+    assert d['overlap']==1 and d['followups']['recent14']==2 and d['followups']['due']==1
+    assert d['followups']['byBusiness']['priority']==1
+    assert client.post('/api/workspace/followups/'+note.json()['id']+'/complete').status_code==200
+    assert client.get('/api/workspace/dashboard').json()['followups']['due']==0
+    client.test_user.update(id='demo-manager',customerScope='self',rolePermission='manager',team='演示一组')
+    d=client.get('/api/workspace/dashboard').json()
+    assert d['customers']==1 and d['placement']['participants']==0 and d['priority']['participants']==1
+    client.test_user.update(id='demo-manager-2')
+    d=client.get('/api/workspace/dashboard').json()
+    assert d['customers']==1 and d['placement']['participants']==1 and d['priority']['participants']==0
+    assert d['followups']['byBusiness']['priority']==0
+
+
+def test_archived_tw_not_resurrected_or_duplicated_by_shared_roster(client):
+    with main.db() as conn:
+        c=main.create_customer_record(conn,{'name':'甲','twCode':'TW2026001'},main.DEMO_USERS['manager'],client.test_user)
+        conn.execute('UPDATE customers SET archived_at=? WHERE id=?',(main.now_iso(),c['id']))
+    p=preview(client,[master()])
+    assert p['sharedCustomers']['createdCount']==1
+    assert p['sharedCustomers']['conflicts'][0]['twCode']=='TW2026001'
+    publish(client,[master()])
+    with main.db() as conn:
+        assert conn.execute('SELECT archived_at FROM customers WHERE id=?',(c['id'],)).fetchone()[0]
+        assert conn.execute('SELECT COUNT(*) FROM customers').fetchone()[0]==2
+
+
+def test_shared_dashboard_batch_totals_do_not_double_count_master(client):
+    publish(client,[master(),icc()])
+    with main.db() as conn:
+        c=conn.execute("SELECT id FROM customers WHERE customer_code='TW2026001'").fetchone()
+        conn.execute("UPDATE customers SET placement_status='已参与',actual_amount=9999 WHERE id=?",(c['id'],))
+    for n,amount in enumerate([100,200]):
+        r=client.post('/api/batches',json={'name':f'批次{n}','status':'已完成'})
+        assert r.status_code==201,r.text
+        bid=r.json()['batch']['id']
+        r=client.post('/api/batches/'+bid+'/participations',json={'customerId':c['id'],'status':'已参与','actualAmount':amount})
+        assert r.status_code==201,r.text
+    d=client.get('/api/workspace/dashboard').json()
+    assert d['placement']['participants']==1 and d['placement']['records']==2
+    assert Decimal(d['placement']['actualAmount'])==300
+    assert d['overlap']==1
+
+
+def test_shared_backfill_existing_published_sources_without_reupload(client):
+    from backend.priority_inferior import heads
+    from backend.priority_import import parse
+    import json
+    dataset=parse(base64.b64decode(master()['contentBase64']),'master.xlsx','2026-09-11',[])[0]
+    with main.db() as conn:
+        conn.execute("INSERT INTO priority_datasets VALUES ('master:2026-09-11','master','2026-09-11','r-old')")
+        conn.execute('INSERT INTO priority_revisions VALUES (?,?,?,?,?,?,?,?,?)',('r-old','master:2026-09-11','','old',json.dumps(dataset['rows']),'master.xlsx','old',main.now_iso(),'old'))
+        first=main.sync_shared_customers(conn,heads(conn),client.test_user)
+        second=main.sync_shared_customers(conn,heads(conn),client.test_user)
+        assert first['createdCount']==2 and second['createdCount']==0
+    assert client.get('/api/workspace/dashboard').json()['customers']==2
+    assert client.get('/api/customers').json()['total']==2

@@ -5568,6 +5568,11 @@ def commit_existing_bindings(payload: ApplyDefaultBindingsPayload,user=Depends(c
 
 from backend.priority_inferior import install as install_priority_inferior
 
-install_priority_inferior(app, db, current_user, access_clause, audit, now_iso, platform_users)
+def sync_shared_customers(conn, datasets, user, dry_run=False):
+    from backend.shared_customers import sync
+    return sync(conn,datasets,user,create_customer_record,add_tw_identifier,dict(UNASSIGNED_OWNER),audit,dry_run=dry_run)
+
+
+install_priority_inferior(app, db, current_user, access_clause, audit, now_iso, platform_users, sync_shared_customers)
 
 app.mount("/", StaticFiles(directory=ROOT_DIR / "frontend", html=True), name="frontend")

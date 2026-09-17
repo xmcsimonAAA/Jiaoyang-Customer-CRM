@@ -173,10 +173,24 @@ def prepare_dataset(dataset, previous):
 
 
 def install(app: Any, db: Callable, current_user: Callable, access_clause: Callable, audit: Callable,
-            now_iso: Callable, platform_users: Callable) -> None:
+            now_iso: Callable, platform_users: Callable, sync_customers: Callable) -> None:
     with db() as conn:
         for sql in SCHEMA:
             conn.execute(sql)
+        conn.execute('UPDATE priority_write_lock SET version=version+1 WHERE id=1')
+        sync_customers(conn, heads(conn), {'id':'system-shared-registry','name':'共用客户主档迁移',
+                      'customerScope':'all','canManageAssignments':True,'canManageAdvisorBindings':True})
+
+    def shared_registry(conn, datasets):
+        from backend.shared_customers import identities, archived_codes
+        # Keep existing CRM names when TW already exists; sources remain available in history.
+        source=registry(datasets)
+        result={**source, **identities(conn)}
+        for code, row in source.items():
+            if row.get('brokerAccountStatus'):
+                result[code]['brokerAccountStatus']=row['brokerAccountStatus']
+        blocked=archived_codes(conn)
+        return {k:v for k,v in result.items() if k not in blocked}
 
     def require_import(user):
         if not user.get('canImportCustomers') or user.get('customerScope') != 'all':
@@ -210,6 +224,10 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
     def scope_rows(conn, all_heads, user):
         visible = links(conn, user)
         result = copy.deepcopy(all_heads)
+        from backend.shared_customers import archived_codes
+        blocked=archived_codes(conn)
+        for d in result.values():
+            d['rows']=[r for r in d['rows'] if r.get('twCode') not in blocked]
         assignments = assignment_data(conn, all_heads)
         decorate(result, assignments)
         if user['customerScope'] == 'all':
@@ -307,7 +325,7 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
             raise HTTPException(422, '同一日期同一来源只保留一份文件；修订表请单独上传。')
         with db() as conn:
             current = heads(conn)
-            identities = registry(current)
+            identities = shared_registry(conn, current)
             for d in datasets:
                 if d['kind'] == 'master':
                     identities.update({r['twCode']: r for r in d['rows']})
@@ -334,11 +352,15 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                 if d['duplicate']:
                     d['rows'] = copy.deepcopy(before['rows'])
                     d['changes'] = []
+            proposed=copy.deepcopy(current)
+            for d in datasets:
+                proposed[d['key']]={**d,'business_date':d['date']}
+            shared_preview=sync_customers(conn,proposed,user,dry_run=True)
             result = [summary(d) for d in datasets]
             job = str(uuid4())
             conn.execute('INSERT INTO priority_uploads VALUES (?,?,?,?,?,?,?)',
                          (job, 'preview', dumps({'datasets': datasets, 'baseHeads': {k: v['head_id'] for k, v in current.items()}}), dumps(sources), dumps(result), now_iso(), user['id']))
-        return {'id': job, 'datasets': result, 'issues': [dict(key=d['key'], recordKey=r['recordKey'], name=r['customerName'], sourceRow=r['sourceRow'], status=r['matchStatus'], candidates=r['candidates'])
+        return {'id': job, 'datasets': result, 'sharedCustomers':shared_preview, 'issues': [dict(key=d['key'], recordKey=r['recordKey'], name=r['customerName'], sourceRow=r['sourceRow'], status=r['matchStatus'], candidates=r['candidates'])
                 for d in datasets if d['kind'] == 'icc' and not d['duplicate'] for r in d['rows'] if not r.get('twCode')]}
 
     @app.post('/api/priority-inferior/imports/{job_id}/commit')
@@ -369,11 +391,12 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                     rev = str(uuid4())
                     conn.execute('INSERT INTO priority_revisions VALUES (?,?,?,?,?,?,?,?,?)', (rev, key, d['parent'], job_id, dumps(d['rows']), d['filename'], d['fingerprint'], now_iso(), user['id']))
                     conn.execute('UPDATE priority_datasets SET head_id=? WHERE dataset_key=?', (rev, key))
+                shared_result = sync_customers(conn, heads(conn), user)
                 conn.execute("UPDATE priority_uploads SET status='committed' WHERE id=?", (job_id,))
                 audit(conn, user, 'priority.import', 'priority_upload', job_id, {'datasets': json.loads(job['summary_json'])})
         except sqlite3.IntegrityError as exc:
             raise HTTPException(409, '另一项上传刚刚更新了同一份资料，请重新预览。') from exc
-        return {'id': job_id, 'status': 'committed'}
+        return {'id': job_id, 'status': 'committed', 'sharedCustomers':shared_result}
 
     @app.get('/api/priority-inferior/imports')
     def imports(user=Depends(current_user)):
@@ -434,7 +457,10 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
             if asOf:
                 cutoff = iso(asOf)
                 all_heads = {k: v for k, v in all_heads.items() if v['business_date'] <= cutoff}
-            identities = registry(all_heads)
+            identities = shared_registry(conn, all_heads)
+            if user['customerScope'] != 'all':
+                permitted=set(visible)|{r.get('twCode') for d in all_heads.values() for r in d['rows']}
+                identities={k:v for k,v in identities.items() if k in permitted}
             rows_by_kind = {}
             date_by_kind = {}
             for kind in ('assets', 'secondary', 'master'):
@@ -503,7 +529,10 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
 
     @app.patch('/api/priority-inferior/batches/{batch_date}/records/{record_key}')
     def edit(batch_date: str, record_key: str, payload: Edit, user=Depends(current_user)):
-        require_edit(user)
+        if set(payload.changes) == {'jiaoyangOwner'}:
+            require_assignment(user)
+        else:
+            require_edit(user)
         allowed = set(FIELDS) - {'sourceSequence', 'customerName'} | {'twCode', 'participationIntent'}
         if not payload.changes or set(payload.changes) - allowed:
             raise HTTPException(422, '包含不可编辑字段。')
@@ -527,7 +556,7 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                     raise HTTPException(403, '修改归属或参与意向需要客户归属权限。')
             if 'twCode' in changes:
                 code = tw(changes['twCode'])
-                identities = registry(all_heads)
+                identities = shared_registry(conn, all_heads)
                 if code not in identities:
                     raise HTTPException(422, '该 TW 不在已上传的客户名单中，请先补充客户名单。')
                 if any(x is not r and x.get('twCode') == code for x in rows):
