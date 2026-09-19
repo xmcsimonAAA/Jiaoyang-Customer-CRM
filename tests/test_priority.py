@@ -48,9 +48,9 @@ def master():
         ('不读取',[(1,dict(A='无效内容'))])])
 
 
-def icc(amount='100', owner='演示顾问', batch='2026.09.09', name='甲', notes='', row=5):
-    return source('icc.xlsx',[(batch,[(2,dict(zip('ABCDEFGHIJKL',HEADERS))),
-        (row,dict(A=1,B=name,C='已提交',F='外部经纪人',I='☑',J=amount,K=owner,L=notes)),
+def icc(amount='100', owner='演示顾问', batch='2026.09.09', name='甲', notes='', row=5, code=None):
+    return source('icc.xlsx',[(batch,[(2,{**dict(zip('ABCDEFGHIJKL',HEADERS)), 'M':'TW 编号'}),
+        (row,dict(A=1,B=name,C='已提交',F='外部经纪人',I='☑',J=amount,K=owner,L=notes,M=('TW2026001' if name=='甲' else '') if code is None else code)),
         (50,dict(A=1,I='☐'))]), ('2026.08.01',[(1,dict(B='这张不读取',J='错误金额'))])])
 
 
@@ -236,8 +236,8 @@ def test_reordered_rows_do_not_reuse_other_clients_record_keys(client):
 def service_icc():
     f=icc(amount='',owner='')
     # An unchecked row is ordinary service, not an explicit rejection.
-    content=xlsx([('2026.09.09',[(2,dict(zip('ABCDEFGHIJKL',HEADERS))),
-                     (5,dict(B='甲',F='外部经纪人',I='☐'))])])
+    content=xlsx([('2026.09.09',[(2,{**dict(zip('ABCDEFGHIJKL',HEADERS)), 'M':'TW 编号'}),
+                     (5,dict(B='甲',F='外部经纪人',I='☐',M='TW2026001'))])])
     f['contentBase64']=base64.b64encode(content).decode()
     return f
 
@@ -458,8 +458,8 @@ def test_leader_assignment_without_import_permission_is_narrowly_scoped(client):
 def test_shared_roster_100_new_customers_ten_priority_participants(client):
     roster=source('master.xlsx',[('全部',[(1,dict(A='客户姓名',B='是否完成开户',C='备注'))]+
            [(i+2,dict(A=f'新增客户{i}',B='已开户',C=f'TW202699{i:03}')) for i in range(100)])])
-    activity=source('icc.xlsx',[('2026.09.09',[(2,dict(zip('ABCDEFGHIJKL',HEADERS)))]+
-             [(i+3,dict(B=f'新增客户{i}',J='100',K='演示顾问')) for i in range(10)])])
+    activity=source('icc.xlsx',[('2026.09.09',[(2,{**dict(zip('ABCDEFGHIJKL',HEADERS)), 'M':'TW 编号'})]+
+             [(i+3,dict(B=f'新增客户{i}',J='100',K='演示顾问',M=f'TW202699{i:03}')) for i in range(10)])])
     p=preview(client,[roster,activity])
     assert p['sharedCustomers']['createdCount']==100
     with main.db() as conn:
@@ -568,3 +568,77 @@ def test_shared_backfill_existing_published_sources_without_reupload(client):
         assert first['createdCount']==2 and second['createdCount']==0
     assert client.get('/api/workspace/dashboard').json()['customers']==2
     assert client.get('/api/customers').json()['total']==2
+
+
+def test_same_name_only_suggests_candidate_and_explicit_tw_matches(client):
+    p=publish(client,[master(),icc(code='')])
+    issue=p['issues'][0]
+    assert issue['candidates']==['TW2026001']
+    d=client.get('/api/priority-inferior/batches/2026-09-09/participations').json()
+    assert d['rows'][0]['twCode']==''
+    assert p['datasets'][1]['changes'][0]['fields']==['新增批次记录']
+    assert client.get('/api/priority-inferior/customers/TW2026001').json()['icc']==[]
+    publish(client,[icc(code='TW2026001',batch='2026.09.17')],batches=['2026-09-17'])
+    assert len(client.get('/api/priority-inferior/customers/TW2026001').json()['icc'])==1
+    bad=client.post('/api/priority-inferior/imports/preview',json=dict(asOf='2026-09-11',batchDates=['2026-09-09'],files=[icc(code='TW999999')]))
+    assert bad.status_code==422
+
+
+def test_unlink_keeps_activity_followups_assets_and_survives_reupload(client):
+    publish(client,[master(),icc(notes='保留'),assets()])
+    assert workspace_note(client).status_code==201
+    assert workspace_note(client,business='service').status_code==201
+    d=client.get('/api/priority-inferior/batches/2026-09-09/participations').json()
+    row=d['rows'][0]
+    url='/api/priority-inferior/batches/2026-09-09/records/'+row['recordKey']
+    result=client.patch(url,json=dict(expectedRevision=d['revision'],changes={'twCode':''},reason='不是同一人'))
+    assert result.status_code==200,result.text
+    assert client.patch(url,json=dict(expectedRevision=d['revision'],changes={'twCode':''},reason='重复')).status_code==409
+    card=client.get('/api/workspace/card',params={'key':'tw:TW2026001'}).json()
+    assert not card['priority']
+    assert [n['business'] for n in card['followups']]==['service']
+    assert client.get('/api/priority-inferior/customers/TW2026001').json()['assets'][0]['assetUsd']=='26.37'
+    anchor='icc:2026-09-09/'+row['recordKey']
+    card=client.get('/api/workspace/card',params={'key':anchor}).json()
+    assert len(card['followups'])==1 and card['followups'][0]['business']=='priority'
+    publish(client,[icc(notes='保留')])  # identical file stays detached
+    publish(client,[icc(amount='200')])  # changed file with the old TW also stays detached
+    after=client.get('/api/priority-inferior/batches/2026-09-09/participations').json()
+    assert len(after['rows'])==1
+    assert after['rows'][0]['recordKey']==row['recordKey']
+    assert after['rows'][0]['twCode']=='' and after['rows'][0]['identityDetached']=='TW2026001'
+    assert after['rows'][0]['agreementAmountUsd']=='200'
+    client.test_user['canImportCustomers']=False
+    assert client.patch(url,json=dict(expectedRevision=after['revision'],changes={'twCode':''},reason='无权限')).status_code==403
+
+
+def test_pre_upgrade_preview_cannot_commit(client):
+    import json
+    p=preview(client,[master(),icc()])
+    with main.db() as conn:
+        row=conn.execute('SELECT payload_json FROM priority_uploads WHERE id=?',(p['id'],)).fetchone()
+        payload=json.loads(row['payload_json']);payload.pop('matchingVersion')
+        conn.execute('UPDATE priority_uploads SET payload_json=? WHERE id=?',(json.dumps(payload),p['id']))
+    assert client.post('/api/priority-inferior/imports/'+p['id']+'/commit').status_code==409
+
+
+def test_targeted_repair_is_audited_idempotent_and_does_not_change_other_rows(client):
+    from backend.scripts.unlink_priority_identity import repair
+    publish(client,[master(),icc(),assets()])
+    kwargs=dict(batch='2026-09-09',name='甲',expected_tw='TW2026001',broker='外部经纪人',reason='用户确认不同人')
+    with main.db() as conn:
+        old=conn.execute("SELECT head_id FROM priority_datasets WHERE dataset_key='icc:2026-09-09'").fetchone()[0]
+        assert repair(conn,**kwargs)['status']=='preview'
+        assert conn.execute("SELECT head_id FROM priority_datasets WHERE dataset_key='icc:2026-09-09'").fetchone()[0]==old
+        with pytest.raises(ValueError):repair(conn,**{**kwargs,'broker':'错误经纪人'},apply=True)
+        result=repair(conn,**kwargs,apply=True)
+        assert result['status']=='unlinked'
+        assert repair(conn,**kwargs,apply=True)['status']=='already_unlinked'
+        assert conn.execute("SELECT COUNT(*) FROM audit_logs WHERE actor_id='system-identity-repair'").fetchone()[0]==1
+        assert conn.execute('SELECT COUNT(*) FROM customers').fetchone()[0]==2
+    assert client.get('/api/priority-inferior/overview').json()['summary']['agreementUsd']=='100'
+    assert client.get('/api/priority-inferior/customers/TW2026001').json()['icc']==[]
+    # Existing immutable version can still be inspected and repair can be rolled back.
+    assert client.get('/api/priority-inferior/revisions/'+old).json()['rows'][0]['twCode']=='TW2026001'
+    assert client.post('/api/priority-inferior/imports/'+result['jobId']+'/rollback').status_code==200
+    assert len(client.get('/api/priority-inferior/customers/TW2026001').json()['icc'])==1

@@ -42,6 +42,8 @@ SCHEMA = [
         created_at TEXT NOT NULL, created_by TEXT NOT NULL)""",
     'CREATE INDEX IF NOT EXISTS idx_priority_revision_dataset ON priority_revisions(dataset_key, created_at)',
 ]
+MATCHING_VERSION = 2
+
 LABELS = {'master': '客户身份与券商开户', 'assets': '客户资产（USD）', 'secondary': 'XMax 二级持仓（股）', 'icc': '港安 ICC 批次'}
 
 
@@ -103,25 +105,43 @@ def match_records(rows, identities, batch_date):
         by_name.setdefault(normalized(r['customerName']), []).append(code)
     for r in rows:
         code = r.get('twCode')
-        if code and code in identities:
+        trusted = False
+        if r.get('identityDetached'):
+            candidates = by_name.get(normalized(r['customerName']), [])
+        elif code:
+            if code not in identities:
+                raise HTTPException(422, f'{batch_date} 的 TW {code} 不在客户名单中，请先补充客户名单。')
             candidates = [code]
+            trusted = True
         elif normalized(r['customerName']) == normalized('董芳') and batch_date == '2026-09-09' and 'TW202609039' in identities and normalized(identities['TW202609039']['customerName']) == normalized('董方'):
             candidates = ['TW202609039']
             r['matchReason'] = '用户已确认：2026-09-09 董芳即董方'
+            trusted = True
         else:
             candidates = by_name.get(normalized(r['customerName']), [])
         r['candidates'] = candidates
-        if len(candidates) == 1:
+        if trusted:
             r['twCode'] = candidates[0]
             r['canonicalName'] = identities[candidates[0]]['customerName']
             r['matchStatus'] = 'matched'
-            r['matchReason'] = r.get('matchReason') or '客户名单中的唯一同名记录'
+            r['matchReason'] = r.get('matchReason') or '按明确 TW 编号关联'
         else:
             r['twCode'] = ''
+            r['canonicalName'] = ''
             r['matchStatus'] = 'ambiguous' if candidates else 'unmatched'
+            r['matchReason'] = r.get('matchReason') if r.get('identityDetached') else '姓名仅作候选，须核对 TW 后确认'
+    unresolved_names = [normalized(r['customerName']) for r in rows if not r.get('twCode')]
+    if len(unresolved_names) != len(set(unresolved_names)):
+        raise HTTPException(422, f'{batch_date} 存在多条未确认身份的同名记录，请在表格添加 TW 编号区分后重传。')
     codes = [r['twCode'] for r in rows if r.get('twCode')]
     if len(codes) != len(set(codes)):
         raise HTTPException(422, f'{batch_date} 同一 TW 出现多条活动记录，请核对后重传。')
+
+
+def detached_identity(row, reason):
+    """Unlink only the activity, keeping its stable record key and business history."""
+    return dict(twCode='', canonicalName='', matchStatus='unmatched', candidates=[],
+                matchReason=reason, identityDetached=row.get('twCode') or row.get('identityDetached') or 'manual')
 
 
 def identity_key(r):
@@ -133,11 +153,19 @@ def prepare_dataset(dataset, previous):
     old = previous.get('rows', [])
     by_id = {identity_key(r): r for r in old}
     # Also align a newly resolved identity with its previous unresolved source name.
-    by_name = {normalized(r['customerName']): r for r in old if not r.get('twCode')}
+    name_groups = {}
+    for row in old:
+        name_groups.setdefault(normalized(row['customerName']), []).append(row)
+    by_name = {name: group[0] for name, group in name_groups.items() if len(group) == 1}
     seen = set()
     changes = []
     for r in dataset['rows']:
-        before = by_id.get(identity_key(r)) or by_name.get(normalized(r['customerName']))
+        before = by_id.get(identity_key(r))
+        candidate = by_name.get(normalized(r['customerName']))
+        if not before and candidate and (not r.get('twCode') or not candidate.get('twCode')):
+            before = candidate
+        if before and before['recordKey'] in seen:
+            raise HTTPException(422, '多条记录指向同一历史身份，请核对 TW 后重传。')
         if before:
             seen.add(before['recordKey'])
             r['recordKey'] = before['recordKey']
@@ -158,7 +186,7 @@ def prepare_dataset(dataset, previous):
         else:
             if dataset['kind'] == 'icc':
                 r['recordKey'] = 'record:' + str(uuid4())
-            changes.append({'name': r['customerName'], 'twCode': r.get('twCode'), 'fields': ['新增记录']})
+            changes.append({'name': r['customerName'], 'twCode': r.get('twCode'), 'fields': ['新增批次记录' if dataset['kind'] == 'icc' else '新增记录']})
     missing = [r for r in old if r['recordKey'] not in seen]
     # ICC omissions are not cancellations. Keep the dated client record and provenance.
     if dataset['kind'] == 'icc':
@@ -332,11 +360,17 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
             for d in datasets:
                 before = current.get(d['key'], {})
                 if d['kind'] == 'icc':
-                    confirmed = {normalized(r['customerName']): r for r in before.get('rows', []) if r.get('twCode')}
+                    groups = {}
+                    for old in before.get('rows', []):
+                        groups.setdefault(normalized(old['customerName']), []).append(old)
+                    confirmed = {name: group[0] for name, group in groups.items() if len(group) == 1 and
+                                 (group[0].get('identityDetached') or
+                                  (group[0].get('twCode') and group[0].get('matchReason') != '客户名单中的唯一同名记录'))}
                     for r in d['rows']:
                         prior = confirmed.get(normalized(r['customerName']))
-                        if prior:
-                            r['twCode'] = prior['twCode']
+                        if prior and (not r.get('twCode') or prior.get('identityDetached')):
+                            r['identityDetached'] = prior.get('identityDetached', '')
+                            r['twCode'] = prior.get('twCode', '')
                             r['matchReason'] = prior.get('matchReason', '沿用本批次已确认身份')
                     match_records(d['rows'], identities, d['date'])
                 previous_hash = None
@@ -359,7 +393,7 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
             result = [summary(d) for d in datasets]
             job = str(uuid4())
             conn.execute('INSERT INTO priority_uploads VALUES (?,?,?,?,?,?,?)',
-                         (job, 'preview', dumps({'datasets': datasets, 'baseHeads': {k: v['head_id'] for k, v in current.items()}}), dumps(sources), dumps(result), now_iso(), user['id']))
+                         (job, 'preview', dumps({'matchingVersion': MATCHING_VERSION, 'datasets': datasets, 'baseHeads': {k: v['head_id'] for k, v in current.items()}}), dumps(sources), dumps(result), now_iso(), user['id']))
         return {'id': job, 'datasets': result, 'sharedCustomers':shared_preview, 'issues': [dict(key=d['key'], recordKey=r['recordKey'], name=r['customerName'], sourceRow=r['sourceRow'], status=r['matchStatus'], candidates=r['candidates'])
                 for d in datasets if d['kind'] == 'icc' and not d['duplicate'] for r in d['rows'] if not r.get('twCode')]}
 
@@ -380,6 +414,8 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                 if job['status'] != 'preview':
                     raise HTTPException(409, '本次上传已撤销，请重新预览。')
                 payload = json.loads(job['payload_json'])
+                if payload.get('matchingVersion') != MATCHING_VERSION:
+                    raise HTTPException(409, '身份匹配规则已更新，请重新上传生成预览。')
                 current = heads(conn)
                 if {k: v['head_id'] for k, v in current.items()} != payload['baseHeads']:
                     raise HTTPException(409, '数据已被其他操作更新，请重新生成预览后保存。')
@@ -555,13 +591,16 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                 if not user.get('canManageAssignments'):
                     raise HTTPException(403, '修改归属或参与意向需要客户归属权限。')
             if 'twCode' in changes:
-                code = tw(changes['twCode'])
+                code = tw(changes['twCode']) if text(changes['twCode']) else ''
                 identities = shared_registry(conn, all_heads)
-                if code not in identities:
-                    raise HTTPException(422, '该 TW 不在已上传的客户名单中，请先补充客户名单。')
-                if any(x is not r and x.get('twCode') == code for x in rows):
-                    raise HTTPException(409, '该客户已经在本批次中，请核对重复记录。')
-                changes.update(twCode=code, canonicalName=identities[code]['customerName'], matchStatus='matched', matchReason=payload.reason, candidates=[code])
+                if code:
+                    if code not in identities:
+                        raise HTTPException(422, '该 TW 不在客户名单中，请先补充客户名单。')
+                    if any(x is not r and x.get('twCode') == code for x in rows):
+                        raise HTTPException(409, '该客户已经在本批次中，请核对重复记录。')
+                    changes.update(twCode=code, canonicalName=identities[code]['customerName'], matchStatus='matched', matchReason=payload.reason, candidates=[code], identityDetached='')
+                else:
+                    changes.update(detached_identity(r, payload.reason))
             for field in ('depositAmount', 'agreementAmountUsd'):
                 if field in changes:
                     changes[field] = number(changes[field], field, nonnegative=True)

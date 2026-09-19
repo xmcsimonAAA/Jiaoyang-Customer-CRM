@@ -156,6 +156,9 @@ def _parse(workbook, filename, as_of, batch_dates):
                 if len(cols) != 1:
                     raise HTTPException(422, f'{sheet[0]} 缺少或重复表头：{label}')
                 mapping[field] = cols[0]
+            tw_cols = [c for c, v in header[1].items() if normalized(v) in {'tw', 'tw编号'}]
+            if len(tw_cols) > 1:
+                raise HTTPException(422, f'{sheet[0]} TW 编号表头重复。')
             records = []
             for index, values in raw:
                 if index <= header[0]:
@@ -164,7 +167,8 @@ def _parse(workbook, filename, as_of, batch_dates):
                 if not name or name in {'合计', '总计'}:
                     continue
                 r = {field: text(values.get(col)) for field, col in mapping.items()}
-                r.update(sourceRow=index, sourceSheet=sheet[0], raw=values, twCode='', batchDate=batch_date)
+                code = text(values.get(tw_cols[0])) if tw_cols else ''
+                r.update(sourceRow=index, sourceSheet=sheet[0], raw=values, twCode=tw(code) if code else '', batchDate=batch_date)
                 r['agreementAmountUsd'] = number(r['agreementAmountUsd'], f'{sheet[0]}!J{index}', nonnegative=True)
                 r['depositAmount'] = number(r['depositAmount'], f'{sheet[0]}!D{index}', nonnegative=True)
                 r['recordKey'] = f'row:{index}'
