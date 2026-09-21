@@ -462,7 +462,9 @@ def init_db() -> None:
     else:
         init_sqlite_db()
     from backend.workspace import SCHEMA as workspace_schema
+    from backend.shared_ownership import SCHEMA as owner_schema
     with db() as conn:
+        conn.execute(owner_schema)
         for statement in workspace_schema:
             conn.execute(statement)
 
@@ -2549,9 +2551,10 @@ def assign_customer(customer_id: str, payload: AssignPayload, user: dict[str, An
     require_supervisor(user)
     owner = owner_for_request(payload.ownerId, user)
     with db() as conn:
+        conn.execute('UPDATE priority_write_lock SET version=version+1 WHERE id=1')
         current = assert_customer_access(conn, customer_id, user)
-        if current["owner_id"] == owner["id"]:
-            raise HTTPException(422, "客户已经属于该商务经理。")
+        from backend.shared_ownership import remember
+        remember(conn, customer_id, owner['id'], 'manual')
         changed_at = now_iso()
         conn.execute("UPDATE customers SET owner_id=?, owner_name=?, owner_team=?, updated_at=?, version=version+1 WHERE id=?", (owner["id"], owner["name"], owner["team"], changed_at, customer_id))
         conn.execute("INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (str(uuid4()), customer_id, current["owner_id"], current["owner_name"], current["owner_team"], owner["id"], owner["name"], owner["team"], payload.reason.strip(), user["id"], user["name"], changed_at))
@@ -2570,6 +2573,7 @@ def bulk_assign_customers(payload: BulkAssignPayload, user: dict[str, Any] = Dep
     marks = ", ".join("?" for _ in customer_ids)
     changed_at = now_iso()
     with db() as conn:
+        conn.execute('UPDATE priority_write_lock SET version=version+1 WHERE id=1')
         rows = conn.execute(
             f"SELECT c.* FROM customers c WHERE c.id IN ({marks}) AND c.archived_at IS NULL AND {clause}",
             (*customer_ids, *access_params),
@@ -2578,6 +2582,8 @@ def bulk_assign_customers(payload: BulkAssignPayload, user: dict[str, Any] = Dep
             raise HTTPException(403, "所选客户中包含您无权调整的记录，请刷新后重试。")
         changed, unchanged = [], []
         for current in rows:
+            from backend.shared_ownership import remember
+            remember(conn, current['id'], owner['id'], 'manual')
             if current["owner_id"] == owner["id"]:
                 unchanged.append(current["id"])
                 continue
@@ -2621,6 +2627,7 @@ def apply_source_advisor_assignments(payload: SourceAdvisorAssignmentPayload, us
     unresolved: list[dict[str, Any]] = []
     changed_at = now_iso()
     with db() as conn:
+        conn.execute('UPDATE priority_write_lock SET version=version+1 WHERE id=1')
         advisor_users = advisor_alias_users(conn, users_by_name, users_by_id)
         rows = conn.execute(
             f"SELECT c.* FROM customers c WHERE {where} ORDER BY c.created_at, c.id",
@@ -2648,6 +2655,8 @@ def apply_source_advisor_assignments(payload: SourceAdvisorAssignmentPayload, us
                 "INSERT INTO assignments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (str(uuid4()), current["id"], current["owner_id"], current["owner_name"], current["owner_team"], owner["id"], owner["name"], owner["team"], "按原表骄阳顾问自动分配", user["id"], user["name"], changed_at),
             )
+            from backend.shared_ownership import remember
+            remember(conn, current['id'], owner['id'], 'manual')
             replace_collaborators(conn, current["id"], collaborators, user)
             audit(conn, user, "customer.assigned_from_source_advisor", "customer", current["id"], {"from": current["owner_id"], "to": owner["id"], "sourceAdvisorLabel": current["source_advisor_label"], "collaboratorIds": [person["id"] for person in collaborators], "unmatched": missing})
             assigned.append({"id": current["id"], "name": current["name"] or current["wechat_nickname"], "owner": owner["name"], "collaborators": [person["name"] for person in collaborators], "sourceAdvisorLabel": current["source_advisor_label"]})

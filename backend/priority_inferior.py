@@ -1,8 +1,8 @@
 """Versioned imports and scoped queries for the independent priority-inferior board.
 
 Each dataset is a source type + business date. Published revisions are immutable;
-only its head changes. Raw files and preview payloads stay server-side. No writes
-are made to placement fields, client ownership, or the old import pipeline.
+only its head changes. Raw files and preview payloads stay server-side.
+Customer ownership is shared across products; participation remains independent.
 """
 from __future__ import annotations
 
@@ -22,10 +22,12 @@ from backend.priority_assignment import SCHEMA as BINDING_SCHEMA, resolve as res
 from backend.priority_import import FIELDS, iso, normalized, number, parse, sum_values, text, tw
 
 from backend.priority_identity import reconcile, excluded_codes
+from backend import shared_ownership
 from backend.workspace import SCHEMA as WORKSPACE_SCHEMA, install as install_workspace
 
 SCHEMA = [
     *WORKSPACE_SCHEMA,
+    shared_ownership.SCHEMA,
     BINDING_SCHEMA,
     "CREATE TABLE IF NOT EXISTS priority_write_lock (id INTEGER PRIMARY KEY, version INTEGER NOT NULL)",
     "INSERT INTO priority_write_lock VALUES (1,0) ON CONFLICT(id) DO NOTHING",
@@ -62,6 +64,8 @@ class Source(BaseModel):
 
 
 class Upload(BaseModel):
+    # Older clients retain their all-rows behavior; the current UI defaults this on.
+    skipIccBlankAccountStatus: bool = False
     asOf: str
     batchDates: list[str] = Field(default_factory=lambda: ['2026-09-09'], max_length=30)
     files: list[Source] = Field(min_length=1, max_length=12)
@@ -78,6 +82,7 @@ class CommitSelections(BaseModel):
 
 
 class Edit(BaseModel):
+    expectedCustomerVersion: int | None = None
     expectedRevision: str
     changes: dict[str, Any]
     reason: str = Field(min_length=1, max_length=1000)
@@ -185,6 +190,9 @@ def prepare_dataset(dataset, previous):
                 r['excludedTwCodes'] = before['excludedTwCodes']
             if 'participationIntent' in before:
                 r['participationIntent'] = before['participationIntent']
+            if before.get('originalCustomerName'):
+                r['customerName'] = before['customerName']
+                r['originalCustomerName'] = before['originalCustomerName']
             if dataset['kind'] in {'icc', 'master'}:
                 carried = {}
                 for field in FIELDS:
@@ -256,12 +264,27 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                 result[code] = dict(r)
         return result
 
-    def assignment_data(conn, all_heads, proposed=None):
+    def assignment_proposals(conn, all_heads, proposed=None):
         rules = {r['broker_key']: dict(r) for r in conn.execute('SELECT * FROM priority_broker_bindings').fetchall()}
         if proposed:
             rules[proposed['broker_key']] = proposed
         aliases = [dict(r) for r in conn.execute('SELECT alias,user_id FROM advisor_alias_mappings').fetchall()]
         return resolve_assignments(all_heads, rules, platform_users(), aliases)
+
+    def assignment_data(conn, all_heads, proposed=None):
+        result = shared_ownership.effective(conn, assignment_proposals(conn, all_heads, proposed))
+        active = {p['id'] for p in platform_users() if p.get('active') and p.get('rolePermission') in {'manager','supervisor'}}
+        for a in result.values():
+            if a.get('serviceOwnerId') and a['serviceOwnerId'] not in active:
+                a.update(ownerConflict=True,assignmentReason='负责人账号已停用或不适用，请重新指派统一负责人')
+        return result
+
+    def sync_owners(conn, user):
+        shared_ownership.sync(conn, assignment_proposals(conn, heads(conn)), user, now_iso())
+
+    with db() as conn:
+        conn.execute('UPDATE priority_write_lock SET version=version+1 WHERE id=1')
+        sync_owners(conn, {'id':'system-shared-ownership','name':'统一客户负责人迁移'})
 
     def scope_rows(conn, all_heads, user):
         visible = links(conn, user)
@@ -277,8 +300,8 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
         def allowed(a):
             return bool(a['serviceOwnerId']) and (a['serviceOwnerId'] == user['id'] or
                 (user['customerScope'] == 'team' and a['serviceOwnerTeam'] == user.get('team')))
-        # Product ownership is independent of placement/CRM ownership.
-        codes = {key for key, a in assignments.items() if allowed(a)}
+        # Matched customers use the canonical CRM access rules (including collaborators).
+        codes = set(visible) | {key for key, a in assignments.items() if not a.get('customerId') and allowed(a)}
         for d in result.values():
             d['rows'] = [r for r in d['rows'] if (r.get('twCode') or d['dataset_key']+'/'+r['recordKey']) in codes]
         return result, visible
@@ -328,6 +351,7 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
             r=impact['rule']
             conn.execute('INSERT INTO priority_broker_bindings VALUES (?,?,?,?,?,?) ON CONFLICT(broker_key) DO UPDATE SET broker_name=excluded.broker_name,owner_id=excluded.owner_id,active=excluded.active,updated_at=excluded.updated_at,updated_by=excluded.updated_by',
                          (r['broker_key'],r['broker_name'],r['owner_id'],r['active'],now_iso(),user['id']))
+            sync_owners(conn, user)
             audit(conn,user,'priority.binding','priority_broker',r['broker_key'],{'reason':payload.reason,'impact':impact['affected'],'rule':r})
         return {'ok':True,'changed':sum(a['changed'] for a in impact['affected'])}
 
@@ -340,6 +364,7 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                     assetUsd=sum_values(r.get('assetUsd') for r in rows), quantity=sum_values(r.get('quantity') for r in rows),
                     automaticIdentity=dataset.get('automaticIdentity', False),
                     pending=sum(1 for r in rows if dataset['kind'] == 'icc' and not r.get('twCode')),
+                    iccAccountFilter=dataset.get('iccAccountFilter'),
                     missingCount=dataset.get('missingCount', 0), duplicate=dataset.get('duplicate', False),
                     changes=dataset.get('changes', []))
 
@@ -362,6 +387,14 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
             sources.append(dict(filename=source.filename, sha256=source_hash, contentBase64=source.contentBase64))
             for d in parse(content, source.filename, as_of, dates):
                 d.update(key=f"{d['kind']}:{d['date']}", filename=source.filename, sourceHash=source_hash)
+                if d['kind'] == 'icc':
+                    source_rows = d['rows']
+                    skipped = [r for r in source_rows if not text(r.get('brokerAccountStatus'))] if payload.skipIccBlankAccountStatus else []
+                    d['iccAccountFilter'] = dict(enabled=payload.skipIccBlankAccountStatus,
+                        sourceCount=len(source_rows), includedCount=len(source_rows)-len(skipped),
+                        skipped=[dict(name=r['customerName'],sourceRow=r['sourceRow']) for r in skipped])
+                    if payload.skipIccBlankAccountStatus:
+                        d['rows'] = [r for r in source_rows if text(r.get('brokerAccountStatus'))]
                 d['fingerprint'] = digest({'kind': d['kind'], 'date': d['date'], 'rows': d['rows']})
                 datasets.append(d)
         if len({d['key'] for d in datasets}) != len(datasets):
@@ -375,6 +408,17 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
             for d in datasets:
                 before = current.get(d['key'], {})
                 if d['kind'] == 'icc':
+                    aliases = {}
+                    for old in before.get('rows', []):
+                        for name in {old['customerName'], old.get('originalCustomerName', '')} - {''}:
+                            aliases.setdefault(normalized(name), []).append(old)
+                    for row in d['rows']:
+                        matches = aliases.get(normalized(row['customerName']), [])
+                        if len(matches) == 1 and matches[0].get('originalCustomerName'):
+                            old = matches[0]
+                            if not row.get('twCode') or row['twCode'] == old.get('twCode'):
+                                row['customerName'] = old['customerName']
+                                row['originalCustomerName'] = old['originalCustomerName']
                     groups = {}
                     for old in before.get('rows', []):
                         groups.setdefault(normalized(old['customerName']), []).append(old)
@@ -525,6 +569,7 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                     conn.execute('INSERT INTO priority_revisions VALUES (?,?,?,?,?,?,?,?,?)', (rev, key, d['parent'], job_id, dumps(d['rows']), d['filename'], d['fingerprint'], now_iso(), user['id']))
                     conn.execute('UPDATE priority_datasets SET head_id=? WHERE dataset_key=?', (rev, key))
                 shared_result = sync_customers(conn, heads(conn), user)
+                sync_owners(conn, user)
                 conn.execute("UPDATE priority_uploads SET status='committed' WHERE id=?", (job_id,))
                 audit(conn, user, 'priority.import', 'priority_upload', job_id, {'datasets': [summary(d) for d in payload['datasets']], 'identityReconciliation':payload.get('identityReconciliation'), 'identitySelections':[s.model_dump() for s in chosen]})
         except sqlite3.IntegrityError as exc:
@@ -577,6 +622,7 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
             for r in revisions:
                 conn.execute('UPDATE priority_datasets SET head_id=? WHERE dataset_key=?', (r['parent_id'], r['dataset_key']))
             conn.execute("UPDATE priority_uploads SET status='rolled_back' WHERE id=?", (job_id,))
+            sync_owners(conn, user)
             audit(conn, user, 'priority.rollback', 'priority_upload', job_id, {})
         return {'status': 'rolled_back'}
 
@@ -617,7 +663,7 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                     insuranceBroker=next((r['insuranceBroker'] for r in reversed(own) if r.get('insuranceBroker')), ''),
                     jiaoyangOwner=next((r['jiaoyangOwner'] for r in reversed(own) if r.get('jiaoyangOwner')), ''),
                     currentOwner=visible.get(code, {}).get('owner_name', ''),
-                    serviceOwner=own[-1].get('serviceOwner','') if own else '',
+                    serviceOwner=own[-1].get('serviceOwner','') if own else visible.get(code, {}).get('owner_name', ''),
                     assignmentReason=own[-1].get('assignmentReason','') if own else '',
                     customerType=next((r['customerType'] for r in reversed(own) if r.get('customerType')), ''))
             part = [r for r in activity if r.get('agreementAmountUsd') and Decimal(r['agreementAmountUsd']) > 0]
@@ -654,11 +700,11 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                     if owner_key in seen_owners:
                         continue
                     seen_owners.add(owner_key)
-                    if can_assign and not r.get('serviceOwnerId'):
+                    if can_assign and (not r.get('serviceOwnerId') or r.get('ownerConflict')):
                         action = 'owner' if r.get('assignmentMode') != 'pending_binding' else 'binding' if r.get('insuranceBroker') else 'broker'
                         if action == 'broker' and not can_edit:
                             continue
-                        items.append(dict(base, action=action, label={'owner':'指派负责人','binding':'设置经纪人绑定','broker':'补充保险经纪人'}[action], reason=r.get('assignmentReason','待分配')))
+                        items.append(dict(base, action=action, label='确认统一负责人' if r.get('ownerConflict') else {'owner':'指派负责人','binding':'设置经纪人绑定','broker':'补充保险经纪人'}[action], reason=r.get('assignmentReason','待分配')))
         # One broker rule resolves many service customers; show one action, not many duplicates.
         grouped, compact = {}, []
         for task in items:
@@ -708,7 +754,7 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
             require_assignment(user)
         else:
             require_edit(user)
-        allowed = set(FIELDS) - {'sourceSequence', 'customerName'} | {'twCode', 'participationIntent'}
+        allowed = set(FIELDS) - {'sourceSequence'} | {'twCode', 'participationIntent'}
         if not payload.changes or set(payload.changes) - allowed:
             raise HTTPException(422, '包含不可编辑字段。')
         key = 'icc:' + iso(batch_date)
@@ -751,14 +797,38 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                     if len(changes[field]) > 5000:
                         raise HTTPException(422, '字段内容过长。')
             before = {field: r.get(field) for field in changes}
+            if 'customerName' in changes:
+                if not text(changes['customerName']):
+                    raise HTTPException(422, '姓名不能为空。')
+                changes['customerName'] = text(changes['customerName'])
+                changes['originalCustomerName'] = r.get('originalCustomerName') or r['customerName']
+                if not changes.get('twCode', r.get('twCode')):
+                    identities = shared_registry(conn, all_heads)
+                    candidates = [code for code, identity in identities.items() if normalized(identity['customerName']) == normalized(changes['customerName']) and code not in excluded_codes(r)]
+                    changes.update(candidates=candidates, canonicalName='', matchStatus='ambiguous' if candidates else 'unmatched', matchReason='姓名已修正，等待匹配客户编号')
+            if 'jiaoyangOwner' in changes:
+                label = normalized(changes['jiaoyangOwner'])
+                candidates = [p for p in platform_users() if p.get('active') and p.get('rolePermission') in {'manager','supervisor'} and normalized(p['name']) == label]
+                if len(candidates) != 1:
+                    raise HTTPException(422, '请选择唯一有效的负责人；统一负责人不能通过清空原表姓名解除。')
+                code = changes.get('twCode', r.get('twCode'))
+                customer = shared_ownership.customers(conn).get(code)
+                if customer:
+                    if payload.expectedCustomerVersion is not None and customer['version'] != payload.expectedCustomerVersion:
+                        raise HTTPException(409, '客户负责人或资料已变化，请重新打开后确认。')
+                    owner = candidates[0]
+                    shared_ownership.assign(conn, customer, owner, user, now_iso(), payload.reason or '确认全产品统一负责人')
+                    shared_ownership.remember(conn, customer['id'], owner['id'], 'manual')
             r.update(changes)
-            r['manualCorrection'] = {'reason': payload.reason, 'by': user['name'], 'at': now_iso(), 'fields': list(changes)}
+            correction_fields=list(payload.changes)
+            r['manualCorrection'] = {'reason': payload.reason, 'by': user['name'], 'at': now_iso(), 'fields': correction_fields}
             rev, job = str(uuid4()), str(uuid4())
             conn.execute('INSERT INTO priority_uploads VALUES (?,?,?,?,?,?,?)',
                          (job, 'committed', '{}', '[]', dumps([{'label': '人工修订', 'date': batch_date, 'records': 1, 'changes': []}]), now_iso(), user['id']))
             conn.execute('INSERT INTO priority_revisions VALUES (?,?,?,?,?,?,?,?,?)',
                          (rev, key, d['head_id'], job, dumps(rows), d['filename'], 'manual:' + rev, now_iso(), user['id']))
             conn.execute('UPDATE priority_datasets SET head_id=? WHERE dataset_key=?', (rev, key))
+            sync_owners(conn, user)
             audit(conn, user, 'priority.edit', 'priority_record', record_key, dict(batchDate=batch_date, before=before, after=changes, reason=payload.reason))
         return {'revision': rev, 'jobId': job}
 

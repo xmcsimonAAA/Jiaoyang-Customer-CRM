@@ -258,9 +258,9 @@ def test_binding_existing_new_clients_permissions_and_manual_protection(client):
     assert p['affected'][0]['serviceOwner']=='演示顾问' and p['affected'][0]['changed']
     row=client.get('/api/priority-inferior/batches/2026-09-09/participations').json()['rows'][0]
     assert row['serviceOwner']=='演示顾问' and row['jiaoyangOwner']==''
-    # Changing a default takes effect for existing auto-managed clients.
+    # A default only fills unassigned customers; existing ownership is stable.
     bind_service(client,'demo-manager-2')
-    assert client.get('/api/priority-inferior/overview').json()['customers'][0]['serviceOwner']=='演示顾问二'
+    assert client.get('/api/priority-inferior/overview').json()['customers'][0]['serviceOwner']=='演示顾问'
     d=client.get('/api/priority-inferior/batches/2026-09-09/participations').json()
     url='/api/priority-inferior/batches/2026-09-09/records/'+d['rows'][0]['recordKey']
     r=client.patch(url,json={'expectedRevision':d['revision'],'changes':{'jiaoyangOwner':'演示顾问'},'reason':'领导指派'})
@@ -292,7 +292,7 @@ def test_explicit_intent_blocks_default_and_survives_import(client):
     assert r.status_code==200,r.text
     publish(client,[service_icc()])
     row=client.get('/api/priority-inferior/batches/2026-09-09/participations').json()['rows'][0]
-    assert row['assignmentMode']=='pending_manual'
+    assert row['assignmentMode']=='binding' and row['serviceOwnerId']=='demo-manager'
 
 
 def test_legacy_default_apply_preview_preserves_existing_and_placement(client):
@@ -314,19 +314,19 @@ def test_legacy_default_apply_preview_preserves_existing_and_placement(client):
     assert rows=={'普通':'demo-manager','意向':'unassigned','人工':'demo-manager-2'}
 
 
-def test_binding_disable_and_inactive_account_remove_auto_access(client, monkeypatch):
+def test_binding_disable_preserves_owner_and_inactive_account_flags_task(client, monkeypatch):
     publish(client,[master(),service_icc()]);bind_service(client)
     payload={'broker':'外部经纪人','ownerId':'demo-manager','active':False,'reason':'停止服务绑定'}
     p=client.post('/api/priority-inferior/bindings/preview',json=payload).json()
-    assert p['affected'][0]['assignmentReason']=='绑定已停用'
+    assert not p['affected'][0]['changed'] and p['affected'][0]['serviceOwnerId']=='demo-manager'
     assert client.post('/api/priority-inferior/bindings/save',json={**payload,'token':p['token']}).status_code==200
     row=client.get('/api/priority-inferior/batches/2026-09-09/participations').json()['rows'][0]
-    assert not row['serviceOwnerId']
+    assert row['serviceOwnerId']=='demo-manager'
     bind_service(client)
     original=main.DEMO_USERS['manager']
     monkeypatch.setitem(main.DEMO_USERS,'manager',{**original,'active':False})
     row=client.get('/api/priority-inferior/batches/2026-09-09/participations').json()['rows'][0]
-    assert not row['serviceOwnerId'] and '停用' in row['assignmentReason']
+    assert row['ownerConflict'] and '停用' in row['assignmentReason']
 
 
 def workspace_note(client, key='tw:TW2026001', business='priority', **extra):
@@ -372,13 +372,12 @@ def test_workspace_product_permissions_and_reassignment(client):
     assert workspace_note(client).status_code==201
     admin=dict(client.test_user)
     client.test_user.update(id='demo-manager',customerScope='self',rolePermission='manager',team='演示一组')
-    card=client.get('/api/workspace/card',params={'key':'tw:TW2026001'}).json()
-    assert card['crm']==[] and {r['business'] for r in card['followups']}=={'service','priority'}
+    assert client.get('/api/workspace/card',params={'key':'tw:TW2026001'}).status_code==404
     assert workspace_note(client,business='placement').status_code==404
     client.test_user.update(id='demo-manager-2')
     card=client.get('/api/workspace/card',params={'key':'tw:TW2026001'}).json()
-    assert card['priority']==[] and {r['business'] for r in card['followups']}=={'service','placement'}
-    assert workspace_note(client).status_code==404
+    assert card['priority'] and card['crm'] and {r['business'] for r in card['followups']}=={'service','placement','priority'}
+    assert workspace_note(client).status_code==201
     client.test_user.update(admin);bind_service(client,'demo-manager-2')
     client.test_user.update(id='demo-manager',customerScope='self',rolePermission='manager',team='演示一组')
     assert client.get('/api/workspace/followups').json()['items']==[]
@@ -422,13 +421,13 @@ def test_workspace_followups_protect_activity_rollback_and_crm_import(client):
         assert main.customer_followup_count(conn,c['id'])==1
 
 
-def test_workspace_shares_assets_without_product_private_records(client):
+def test_workspace_shared_owner_sees_assets_and_both_products(client):
     publish(client,[master(),icc(),assets()])
     with main.db() as conn:
         conn.execute("UPDATE customers SET owner_id='demo-manager-2',owner_name='演示顾问二',owner_team='演示一组' WHERE customer_code='TW2026001'")
     client.test_user.update(id='demo-manager-2',customerScope='self',rolePermission='manager',team='演示一组')
     p=client.get('/api/workspace/card',params={'key':'tw:TW2026001'}).json()
-    assert p['priority']==[] and p['assets'][0]['assetUsd']=='26.37'
+    assert p['priority'] and p['assets'][0]['assetUsd']=='26.37'
 
 
 def test_workspace_service_note_protects_last_identity_rollback(client):
@@ -518,11 +517,11 @@ def test_shared_dashboard_followups_products_and_visibility(client):
     assert client.get('/api/workspace/dashboard').json()['followups']['due']==0
     client.test_user.update(id='demo-manager',customerScope='self',rolePermission='manager',team='演示一组')
     d=client.get('/api/workspace/dashboard').json()
-    assert d['customers']==1 and d['placement']['participants']==0 and d['priority']['participants']==1
+    assert d['customers']==0 and d['placement']['participants']==0 and d['priority']['participants']==0
     client.test_user.update(id='demo-manager-2')
     d=client.get('/api/workspace/dashboard').json()
-    assert d['customers']==1 and d['placement']['participants']==1 and d['priority']['participants']==0
-    assert d['followups']['byBusiness']['priority']==0
+    assert d['customers']==1 and d['placement']['participants']==1 and d['priority']['participants']==1
+    assert d['followups']['byBusiness']['priority']==1
 
 
 def test_archived_tw_not_resurrected_or_duplicated_by_shared_roster(client):
@@ -833,3 +832,211 @@ def test_task_center_owner_binding_and_missing_broker(client):
     assert client.get('/api/priority-inferior/tasks').json()['items'][0]['action']=='binding'
     bind_service(client)
     assert not client.get('/api/priority-inferior/tasks').json()['items']
+
+
+def test_edit_activity_name_preserves_original_and_survives_reupload(client):
+    publish(client,[roster_rows([('杜勇锋','TW202609056')]),icc(name='杜勇峰',code='TW202609056',batch='2026-09-17')],batches=['2026-09-17'])
+    d=client.get('/api/priority-inferior/batches/2026-09-17/participations').json(); row=d['rows'][0]
+    url='/api/priority-inferior/batches/2026-09-17/records/'+row['recordKey']
+    r=client.patch(url,json={'expectedRevision':d['revision'],'changes':{'customerName':'杜勇锋'},'reason':'核对客户姓名录入错误'})
+    assert r.status_code==200,r.text
+    fixed=client.get('/api/priority-inferior/batches/2026-09-17/participations').json()['rows'][0]
+    assert fixed['customerName']=='杜勇锋' and fixed['originalCustomerName']=='杜勇峰'
+    assert fixed['manualCorrection']['fields']==['customerName']
+    publish(client,[icc(name='杜勇峰',code='TW202609056',batch='2026-09-17')],batches=['2026-09-17'])
+    fixed=client.get('/api/priority-inferior/batches/2026-09-17/participations').json()['rows'][0]
+    assert fixed['customerName']=='杜勇锋'
+
+    publish(client,[icc(name='杜勇峰',code='',amount='200',batch='2026-09-17')],batches=['2026-09-17'])
+    rows=client.get('/api/priority-inferior/batches/2026-09-17/participations').json()['rows']
+    assert len(rows)==1 and rows[0]['customerName']=='杜勇锋' and rows[0]['twCode']=='TW202609056'
+    assert rows[0]['recordKey']==row['recordKey'] and rows[0]['agreementAmountUsd']=='200'
+    assert rows[0]['raw']['B']=='杜勇峰'
+    d=client.get('/api/priority-inferior/batches/2026-09-17/participations').json()
+    assert client.patch(url,json={'expectedRevision':d['revision'],'changes':{'customerName':'  '},'reason':'空白'}).status_code==422
+
+
+def owner_customer():
+    with main.db() as conn:
+        return dict(conn.execute("SELECT * FROM customers WHERE customer_code='TW2026001'").fetchone())
+
+
+def activity(client):
+    return client.get('/api/priority-inferior/batches/2026-09-09/participations').json()
+
+
+def set_activity_owner(client, name, snapshot=None):
+    data=snapshot or activity(client)
+    return client.patch('/api/priority-inferior/batches/2026-09-09/records/'+data['rows'][0]['recordKey'],json={
+        'expectedRevision':data['revision'],'expectedCustomerVersion':data['rows'][0].get('customerVersion'),
+        'changes':{'jiaoyangOwner':name},'reason':'领导确认统一负责人'})
+
+
+def test_shared_owner_adopt_and_bidirectional_assignment(client):
+    publish(client,[master(),icc()])
+    c=owner_customer()
+    assert c['owner_id']=='demo-manager'
+    assert set_activity_owner(client,'演示顾问二').status_code==200
+    assert owner_customer()['owner_id']=='demo-manager-2'
+    row=activity(client)['rows'][0]
+    assert row['serviceOwnerId']=='demo-manager-2' and not row['ownerConflict']
+    result=client.post('/api/customers/'+c['id']+'/assign',json={'ownerId':'demo-manager','reason':'客户统一转交'})
+    assert result.status_code==200,result.text
+    row=activity(client)['rows'][0]
+    assert row['serviceOwnerId']=='demo-manager' and not row['ownerConflict']
+    # Uploads cannot undo a leader decision; raw source remains available.
+    publish(client,[icc(owner='演示顾问二',amount='500')])
+    assert activity(client)['rows'][0]['serviceOwnerId']=='demo-manager'
+    assert owner_customer()['owner_id']=='demo-manager'
+
+
+def test_shared_owner_existing_conflict_direct_resolution_and_stale_edit(client):
+    publish(client,[master()])
+    c=owner_customer()
+    with main.db() as conn:
+        conn.execute("UPDATE customers SET owner_id='demo-manager-2',owner_name='演示顾问二',owner_team='演示一组' WHERE id=?",(c['id'],))
+    publish(client,[icc()])
+    data=activity(client)
+    row=data['rows'][0]
+    assert row['ownerConflict'] and row['serviceOwnerId']=='demo-manager-2'
+    tasks=client.get('/api/priority-inferior/tasks').json()['items']
+    task=next(t for t in tasks if t['twCode']=='TW2026001')
+    assert task['action']=='owner' and task['label']=='确认统一负责人'
+    # Keeping the existing master owner is a valid, recorded resolution.
+    assert set_activity_owner(client,'演示顾问二',data).status_code==200
+    assert not activity(client)['rows'][0]['ownerConflict']
+    stale=activity(client)
+    assert client.post('/api/customers/'+c['id']+'/assign',json={'ownerId':'demo-manager','reason':'领导再次转交'}).status_code==200
+    assert set_activity_owner(client,'演示顾问二',stale).status_code==409
+    assert owner_customer()['owner_id']=='demo-manager'
+
+
+def test_shared_owner_detach_reverts_only_automatic_owner(client):
+    publish(client,[master(),icc()])
+    data=activity(client)
+    url='/api/priority-inferior/batches/2026-09-09/records/'+data['rows'][0]['recordKey']
+    r=client.patch(url,json={'expectedRevision':data['revision'],'changes':{'twCode':''},'reason':'同名不同人'})
+    assert r.status_code==200,r.text
+    assert owner_customer()['owner_id']=='unassigned'
+
+
+def test_shared_owner_manual_survives_detach(client):
+    publish(client,[master(),icc()])
+    assert set_activity_owner(client,'演示顾问二').status_code==200
+    data=activity(client)
+    r=client.patch('/api/priority-inferior/batches/2026-09-09/records/'+data['rows'][0]['recordKey'],json={
+        'expectedRevision':data['revision'],'changes':{'twCode':''},'reason':'不同人'})
+    assert r.status_code==200,r.text
+    assert owner_customer()['owner_id']=='demo-manager-2'
+
+
+def test_shared_owner_migration_idempotent_and_reassignment_permissions(client):
+    from backend import shared_ownership
+    publish(client,[master(),icc()])
+    c=owner_customer()
+    with main.db() as conn:
+        count=conn.execute('SELECT COUNT(*) FROM assignments').fetchone()[0]
+        proposal={'TW2026001':dict(serviceOwnerId='demo-manager',serviceOwner='演示顾问',serviceOwnerTeam='演示一组',assignmentMode='manual')}
+        shared_ownership.sync(conn,proposal,client.test_user,main.now_iso())
+        assert conn.execute('SELECT COUNT(*) FROM assignments').fetchone()[0]==count
+    assert client.post('/api/customers/'+c['id']+'/assign',json={'ownerId':'demo-manager-2','reason':'转交两个产品'}).status_code==200
+    client.test_user.update(id='demo-manager',customerScope='self',rolePermission='manager',team='演示一组')
+    assert client.get('/api/workspace/card',params={'key':'tw:TW2026001'}).status_code==404
+    assert client.get('/api/priority-inferior/overview').json()['customers']==[]
+    client.test_user.update(id='demo-manager-2')
+    card=client.get('/api/workspace/card',params={'key':'tw:TW2026001'}).json()
+    assert card['crm'][0]['owner_id']=='demo-manager-2'
+    assert card['priority'][0]['serviceOwnerId']=='demo-manager-2'
+
+
+def test_shared_owner_late_tw_link_and_upload_rollback(client):
+    publish(client,[icc(code='')])
+    assert activity(client)['rows'][0]['twCode']==''
+    roster=publish(client,[master()])
+    assert activity(client)['rows'][0]['twCode']=='TW2026001'
+    assert owner_customer()['owner_id']=='demo-manager'
+    r=client.post('/api/priority-inferior/imports/'+roster['id']+'/rollback',json={})
+    assert r.status_code==200,r.text
+    assert owner_customer()['owner_id']=='unassigned'
+    assert activity(client)['rows'][0]['twCode']==''
+
+
+def test_shared_owner_binding_preview_rejects_intervening_manual_assignment(client):
+    publish(client,[master(),service_icc()])
+    payload={'broker':'外部经纪人','ownerId':'demo-manager','reason':'补全客户负责人'}
+    p=client.post('/api/priority-inferior/bindings/preview',json=payload).json()
+    c=owner_customer()
+    assert client.post('/api/customers/'+c['id']+'/assign',json={'ownerId':'demo-manager-2','reason':'人工安排'}).status_code==200
+    assert client.post('/api/priority-inferior/bindings/save',json={**payload,'token':p['token']}).status_code==409
+    assert activity(client)['rows'][0]['serviceOwnerId']=='demo-manager-2'
+
+
+def filtered_icc_preview(client, file, enabled=True):
+    r=client.post('/api/priority-inferior/imports/preview',json={
+        'asOf':'2026-09-11','batchDates':['2026-09-09'],'files':[file],
+        'skipIccBlankAccountStatus':enabled})
+    assert r.status_code==200,r.text
+    return r.json()
+
+
+def filter_fixture(status='  '):
+    return source('ICC筛选.xlsx',[('2026.09.09',[
+        (2,{**dict(zip('ABCDEFGHIJKL',HEADERS)), 'M':'TW 编号'}),
+        (3,dict(B='已提交客户',C='已提交',J='100',K='演示顾问')),
+        (4,dict(B='尚未开户客户',C=status,J='200',K='演示顾问'))])])
+
+
+def commit_preview(client,p):
+    r=client.post('/api/priority-inferior/imports/'+p['id']+'/commit',json={})
+    assert r.status_code==200,r.text
+
+
+def test_icc_blank_account_filter_preview_save_and_disable(client):
+    p=filtered_icc_preview(client,filter_fixture())
+    d=p['datasets'][0]
+    assert d['records']==1 and d['participants']==1 and d['agreementUsd']=='100'
+    assert d['iccAccountFilter']==dict(enabled=True,sourceCount=2,includedCount=1,
+        skipped=[dict(name='尚未开户客户',sourceRow=4)])
+    commit_preview(client,p)
+    rows=activity(client)['rows']
+    assert len(rows)==1 and rows[0]['customerName']=='已提交客户' and rows[0]['twCode']==''
+    history=client.get('/api/priority-inferior/imports').json()
+    assert history[0]['datasets'][0]['iccAccountFilter']['skipped'][0]['sourceRow']==4
+    # Turning the switch off can import the exact same file's previously skipped rows.
+    p=filtered_icc_preview(client,filter_fixture(),False)
+    assert p['datasets'][0]['records']==2 and not p['datasets'][0]['duplicate']
+    commit_preview(client,p)
+    assert len(activity(client)['rows'])==2
+    # Filtering a later upload never deletes a previously stored activity.
+    p=filtered_icc_preview(client,filter_fixture())
+    assert p['datasets'][0]['records']==2 and p['datasets'][0]['missingCount']==1
+    commit_preview(client,p)
+    assert len(activity(client)['rows'])==2
+
+
+def test_icc_blank_account_filter_later_status_and_all_skipped(client):
+    f=source('ICC全空.xlsx',[('2026.09.09',[(2,dict(zip('ABCDEFGHIJKL',HEADERS))),
+        (3,dict(B='甲',C='',J='500'))])])
+    p=filtered_icc_preview(client,f)
+    assert p['datasets'][0]['records']==0 and p['datasets'][0]['iccAccountFilter']['includedCount']==0
+    commit_preview(client,p)
+    assert activity(client)['rows']==[]
+    assert client.get('/api/priority-inferior/tasks').json()['waiting']==[]
+    # A subsequent nonblank status admits the row even though it still has no TW.
+    p=filtered_icc_preview(client,icc(code='',owner=''))
+    assert p['datasets'][0]['records']==1
+    commit_preview(client,p)
+    assert activity(client)['rows'][0]['customerName']=='甲'
+    assert activity(client)['rows'][0]['twCode']==''
+
+
+def test_icc_account_filter_does_not_filter_roster_assets_or_positions(client):
+    r=client.post('/api/priority-inferior/imports/preview',json={
+        'asOf':'2026-09-11','batchDates':['2026-09-09'],'files':[master(),assets()],
+        'skipIccBlankAccountStatus':True})
+    assert r.status_code==200,r.text
+    data=r.json()
+    assert {d['kind']:d['records'] for d in data['datasets']}=={'master':2,'assets':1}
+    assert all(d['iccAccountFilter'] is None for d in data['datasets'])
+    commit_preview(client,data)
+    assert owner_customer()['customer_code']=='TW2026001'
