@@ -67,6 +67,16 @@ class Upload(BaseModel):
     files: list[Source] = Field(min_length=1, max_length=12)
 
 
+class IdentitySelection(BaseModel):
+    key: str
+    recordKey: str
+    twCode: str
+
+
+class CommitSelections(BaseModel):
+    identities: list[IdentitySelection] = Field(default_factory=list, max_length=500)
+
+
 class Edit(BaseModel):
     expectedRevision: str
     changes: dict[str, Any]
@@ -433,7 +443,7 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
             identity_summary = dict(autoMatched=auto_matched, pending=len(pending_rows),
                 waiting=sum(not r.get('candidates') or '等待' in r.get('matchReason','') for _,r in pending_rows),
                 issues=[dict(key=d.get('dataset_key') or d.get('key'), name=r['customerName'],
-                    sourceRow=r['sourceRow'], reason=r.get('matchReason','身份待确认'),
+                    recordKey=r['recordKey'], sourceRow=r['sourceRow'], reason=r.get('matchReason','身份待确认'),
                     candidates=r.get('candidates',[])) for d,r in pending_rows])
             result = [summary(d) for d in datasets]
             job = str(uuid4())
@@ -443,7 +453,7 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                 for d in datasets if d['kind'] == 'icc' and not d['duplicate'] for r in d['rows'] if not r.get('twCode')]}
 
     @app.post('/api/priority-inferior/imports/{job_id}/commit')
-    def commit(job_id: str, user=Depends(current_user)):
+    def commit(job_id: str, selections: CommitSelections | None = None, user=Depends(current_user)):
         require_edit(user)
         try:
             with db() as conn:
@@ -464,6 +474,48 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                 current = heads(conn)
                 if {k: v['head_id'] for k, v in current.items()} != payload['baseHeads']:
                     raise HTTPException(409, '数据已被其他操作更新，请重新生成预览后保存。')
+                chosen = selections.identities if selections else []
+                issues = {(i['key'], i.get('recordKey')):i for i in payload.get('identityReconciliation',{}).get('issues',[])}
+                datasets = {d['key']:d for d in payload['datasets']}
+                original_keys = set(datasets)
+                proposed = copy.deepcopy(current)
+                for key, d in datasets.items():
+                    proposed[key] = {**d, 'business_date':d['date']}
+                identities = shared_registry(conn, proposed)
+                blocked = {c['twCode'] for c in sync_customers(conn, proposed, user, dry_run=True)['conflicts']}
+                seen = set()
+                for selection in chosen:
+                    anchor = (selection.key, selection.recordKey)
+                    issue = issues.get(anchor)
+                    code = tw(selection.twCode)
+                    if anchor in seen or not issue or code not in issue.get('candidates',[]) or code not in identities or code in blocked:
+                        raise HTTPException(422, '身份选择无效或编号存在冲突，请重新核对预览候选。')
+                    seen.add(anchor)
+                    d = datasets.get(selection.key)
+                    if d is None:
+                        old = current.get(selection.key)
+                        if not old or old['kind'] != 'icc':
+                            raise HTTPException(422, '所选批次不存在。')
+                        d = dict(key=selection.key,kind='icc',date=old['business_date'],filename=old['filename'],
+                                 parent=old['head_id'],rows=copy.deepcopy(old['rows']),changes=[],duplicate=False)
+                        payload['datasets'].append(d)
+                        datasets[selection.key]=d
+                    row = next((r for r in d['rows'] if r['recordKey']==selection.recordKey),None)
+                    if not row or row.get('twCode') or code in excluded_codes(row):
+                        raise HTTPException(409, '该记录已关联或已排除所选编号，请刷新预览。')
+                    if any(r.get('twCode')==code for r in d['rows']):
+                        raise HTTPException(409, '该 TW 已在本批次关联其他记录，请核对重复选择。')
+                    row.update(twCode=code,canonicalName=identities[code]['customerName'],matchStatus='matched',
+                               matchReason='上传预览中人工选择候选 TW',identityMatchMethod='manual',identityDetached='',candidates=[code])
+                    row['manualCorrection']=dict(reason=row['matchReason'],by=user['name'],at=now_iso(),fields=['twCode'])
+                    was_duplicate = d['duplicate']
+                    d['duplicate']=False
+                    # Preserve the source fingerprint on new uploads; unchanged historical sources use manual revisions.
+                    if selection.key not in original_keys or was_duplicate or d.get('fingerprint','').startswith('manual:'):
+                        d['fingerprint']='manual:identity:'+str(uuid4())
+                    d['changes'].append(dict(name=row['customerName'],twCode=code,fields=['twCode'],before={'twCode':''},after={'twCode':code}))
+                if chosen:
+                    conn.execute('UPDATE priority_uploads SET summary_json=? WHERE id=?',(dumps([summary(d) for d in payload['datasets']]),job_id))
                 for d in payload['datasets']:
                     if d['duplicate']:
                         continue
@@ -474,7 +526,7 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                     conn.execute('UPDATE priority_datasets SET head_id=? WHERE dataset_key=?', (rev, key))
                 shared_result = sync_customers(conn, heads(conn), user)
                 conn.execute("UPDATE priority_uploads SET status='committed' WHERE id=?", (job_id,))
-                audit(conn, user, 'priority.import', 'priority_upload', job_id, {'datasets': json.loads(job['summary_json']), 'identityReconciliation':payload.get('identityReconciliation')})
+                audit(conn, user, 'priority.import', 'priority_upload', job_id, {'datasets': [summary(d) for d in payload['datasets']], 'identityReconciliation':payload.get('identityReconciliation'), 'identitySelections':[s.model_dump() for s in chosen]})
         except sqlite3.IntegrityError as exc:
             raise HTTPException(409, '另一项上传刚刚更新了同一份资料，请重新预览。') from exc
         return {'id': job_id, 'status': 'committed', 'sharedCustomers':shared_result}
@@ -579,6 +631,48 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                                      secondaryParticipants=sum(1 for r in customers.values() if r['isSecondary']),
                                      quantity=sum_values(r['quantity'] for r in customers.values()) if date_by_kind['secondary'] else None,
                                      pending=sum(1 for r in activity if not r.get('twCode'))))
+
+    @app.get('/api/priority-inferior/tasks')
+    def tasks(user=Depends(current_user)):
+        can_edit = bool(user.get('customerScope') == 'all' and user.get('canImportCustomers') and user.get('canManageAdvisorBindings'))
+        can_assign = bool(user.get('customerScope') == 'all' and user.get('canManageAssignments') and user.get('canManageAdvisorBindings'))
+        items, waiting = [], []
+        with db() as conn:
+            datasets, _ = scoped(conn, user)
+            seen_owners = set()
+            for d in sorted(datasets.values(),key=lambda d:d['business_date'],reverse=True):
+                if d['kind'] != 'icc':
+                    continue
+                for r in d['rows']:
+                    base = dict(batch=d['business_date'], recordKey=r['recordKey'], name=r['customerName'],
+                                twCode=r.get('twCode',''), broker=r.get('insuranceBroker',''))
+                    if can_edit and not r.get('twCode'):
+                        reason = r.get('matchReason') or '等待更新客户名单'
+                        task = dict(base, action='identity', label='匹配身份', reason=reason)
+                        (waiting if not r.get('candidates') or '等待' in reason else items).append(task)
+                    owner_key = r.get('twCode') or d['dataset_key']+'/'+r['recordKey']
+                    if owner_key in seen_owners:
+                        continue
+                    seen_owners.add(owner_key)
+                    if can_assign and not r.get('serviceOwnerId'):
+                        action = 'owner' if r.get('assignmentMode') != 'pending_binding' else 'binding' if r.get('insuranceBroker') else 'broker'
+                        if action == 'broker' and not can_edit:
+                            continue
+                        items.append(dict(base, action=action, label={'owner':'指派负责人','binding':'设置经纪人绑定','broker':'补充保险经纪人'}[action], reason=r.get('assignmentReason','待分配')))
+        # One broker rule resolves many service customers; show one action, not many duplicates.
+        grouped, compact = {}, []
+        for task in items:
+            if task['action'] != 'binding':
+                compact.append(task)
+                continue
+            key = normalized(task['broker'])
+            if key in grouped:
+                grouped[key]['affectedCount'] += 1
+            else:
+                task['affectedCount'] = 1
+                grouped[key] = task
+                compact.append(task)
+        return dict(items=compact, waiting=waiting)
 
     @app.get('/api/priority-inferior/batches')
     def batches(user=Depends(current_user)):

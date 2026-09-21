@@ -747,3 +747,89 @@ def test_secondary_wrong_total_is_rejected():
     from fastapi import HTTPException
     with pytest.raises(HTTPException,match='合计不一致'):
         parse(base64.b64decode(f['contentBase64']),f['filename'],'2026-09-18',[])
+
+
+def test_choose_identity_in_upload_preview_atomic_audited_and_rollback(client):
+    publish(client,[icc(code='',batch='2026.09.17')],batches=['2026-09-17'])
+    roster=roster_rows([('甲','TW2026001'),('甲','TW2026002')])
+    p=preview(client,[roster],date='2026-09-18')
+    issue=p['identityReconciliation']['issues'][0]
+    choice=dict(key=issue['key'],recordKey=issue['recordKey'],twCode='TW2026002')
+    url='/api/priority-inferior/imports/'+p['id']+'/commit'
+    assert client.post(url,json={'identities':[{**choice,'twCode':'TW999'}]}).status_code==422
+    before=client.get('/api/priority-inferior/batches/2026-09-17/participations').json()
+    assert before['rows'][0]['twCode']==''
+    assert client.post(url,json={'identities':[choice]}).status_code==200
+    row=client.get('/api/priority-inferior/batches/2026-09-17/participations').json()['rows'][0]
+    assert row['twCode']=='TW2026002' and row['recordKey']==choice['recordKey']
+    assert row['manualCorrection']['reason']=='上传预览中人工选择候选 TW'
+    assert client.post(url,json={'identities':[choice]}).json()['alreadyCommitted']
+    assert client.post(url.replace('/commit','/rollback')).status_code==200
+    assert client.get('/api/priority-inferior/batches/2026-09-17/participations').json()['rows'][0]['twCode']==''
+
+
+def test_choose_existing_unchanged_conflict_and_reupload_preserves_choice(client):
+    publish(client,[icc(code='',batch='2026.09.17')],batches=['2026-09-17'])
+    roster=roster_rows([('甲','TW2026001'),('甲','TW2026002')])
+    publish(client,[roster],date='2026-09-18')
+    p=preview(client,[roster],date='2026-09-18')
+    assert len(p['datasets'])==1 and p['datasets'][0]['duplicate']
+    issue=p['identityReconciliation']['issues'][0]
+    choice=dict(key=issue['key'],recordKey=issue['recordKey'],twCode='TW2026001')
+    assert client.post('/api/priority-inferior/imports/'+p['id']+'/commit',json={'identities':[choice]}).status_code==200
+    publish(client,[icc(code='',batch='2026.09.17',amount='200')],batches=['2026-09-17'])
+    row=client.get('/api/priority-inferior/batches/2026-09-17/participations').json()['rows'][0]
+    assert row['twCode']=='TW2026001' and row['agreementAmountUsd']=='200'
+
+
+def test_preview_choice_cannot_duplicate_same_tw_in_batch(client):
+    from backend.priority_inferior import dumps
+    publish(client,[icc(code='',batch='2026.09.17')],batches=['2026-09-17'])
+    roster=roster_rows([('甲','TW2026001'),('甲','TW2026002')])
+    publish(client,[roster],date='2026-09-18')
+    import json
+    with main.db() as conn:
+        head=conn.execute("SELECT head_id FROM priority_datasets WHERE dataset_key='icc:2026-09-17'").fetchone()[0]
+        rows=json.loads(conn.execute('SELECT rows_json FROM priority_revisions WHERE id=?',(head,)).fetchone()[0])
+        rows.append({**rows[0],'recordKey':'another-record','twCode':'TW2026001'})
+        conn.execute('UPDATE priority_revisions SET rows_json=? WHERE id=?',(dumps(rows),head))
+    p=preview(client,[roster],date='2026-09-18')
+    i=p['identityReconciliation']['issues'][0]
+    choice=dict(key=i['key'],recordKey=i['recordKey'],twCode='TW2026001')
+    url='/api/priority-inferior/imports/'+p['id']+'/commit'
+    assert client.post(url,json={'identities':[choice]}).status_code==409
+    client.test_user['canImportCustomers']=False
+    assert client.post(url,json={'identities':[choice]}).status_code==403
+
+
+def test_task_center_only_actionable_and_permissions(client):
+    publish(client,[icc(code='',batch='2026.09.17')],batches=['2026-09-17'])
+    tasks=client.get('/api/priority-inferior/tasks').json()
+    assert not tasks['items'] and len(tasks['waiting'])==1
+    publish(client,[roster_rows([('甲','TW2026001'),('甲','TW2026002')])],date='2026-09-18')
+    tasks=client.get('/api/priority-inferior/tasks').json()
+    assert len(tasks['items'])==1 and not tasks['waiting']
+    task=tasks['items'][0]
+    assert task['action']=='identity' and task['batch']=='2026-09-17'
+    d=client.get('/api/priority-inferior/batches/2026-09-17/participations').json()
+    assert client.patch('/api/priority-inferior/batches/2026-09-17/records/'+task['recordKey'],json=dict(expectedRevision=d['revision'],changes={'twCode':'TW2026001'},reason='快捷确认')).status_code==200
+    assert client.get('/api/priority-inferior/tasks').json()['items']==[]
+    client.test_user.update(customerScope='self',canImportCustomers=False,canManageAssignments=False)
+    assert client.get('/api/priority-inferior/tasks').json()==dict(items=[],waiting=[])
+
+
+def test_task_center_owner_binding_and_missing_broker(client):
+    publish(client,[master(),icc(owner='')])
+    tasks=client.get('/api/priority-inferior/tasks').json()['items']
+    assert len(tasks)==1 and tasks[0]['action']=='owner'
+    d=client.get('/api/priority-inferior/batches/2026-09-09/participations').json()
+    url='/api/priority-inferior/batches/2026-09-09/records/'+tasks[0]['recordKey']
+    assert client.patch(url,json=dict(expectedRevision=d['revision'],changes={'jiaoyangOwner':'演示顾问'},reason='快捷指派')).status_code==200
+    assert not client.get('/api/priority-inferior/tasks').json()['items']
+    # Separate service customer without agreement needs broker binding, not leader assignment.
+    service=icc(name='乙',code='',owner='',amount='',batch='2026.09.17')
+    service['contentBase64']=base64.b64encode(xlsx([('2026.09.17',[(2,dict(zip('ABCDEFGHIJKL',HEADERS))),(3,dict(B='乙',F='外部经纪人',I='☐'))])])).decode()
+    publish(client,[service],batches=['2026-09-17'])
+    assert client.get('/api/priority-inferior/tasks').json()['items'][0]['action']=='binding'
+    bind_service(client)
+    assert not client.get('/api/priority-inferior/tasks').json()['items']
