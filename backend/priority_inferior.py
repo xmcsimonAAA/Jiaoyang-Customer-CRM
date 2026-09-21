@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 from backend.priority_assignment import SCHEMA as BINDING_SCHEMA, resolve as resolve_assignments, decorate
 from backend.priority_import import FIELDS, iso, normalized, number, parse, sum_values, text, tw
 
+from backend.priority_identity import reconcile, excluded_codes
 from backend.workspace import SCHEMA as WORKSPACE_SCHEMA, install as install_workspace
 
 SCHEMA = [
@@ -42,7 +43,7 @@ SCHEMA = [
         created_at TEXT NOT NULL, created_by TEXT NOT NULL)""",
     'CREATE INDEX IF NOT EXISTS idx_priority_revision_dataset ON priority_revisions(dataset_key, created_at)',
 ]
-MATCHING_VERSION = 2
+MATCHING_VERSION = 3
 
 LABELS = {'master': '客户身份与券商开户', 'assets': '客户资产（USD）', 'secondary': 'XMax 二级持仓（股）', 'icc': '港安 ICC 批次'}
 
@@ -140,7 +141,8 @@ def match_records(rows, identities, batch_date):
 
 def detached_identity(row, reason):
     """Unlink only the activity, keeping its stable record key and business history."""
-    return dict(twCode='', canonicalName='', matchStatus='unmatched', candidates=[],
+    blocked = excluded_codes(row) | ({row['twCode']} if row.get('twCode') else set())
+    return dict(twCode='', canonicalName='', matchStatus='unmatched', candidates=[], excludedTwCodes=sorted(blocked),
                 matchReason=reason, identityDetached=row.get('twCode') or row.get('identityDetached') or 'manual')
 
 
@@ -169,6 +171,8 @@ def prepare_dataset(dataset, previous):
         if before:
             seen.add(before['recordKey'])
             r['recordKey'] = before['recordKey']
+            if before.get('excludedTwCodes'):
+                r['excludedTwCodes'] = before['excludedTwCodes']
             if 'participationIntent' in before:
                 r['participationIntent'] = before['participationIntent']
             if dataset['kind'] in {'icc', 'master'}:
@@ -324,6 +328,7 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                     date=dataset.get('date') or dataset.get('business_date'), records=len(rows),
                     participants=len(participating), agreementUsd=sum_values(r['agreementAmountUsd'] for r in participating),
                     assetUsd=sum_values(r.get('assetUsd') for r in rows), quantity=sum_values(r.get('quantity') for r in rows),
+                    automaticIdentity=dataset.get('automaticIdentity', False),
                     pending=sum(1 for r in rows if dataset['kind'] == 'icc' and not r.get('twCode')),
                     missingCount=dataset.get('missingCount', 0), duplicate=dataset.get('duplicate', False),
                     changes=dataset.get('changes', []))
@@ -368,6 +373,10 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                                   (group[0].get('twCode') and group[0].get('matchReason') != '客户名单中的唯一同名记录'))}
                     for r in d['rows']:
                         prior = confirmed.get(normalized(r['customerName']))
+                        if prior and r.get('twCode') and r['twCode'] in excluded_codes(prior):
+                            r['twCode'] = prior.get('twCode', '')
+                        if prior and prior.get('twCode') and r.get('twCode') and prior['twCode'] != r['twCode']:
+                            raise HTTPException(422, '本批次该姓名已有其他 TW，需先在匹配身份中修订，避免覆盖已确认客户。')
                         if prior and (not r.get('twCode') or prior.get('identityDetached')):
                             r['identityDetached'] = prior.get('identityDetached', '')
                             r['twCode'] = prior.get('twCode', '')
@@ -390,11 +399,47 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
             for d in datasets:
                 proposed[d['key']]={**d,'business_date':d['date']}
             shared_preview=sync_customers(conn,proposed,user,dry_run=True)
+            # A roster upload also repairs pending ICC identities, in the SAME reversible job.
+            blocked = {c['twCode'] for c in shared_preview['conflicts']}
+            identities = shared_registry(conn, proposed)
+            auto_matched = 0
+            uploaded = {d['key']: d for d in datasets}
+            for key, activity in list(proposed.items()):
+                if activity['kind'] != 'icc':
+                    continue
+                before_rows = copy.deepcopy(activity['rows'])
+                auto_matched += reconcile(activity['rows'], activity['business_date'], proposed, identities, blocked)
+                if activity['rows'] == before_rows:
+                    continue
+                dataset = uploaded.get(key)
+                if dataset is None:
+                    dataset = dict(key=key, kind='icc', date=activity['business_date'], filename=activity['filename'],
+                                   rows=activity['rows'], parent=activity['head_id'], duplicate=False,
+                                   fingerprint='manual:auto:'+digest(activity['rows']), changes=[], missingCount=0,
+                                   automaticIdentity=True)
+                    datasets.append(dataset)
+                else:
+                    was_duplicate = dataset['duplicate']
+                    dataset['duplicate'] = False
+                    dataset['rows'] = activity['rows']
+                    if was_duplicate:
+                        dataset['fingerprint'] = 'manual:auto:'+digest(activity['rows'])
+                for before_row, row in zip(before_rows, activity['rows']):
+                    if before_row.get('twCode') != row.get('twCode'):
+                        dataset['changes'].append(dict(name=row['customerName'], twCode=row.get('twCode'),
+                            fields=['twCode'], before={'twCode':before_row.get('twCode')},
+                            after={'twCode':row.get('twCode')}, reason=row['matchReason']))
+            pending_rows = [(d,r) for d in proposed.values() if d['kind']=='icc' for r in d['rows'] if not r.get('twCode')]
+            identity_summary = dict(autoMatched=auto_matched, pending=len(pending_rows),
+                waiting=sum(not r.get('candidates') or '等待' in r.get('matchReason','') for _,r in pending_rows),
+                issues=[dict(key=d.get('dataset_key') or d.get('key'), name=r['customerName'],
+                    sourceRow=r['sourceRow'], reason=r.get('matchReason','身份待确认'),
+                    candidates=r.get('candidates',[])) for d,r in pending_rows])
             result = [summary(d) for d in datasets]
             job = str(uuid4())
             conn.execute('INSERT INTO priority_uploads VALUES (?,?,?,?,?,?,?)',
-                         (job, 'preview', dumps({'matchingVersion': MATCHING_VERSION, 'datasets': datasets, 'baseHeads': {k: v['head_id'] for k, v in current.items()}}), dumps(sources), dumps(result), now_iso(), user['id']))
-        return {'id': job, 'datasets': result, 'sharedCustomers':shared_preview, 'issues': [dict(key=d['key'], recordKey=r['recordKey'], name=r['customerName'], sourceRow=r['sourceRow'], status=r['matchStatus'], candidates=r['candidates'])
+                         (job, 'preview', dumps({'matchingVersion': MATCHING_VERSION, 'identityReconciliation': identity_summary, 'datasets': datasets, 'baseHeads': {k: v['head_id'] for k, v in current.items()}}), dumps(sources), dumps(result), now_iso(), user['id']))
+        return {'id': job, 'datasets': result, 'identityReconciliation':identity_summary, 'sharedCustomers':shared_preview, 'issues': [dict(key=d['key'], recordKey=r['recordKey'], name=r['customerName'], sourceRow=r['sourceRow'], status=r['matchStatus'], candidates=r['candidates'])
                 for d in datasets if d['kind'] == 'icc' and not d['duplicate'] for r in d['rows'] if not r.get('twCode')]}
 
     @app.post('/api/priority-inferior/imports/{job_id}/commit')
@@ -429,7 +474,7 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                     conn.execute('UPDATE priority_datasets SET head_id=? WHERE dataset_key=?', (rev, key))
                 shared_result = sync_customers(conn, heads(conn), user)
                 conn.execute("UPDATE priority_uploads SET status='committed' WHERE id=?", (job_id,))
-                audit(conn, user, 'priority.import', 'priority_upload', job_id, {'datasets': json.loads(job['summary_json'])})
+                audit(conn, user, 'priority.import', 'priority_upload', job_id, {'datasets': json.loads(job['summary_json']), 'identityReconciliation':payload.get('identityReconciliation')})
         except sqlite3.IntegrityError as exc:
             raise HTTPException(409, '另一项上传刚刚更新了同一份资料，请重新预览。') from exc
         return {'id': job_id, 'status': 'committed', 'sharedCustomers':shared_result}
@@ -605,9 +650,9 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                 if field in changes:
                     changes[field] = number(changes[field], field, nonnegative=True)
             for field, value in changes.items():
-                if isinstance(value, (dict, list)) and field != 'candidates':
+                if isinstance(value, (dict, list)) and field not in {'candidates', 'excludedTwCodes'}:
                     raise HTTPException(422, '字段值类型错误。')
-                if field not in {'depositAmount', 'agreementAmountUsd', 'candidates'}:
+                if field not in {'depositAmount', 'agreementAmountUsd', 'candidates', 'excludedTwCodes'}:
                     changes[field] = text(value)
                     if len(changes[field]) > 5000:
                         raise HTTPException(422, '字段内容过长。')

@@ -179,52 +179,63 @@ def _parse(workbook, filename, as_of, batch_dates):
     # Only the first sheet is authoritative for the client registry; only ABC for assets.
     sheet = workbook.sheets[0]
     raw = workbook.rows(sheet, {'A', 'B', 'C'})
-    header = next(((i, r) for i, r in raw[:20] if normalized(r.get('A')) in {'客户姓名', '客户编码', 'no.'}), None)
+    header = next(((i, r) for i, r in raw[:20] if normalized(r.get('A')) in {'客户姓名', '客户编码', 'no.', 'cd'}), None)
     if header is None:
         raise HTTPException(422, f'{filename} 不属于已配置的四种表格。')
     label = normalized(header[1].get('A'))
-    kind = {'客户姓名': 'master', '客户编码': 'assets', 'no.': 'secondary'}[label]
+    kind = {'客户姓名': 'master', '客户编码': 'assets', 'no.': 'secondary', 'cd': 'secondary'}[label]
     if kind == 'master' and normalized(header[1].get('B')) != '是否完成开户':
         raise HTTPException(422, '客户名单表头发生变化，请核对券商开户状态列。')
     if kind == 'assets' and not normalized(header[1].get('C')).startswith('客户权益资产'):
         raise HTTPException(422, '客户资产列含义无法确认。')
-    if kind == 'secondary' and normalized(header[1].get('B')) != 'qty':
-        raise HTTPException(422, '二级持仓缺少 qty 列。')
+    quantity_col, name_col = 'B', 'C'
+    if kind == 'secondary':
+        quantities = [c for c,v in header[1].items() if normalized(v) == 'qty']
+        names = [c for c,v in header[1].items() if normalized(v) == 'client_acc_name']
+        if len(quantities) != 1 or len(names) != 1 or 'A' in quantities + names:
+            raise HTTPException(422, '二级持仓需包含唯一 qty 和 client_acc_name 列。')
+        quantity_col, name_col = quantities[0], names[0]
     # A dated file must not silently be imported into a different week.
     match = re.search(r'(20\d\d)[.\-/]?(\d{2})[.\-/]?(\d{2})', filename)
     if match and date(*map(int, match.groups())).isoformat() != as_of:
         raise HTTPException(422, f'{filename} 的日期与统计日期 {as_of} 不一致。')
     records = []
+    totals = []
     groups = defaultdict(list)
     for index, values in raw:
         if index <= header[0]:
             continue
-        if kind == 'secondary' and not text(values.get('A')) and not text(values.get('C')):
-            continue  # trailing qty total, independently reconciled below
+        if kind == 'secondary' and not text(values.get('A')) and not text(values.get(name_col)):
+            if text(values.get(quantity_col)):
+                totals.append(number(values[quantity_col], '持仓合计', nonnegative=True, integer=True))
+            continue
         if not any(text(v) for v in values.values()):
             continue
         code = tw(values.get('C' if kind == 'master' else 'A'))
-        r = dict(twCode=code, customerName=text(values.get('A' if kind == 'master' else 'B' if kind == 'assets' else 'C')),
+        r = dict(twCode=code, customerName=text(values.get('A' if kind == 'master' else 'B' if kind == 'assets' else name_col)),
                  recordKey=code, sourceRow=index, sourceSheet=sheet[0], raw=values)
         if kind == 'master':
             r['brokerAccountStatus'] = text(values.get('B'))
         else:
             field = 'assetUsd' if kind == 'assets' else 'quantity'
-            r[field] = number(values.get('C' if kind == 'assets' else 'B'), f'{sheet[0]} 第 {index} 行',
+            r[field] = number(values.get('C' if kind == 'assets' else quantity_col), f'{sheet[0]} 第 {index} 行',
                               nonnegative=kind == 'secondary', integer=kind == 'secondary')
             if r[field] is None:
                 raise HTTPException(422, f'{sheet[0]} 第 {index} 行缺少数值；空白不能作为零。')
         groups[code].append(r)
     for code, items in groups.items():
-        if kind != 'assets' and len(items) > 1:
+        if kind == 'master' and len(items) > 1:
             raise HTTPException(422, f'{sheet[0]} 中 {code} 重复，需核对后重传。')
         r = dict(items[0])
-        if kind == 'assets':
+        if kind in {'assets', 'secondary'}:
             if len({normalized(x['customerName']) for x in items}) > 1:
                 raise HTTPException(422, f'{code} 的账户姓名不一致，请核对。')
-            r['assetUsd'] = sum_values(x['assetUsd'] for x in items)
+            field = 'assetUsd' if kind == 'assets' else 'quantity'
+            r[field] = sum_values(x[field] for x in items)
             r['sourceRows'] = items
         records.append(r)
+    if kind == 'secondary' and totals and any(Decimal(total) != Decimal(sum_values(r['quantity'] for r in records)) for total in totals):
+        raise HTTPException(422, '二级持仓明细股数与表尾合计不一致，请核对来源文件。')
     if not records:
         raise HTTPException(422, f'{filename} 没有可导入记录。')
     return [dict(kind=kind, date=as_of, rows=records, sheet=sheet[0])]

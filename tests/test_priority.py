@@ -571,12 +571,13 @@ def test_shared_backfill_existing_published_sources_without_reupload(client):
 
 
 def test_same_name_only_suggests_candidate_and_explicit_tw_matches(client):
-    p=publish(client,[master(),icc(code='')])
+    publish(client,[master()],date='2026-09-08')
+    p=publish(client,[icc(code='')])
     issue=p['issues'][0]
     assert issue['candidates']==['TW2026001']
     d=client.get('/api/priority-inferior/batches/2026-09-09/participations').json()
     assert d['rows'][0]['twCode']==''
-    assert p['datasets'][1]['changes'][0]['fields']==['新增批次记录']
+    assert p['datasets'][0]['changes'][0]['fields']==['新增批次记录']
     assert client.get('/api/priority-inferior/customers/TW2026001').json()['icc']==[]
     publish(client,[icc(code='TW2026001',batch='2026.09.17')],batches=['2026-09-17'])
     assert len(client.get('/api/priority-inferior/customers/TW2026001').json()['icc'])==1
@@ -642,3 +643,107 @@ def test_targeted_repair_is_audited_idempotent_and_does_not_change_other_rows(cl
     assert client.get('/api/priority-inferior/revisions/'+old).json()['rows'][0]['twCode']=='TW2026001'
     assert client.post('/api/priority-inferior/imports/'+result['jobId']+'/rollback').status_code==200
     assert len(client.get('/api/priority-inferior/customers/TW2026001').json()['icc'])==1
+
+
+def roster_rows(entries):
+    return source('开户名单.xlsx',[('全部',[(1,dict(A='客户姓名',B='是否完成开户',C='备注'))]+
+        [(i+2,dict(A=name,B='开户成功',C=code)) for i,(name,code) in enumerate(entries)])])
+
+
+def test_roster_after_activity_automatically_links_history_followup_and_can_undo(client):
+    publish(client,[icc(code='',batch='2026.09.17')],batches=['2026-09-17'])
+    old=client.get('/api/priority-inferior/batches/2026-09-17/participations').json()
+    key=old['rows'][0]['recordKey']
+    assert workspace_note(client,key='icc:2026-09-17/'+key,batchKey='2026-09-17').status_code==201
+    p=preview(client,[master(),assets(date='2026.09.18')],date='2026-09-18')
+    assert p['identityReconciliation']['autoMatched']==1
+    assert p['datasets'][-1]['automaticIdentity']
+    assert client.get('/api/priority-inferior/batches/2026-09-17/participations').json()['rows'][0]['twCode']==''
+    assert client.post('/api/priority-inferior/imports/'+p['id']+'/commit').status_code==200
+    row=client.get('/api/priority-inferior/batches/2026-09-17/participations').json()['rows'][0]
+    assert row['recordKey']==key and row['twCode']=='TW2026001'
+    card=client.get('/api/workspace/card',params={'key':'tw:TW2026001'}).json()
+    assert len(card['followups'])==1 and len(card['priority'])==1
+    again=publish(client,[master()],date='2026-09-18')
+    assert again['identityReconciliation']['autoMatched']==0 and len(again['datasets'])==1
+    assert client.post('/api/priority-inferior/imports/'+p['id']+'/rollback').status_code==200
+    row=client.get('/api/priority-inferior/batches/2026-09-17/participations').json()['rows'][0]
+    assert row['recordKey']==key and row['twCode']==''
+    card=client.get('/api/workspace/card',params={'key':'icc:2026-09-17/'+key}).json()
+    assert len(card['followups'])==1
+
+
+def test_rejected_old_namesake_does_not_block_new_account(client):
+    publish(client,[roster_rows([('张萌','TW202605018')]),icc(name='张萌',code='TW202605018',batch='2026.09.17')],batches=['2026-09-17'])
+    d=client.get('/api/priority-inferior/batches/2026-09-17/participations').json()
+    url='/api/priority-inferior/batches/2026-09-17/records/'+d['rows'][0]['recordKey']
+    assert client.patch(url,json=dict(expectedRevision=d['revision'],changes={'twCode':''},reason='不同人')).status_code==200
+    p=publish(client,[roster_rows([('张萌','TW202605018'),('张萌','TW202609050')])],date='2026-09-18')
+    assert p['identityReconciliation']['autoMatched']==1
+    row=client.get('/api/priority-inferior/batches/2026-09-17/participations').json()['rows'][0]
+    assert row['twCode']=='TW202609050' and 'TW202605018' in row['excludedTwCodes']
+    assert client.get('/api/priority-inferior/customers/TW202605018').json()['icc']==[]
+    publish(client,[icc(name='张萌',code='',batch='2026.09.17',amount='200')],batches=['2026-09-17'])
+    row=client.get('/api/priority-inferior/batches/2026-09-17/participations').json()['rows'][0]
+    assert row['twCode']=='TW202609050' and 'TW202605018' in row['excludedTwCodes']
+    publish(client,[icc(name='张萌',code='TW202605018',batch='2026.09.17',amount='300')],batches=['2026-09-17'])
+    rows=client.get('/api/priority-inferior/batches/2026-09-17/participations').json()['rows']
+    assert len(rows)==1 and rows[0]['twCode']=='TW202609050'
+
+
+def test_ambiguous_names_stay_pending_and_same_tw_name_conflicts_do_not_guess(client):
+    publish(client,[icc(code='',batch='2026.09.17')],batches=['2026-09-17'])
+    p=publish(client,[roster_rows([('甲','TW2026001'),('甲','TW2026002')])],date='2026-09-18')
+    assert p['identityReconciliation']['autoMatched']==0
+    assert p['identityReconciliation']['pending']==1
+    assert len(p['identityReconciliation']['issues'][0]['candidates'])==2
+    # Removing an account from the next snapshot must not erase known ambiguity.
+    p=publish(client,[roster_rows([('甲','TW2026002')])],date='2026-09-19')
+    assert p['identityReconciliation']['autoMatched']==0
+
+
+def test_roster_retry_updates_existing_duplicate_upload_and_stale_preview_is_blocked(client):
+    publish(client,[master()],date='2026-09-18')
+    publish(client,[icc(name='访客',code='',batch='2026.09.17')],batches=['2026-09-17'])
+    # Simulate an unresolved record published before reconciliation was introduced.
+    import json
+    with main.db() as conn:
+        d=conn.execute("SELECT r.id,r.rows_json FROM priority_datasets d JOIN priority_revisions r ON r.id=d.head_id WHERE d.dataset_key='icc:2026-09-17'").fetchone()
+        rows=json.loads(d['rows_json']);rows[0]['customerName']='甲'
+        conn.execute('UPDATE priority_revisions SET rows_json=? WHERE id=?',(json.dumps(rows),d['id']))
+    p=preview(client,[master()],date='2026-09-18')
+    assert p['datasets'][0]['duplicate'] and p['identityReconciliation']['autoMatched']==1
+    stale=preview(client,[master()],date='2026-09-18')
+    assert client.post('/api/priority-inferior/imports/'+p['id']+'/commit').status_code==200
+    assert client.post('/api/priority-inferior/imports/'+stale['id']+'/commit').status_code==409
+
+
+def test_secondary_reordered_headers_multi_accounts_and_trailing_total():
+    f=source('SXY SH 20260918二级.xlsx',[('SH',[(1,dict(A='Cd',B='client_acc_name',C='qty')),
+        (2,dict(A='TW2026001',B='JIA',C='12100')),(3,dict(A='TW2026001',B='JIA',C='10333')),
+        (4,dict(A='TW2026002',B='YI',C='10')),(5,dict(C='22443'))])])
+    rows=parse(base64.b64decode(f['contentBase64']),f['filename'],'2026-09-18',[])[0]['rows']
+    assert len(rows)==2 and rows[0]['quantity']=='22433' and len(rows[0]['sourceRows'])==2
+    assert sum(Decimal(r['quantity']) for r in rows)==22443
+
+
+def test_reconcile_does_not_use_conflicting_tw_names_or_occupied_batch_identity():
+    from backend.priority_identity import reconcile
+    identities={'TW1':dict(customerName='甲')}
+    datasets={'master':dict(kind='master',business_date='2026-09-18',rows=[dict(twCode='TW1',customerName='乙')])}
+    row=dict(customerName='乙',twCode='')
+    assert reconcile([row],'2026-09-17',datasets,identities)==0
+    assert '姓名不一致' in row['matchReason']
+    datasets['master']['rows'][0]['customerName']='甲'
+    row=dict(customerName='甲',twCode='')
+    assert reconcile([row],'2026-09-17',datasets,identities,{'TW1'})==0
+    assert '冲突' in row['matchReason']
+    assert reconcile([row,dict(customerName='甲',twCode='TW1')],'2026-09-17',datasets,identities)==0
+
+
+def test_secondary_wrong_total_is_rejected():
+    f=source('二级.xlsx',[('SH',[(1,dict(A='Cd',B='client_acc_name',C='qty')),
+        (2,dict(A='TW1',B='JIA',C=10)),(3,dict(C=11))])])
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException,match='合计不一致'):
+        parse(base64.b64decode(f['contentBase64']),f['filename'],'2026-09-18',[])
