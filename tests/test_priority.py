@@ -1040,3 +1040,18 @@ def test_icc_account_filter_does_not_filter_roster_assets_or_positions(client):
     assert all(d['iccAccountFilter'] is None for d in data['datasets'])
     commit_preview(client,data)
     assert owner_customer()['customer_code']=='TW2026001'
+
+
+def test_secondary_code_qty_name_export_is_recognized(client):
+    exported = source('SXY SH 20260925二级.xlsx', [('20260925 sh', [
+        (1, dict(A='CODE', B='qty', C='name')),
+        (2, dict(A='TW2026001', B='730', C='甲')),
+        (3, dict(A='TW2026001', B='20', C='甲')),
+    ])])
+    p = preview(client, [exported], date='2026-09-25')
+    assert p['datasets'][0]['kind'] == 'secondary'
+    assert p['datasets'][0]['records'] == 1
+    assert p['datasets'][0]['quantity'] == '750'
+    commit_preview(client, p)
+    customer = client.get('/api/priority-inferior/customers/TW2026001').json()
+    assert customer['secondary'][0]['quantity'] == '750'
