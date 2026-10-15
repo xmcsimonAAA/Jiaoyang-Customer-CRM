@@ -58,3 +58,18 @@ body .field textarea { box-sizing:border-box; width:100%; min-height:112px; padd
 .product-stat { display:flex; flex-direction:column; gap:8px; margin:22px 0; }
 .product-stat strong { font-size:32px; font-weight:750; color:#23382c; }
 .product-stat span { font-size:13px; color:#5a6b60; }
+.workspace-history { margin: 0 0 18px; }
+.history-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; }
+.history-card { min-width:0; padding:16px; border:1px solid #dfe7df; border-radius:12px; background:#fbfcfa; }
+.history-card header { display:flex; justify-content:space-between; align-items:baseline; gap:10px; }
+.history-card header span { color:#5c6c61; font-size:12px; }
+.history-card header b { color:#21382b; font-size:18px; text-align:right; overflow-wrap:anywhere; }
+.history-card>p { color:#7a867d; font-size:11px; line-height:1.6; }
+.history-points { display:flex; gap:7px; min-height:118px; align-items:end; overflow-x:auto; padding-top:14px; }
+.history-point { flex:1 0 42px; min-width:42px; display:flex; flex-direction:column; justify-content:end; align-items:center; gap:4px; }
+.history-bar { width:100%; height:64px; display:flex; align-items:end; justify-content:center; background:linear-gradient(to top,#edf2eb 1px,transparent 1px); background-size:100% 16px; }
+.history-bar i { display:block; width:16px; min-height:0; border-radius:4px 4px 1px 1px; background:#6f914b; }
+.history-point strong { color:#425b49; font-size:10px; white-space:nowrap; }
+.history-point small { color:#89948b; font-size:9px; white-space:nowrap; }
+@media(max-width:1050px) { .history-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+@media(max-width:520px) { .history-grid { grid-template-columns:1fr; } }

@@ -34,6 +34,7 @@ POSTGRES_SCHEMA_STATEMENTS = [
         can_manage_assignments INTEGER,
         can_manage_advisor_bindings INTEGER,
         can_manage_crm_permissions INTEGER,
+        can_monitor_followups INTEGER,
         updated_by TEXT,
         updated_at TEXT NOT NULL
     )
@@ -42,6 +43,7 @@ POSTGRES_SCHEMA_STATEMENTS = [
     "ALTER TABLE user_permissions ADD COLUMN IF NOT EXISTS can_manage_assignments INTEGER",
     "ALTER TABLE user_permissions ADD COLUMN IF NOT EXISTS can_manage_advisor_bindings INTEGER",
     "ALTER TABLE user_permissions ADD COLUMN IF NOT EXISTS can_manage_crm_permissions INTEGER",
+    "ALTER TABLE user_permissions ADD COLUMN IF NOT EXISTS can_monitor_followups INTEGER",
     """
     CREATE TABLE IF NOT EXISTS counters (
         counter_key TEXT PRIMARY KEY,
@@ -256,6 +258,7 @@ POSTGRES_SCHEMA_STATEMENTS = [
         intent_amount DOUBLE PRECISION NOT NULL DEFAULT 0,
         funded_amount DOUBLE PRECISION NOT NULL DEFAULT 0,
         actual_amount DOUBLE PRECISION NOT NULL DEFAULT 0,
+        share_quantity INTEGER,
         notes TEXT NOT NULL DEFAULT '',
         source_label TEXT NOT NULL DEFAULT '手工录入',
         source_row INTEGER,
@@ -268,6 +271,7 @@ POSTGRES_SCHEMA_STATEMENTS = [
         UNIQUE(batch_id, customer_id)
     )
     """,
+    "ALTER TABLE batch_participations ADD COLUMN IF NOT EXISTS share_quantity INTEGER",
     "CREATE INDEX IF NOT EXISTS idx_batch_participations_batch ON batch_participations(batch_id, updated_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_batch_participations_customer ON batch_participations(customer_id, updated_at DESC)",
     """

@@ -204,14 +204,26 @@ def _parse(workbook, filename, as_of, batch_dates):
     if match and date(*map(int, match.groups())).isoformat() != as_of:
         raise HTTPException(422, f'{filename} 的日期与统计日期 {as_of} 不一致。')
     records = []
-    totals = []
+    totals = defaultdict(list)
+    holding_mode = 'secondary'
     groups = defaultdict(list)
     for index, values in raw:
         if index <= header[0]:
             continue
+        marker = normalized(values.get('A'))
+        if kind == 'secondary' and '大宗' in marker:
+            holding_mode = 'block'
+            if text(values.get(quantity_col)):
+                totals[holding_mode].append(number(values[quantity_col], '大宗持仓合计', nonnegative=True, integer=True))
+            continue
+        if kind == 'secondary' and '二级买入' in marker:
+            holding_mode = 'secondary'
+            if text(values.get(quantity_col)):
+                totals[holding_mode].append(number(values[quantity_col], '二级持仓合计', nonnegative=True, integer=True))
+            continue
         if kind == 'secondary' and not text(values.get('A')) and not text(values.get(name_col)):
             if text(values.get(quantity_col)):
-                totals.append(number(values[quantity_col], '持仓合计', nonnegative=True, integer=True))
+                totals[holding_mode].append(number(values[quantity_col], '持仓合计', nonnegative=True, integer=True))
             continue
         if not any(text(v) for v in values.values()):
             continue
@@ -224,6 +236,8 @@ def _parse(workbook, filename, as_of, batch_dates):
             field = 'assetUsd' if kind == 'assets' else 'quantity'
             r[field] = number(values.get('C' if kind == 'assets' else quantity_col), f'{sheet[0]} 第 {index} 行',
                               nonnegative=kind == 'secondary', integer=kind == 'secondary')
+            if kind == 'secondary':
+                r['holdingType'] = holding_mode
             if r[field] is None:
                 raise HTTPException(422, f'{sheet[0]} 第 {index} 行缺少数值；空白不能作为零。')
         groups[code].append(r)
@@ -237,9 +251,19 @@ def _parse(workbook, filename, as_of, batch_dates):
             field = 'assetUsd' if kind == 'assets' else 'quantity'
             r[field] = sum_values(x[field] for x in items)
             r['sourceRows'] = items
+            if kind == 'secondary':
+                r['secondaryQuantity'] = sum_values(x[field] for x in items if x.get('holdingType') == 'secondary')
+                r['blockQuantity'] = sum_values(x[field] for x in items if x.get('holdingType') == 'block')
+                types = sorted({x.get('holdingType') for x in items if x.get('holdingType')})
+                r['holdingTypes'] = types
+                r['holdingType'] = types[0] if len(types) == 1 else 'mixed'
         records.append(r)
-    if kind == 'secondary' and totals and any(Decimal(total) != Decimal(sum_values(r['quantity'] for r in records)) for total in totals):
-        raise HTTPException(422, '二级持仓明细股数与表尾合计不一致，请核对来源文件。')
+    if kind == 'secondary':
+        for mode, mode_totals in totals.items():
+            detail_total = sum_values(r.get('blockQuantity' if mode == 'block' else 'secondaryQuantity', 0) for r in records)
+            if mode_totals and any(Decimal(total) != Decimal(detail_total) for total in mode_totals):
+                label = '大宗' if mode == 'block' else '二级'
+                raise HTTPException(422, f'{label}持仓明细股数与表尾合计不一致，请核对来源文件。')
     if not records:
         raise HTTPException(422, f'{filename} 没有可导入记录。')
     return [dict(kind=kind, date=as_of, rows=records, sheet=sheet[0])]

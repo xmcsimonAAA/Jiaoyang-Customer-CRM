@@ -126,6 +126,65 @@ def test_complete_upload_duplicate_and_unmatched_preserved(client):
         assert 'contentBase64' in c.execute('SELECT sources_json FROM priority_uploads WHERE id=?',(p['id'],)).fetchone()[0]
 
 
+def test_latest_asset_snapshot_is_shared_as_funded_amount_and_manual_override(client):
+    publish(client, [master(), assets(date='2026.09.11', amount='20')])
+    customer = client.get('/api/customers').json()['items'][0]
+    assert customer['funded_amount'] == 26.37
+    assert customer['funding_source_date'] == '2026-09-11'
+    # A manual correction is visible in the shared customer master and does not
+    # require editing every product record separately.
+    detail = client.get(f"/api/customers/{customer['id']}").json()['customer']
+    patched = client.patch(f"/api/customers/{customer['id']}", json={
+        'fundedAmount': 88, 'changeReason': '核对真实到账资金', 'version': detail['version'],
+    })
+    assert patched.status_code == 200, patched.text
+    assert patched.json()['customer']['funded_amount'] == 88
+    assert patched.json()['customer']['funding_source_kind'] == 'manual'
+    # A newer snapshot supersedes the manual value. Re-uploading the older
+    # snapshot cannot move the current value backwards.
+    publish(client, [assets(date='2026.09.18', amount='30')], date='2026-09-18')
+    assert client.get(f"/api/customers/{customer['id']}").json()['customer']['funded_amount'] == 36.37
+    publish(client, [assets(date='2026.09.11', amount='21')], date='2026-09-11')
+    final = client.get(f"/api/customers/{customer['id']}").json()['customer']
+    assert final['funded_amount'] == 36.37
+    assert final['funding_source_date'] == '2026-09-18'
+
+
+def test_shared_funding_updates_batches_and_restores_previous_asset_source(client):
+    publish(client, [master(), assets()])
+    customer = client.get('/api/customers').json()['items'][0]
+    batches = []
+    for name in ('到账同步批次一', '到账同步批次二'):
+        batch = client.post('/api/batches', json={'name': name, 'status': '开放中'})
+        assert batch.status_code == 201, batch.text
+        batch_id = batch.json()['batch']['id']
+        row = client.post(f'/api/batches/{batch_id}/participations', json={
+            'customerId': customer['id'], 'status': '已锁定', 'intentAmount': 100,
+        })
+        assert row.status_code == 201, row.text
+        batches.append((batch_id, row.json()['participation']['id']))
+        assert row.json()['participation']['funded_amount'] == 26.37
+    edited = client.patch('/api/batch-participations/' + batches[0][1], json={
+        'fundedAmount': 55, 'notes': '已核对到账',
+    })
+    assert edited.status_code == 200, edited.text
+    for batch_id, _ in batches:
+        row = client.get(f'/api/batches/{batch_id}/participations').json()['items'][0]
+        assert row['participation_funded_amount'] == 55
+        assert row['funding_source_kind'] == 'manual'
+    newer = publish(client, [assets(date='2026.09.18', amount='30')], date='2026-09-18')
+    for batch_id, _ in batches:
+        row = client.get(f'/api/batches/{batch_id}/participations').json()['items'][0]
+        assert row['participation_funded_amount'] == 36.37
+        assert row['funding_source_date'] == '2026-09-18'
+    reverted = client.post('/api/priority-inferior/imports/' + newer['id'] + '/rollback', json={})
+    assert reverted.status_code == 200, reverted.text
+    for batch_id, _ in batches:
+        row = client.get(f'/api/batches/{batch_id}/participations').json()['items'][0]
+        assert row['participation_funded_amount'] == 26.37
+        assert row['funding_source_date'] == '2026-09-11'
+
+
 def test_revisions_blank_carry_stale_preview_rollback_and_history(client):
     p=publish(client,[master(),icc(notes='保留此备注'),assets()])
     stale=preview(client,[icc(amount='300')])
@@ -177,6 +236,43 @@ def test_bad_numbers_invalid_dates_and_qty_total(client):
     assert zero['quantity']=='0' and zero['secondaryPresent'] and not zero['isSecondary']
     with main.db() as c:
         assert not c.execute("SELECT * FROM priority_uploads WHERE status='preview'").fetchall()
+
+
+def test_secondary_file_splits_secondary_and_block_markers():
+    file = source('SXY SH 20260930 二级 及 大宗持仓.xlsx', [('SXY 20260930 SH', [
+        (1, dict(A='CODE', B='qty', C='client_acc_name')),
+        (2, dict(A='TW2026001', B=120, C='甲')),
+        (3, dict(A='TW2026002', B=80, C='乙')),
+        (4, dict(A='二级买入： 200')),
+        (5, dict(A='以下为定增转大宗持仓')),
+        (6, dict(A='TW2026003', B=45, C='丙')),
+        (7, dict(A='大宗交易持仓： 45')),
+    ])])
+    dataset = parse(base64.b64decode(file['contentBase64']), file['filename'], '2026-09-30', [])[0]
+    assert len(dataset['rows']) == 3
+    assert sum(int(row['secondaryQuantity']) for row in dataset['rows']) == 200
+    assert sum(int(row['blockQuantity']) for row in dataset['rows']) == 45
+    assert {row['holdingType'] for row in dataset['rows']} == {'secondary', 'block'}
+
+
+def test_shared_dashboard_history_uses_uploaded_snapshots_without_estimating_missing_metrics(client):
+    secondary = source('二级20260911.xlsx', [('SH', [
+        (1, dict(A='NO.', B='qty', C='client_acc_name')),
+        (2, dict(A='TW2026001', B=12, C='JIA')),
+        (3, dict(A='TW202609039', B=0, C='DONG')),
+        (6, dict(B=12)),
+    ])])
+    publish(client, [master(), secondary])
+    result = client.get('/api/workspace/dashboard/history')
+    assert result.status_code == 200, result.text
+    latest = result.json()['series'][-1]
+    assert latest['totalCustomers'] == 2
+    assert latest['openedCount'] == 1
+    assert latest['accountSuccessRate'] == 50.0
+    assert latest['secondaryQuantity'] == '12'
+    assert latest['blockQuantity'] == '0'
+    assert latest['depositActivationRate'] is None
+    assert latest['holdingMarketValue'] is None
 
 
 def test_permissions_on_totals_rows_history_raw_and_mutations(client):
@@ -1055,3 +1151,172 @@ def test_secondary_code_qty_name_export_is_recognized(client):
     commit_preview(client, p)
     customer = client.get('/api/priority-inferior/customers/TW2026001').json()
     assert customer['secondary'][0]['quantity'] == '750'
+
+
+def test_batch_roster_is_shared_but_manager_followup_is_owner_only(client):
+    publish(client, [master()])
+    with main.db() as conn:
+        customers = [dict(row) for row in conn.execute("SELECT id,customer_code FROM customers ORDER BY customer_code").fetchall()]
+        conn.execute("UPDATE customers SET owner_id='demo-manager',owner_name='演示顾问',owner_team='演示一组' WHERE customer_code='TW2026001'")
+        conn.execute("UPDATE customers SET owner_id='demo-manager-2',owner_name='演示顾问二',owner_team='演示一组' WHERE customer_code='TW202609039'")
+    batch = client.post('/api/batches', json={'name': '跟进权限批次', 'status': '开放中'}).json()['batch']
+    for customer in customers:
+        assert client.post('/api/batches/' + batch['id'] + '/participations', json={
+            'customerId': customer['id'], 'status': '已参与',
+        }).status_code == 201
+    client.test_user.update(id='demo-manager',name='演示顾问',rolePermission='manager',customerScope='self',team='演示一组')
+    roster = client.get('/api/batches/' + batch['id'] + '/participations')
+    assert roster.status_code == 200, roster.text
+    rows = {row['customer_code']: row for row in roster.json()['items']}
+    assert len(rows) == 2
+    assert rows['TW2026001']['canOpenCard'] and rows['TW2026001']['canFollowup']
+    assert not rows['TW202609039']['canOpenCard'] and not rows['TW202609039']['canFollowup']
+    assert rows['TW202609039']['followupDisabledReason']
+    assert client.post('/api/customers/' + rows['TW202609039']['id'] + '/followups', json={
+        'method': '电话', 'content': '越权测试', 'outcome': '', 'nextAction': '',
+        'stageAfter': '初步接洽',
+    }).status_code == 404
+
+
+def test_priority_product_batch_roster_exposes_read_and_followup_flags(client):
+    activity_file = source('活动.xlsx', [('2026.09.09', [
+        (2, {**dict(zip('ABCDEFGHIJKL', HEADERS)), 'M': 'TW 编号'}),
+        (3, dict(B='甲', C='已开户', J='100', K='演示顾问', M='TW2026001')),
+        (4, dict(B='董方', C='已开户', J='200', K='演示顾问二', M='TW202609039')),
+        (5, dict(B='新访客', C='已提交', J='300', K='演示顾问二')),
+    ])])
+    publish(client, [master(), activity_file, assets()])
+    created = client.post('/api/priority-inferior/product-batches', json={
+        'name': '九月活动归集', 'participationDate': '2026-09-20',
+        'status': '进行中', 'activityDates': ['2026-09-09'],
+    })
+    assert created.status_code == 201, created.text
+    with main.db() as conn:
+        conn.execute("UPDATE customers SET owner_id='demo-manager',owner_name='演示顾问',owner_team='演示一组' WHERE customer_code='TW2026001'")
+        conn.execute("UPDATE customers SET owner_id='demo-manager-2',owner_name='演示顾问二',owner_team='演示一组' WHERE customer_code='TW202609039'")
+    client.test_user.update(id='demo-manager',name='演示顾问',rolePermission='manager',customerScope='self',team='演示一组')
+    data = client.get('/api/priority-inferior/product-batches')
+    assert data.status_code == 200, data.text
+    batch_id = created.json()['id']
+    rows = {row['name']: row for row in data.json()['items'][0]['rows']}
+    assert len(rows) == 3
+    assert rows['甲']['canFollowup'] and rows['甲']['canOpenCard']
+    assert not rows['董方']['canFollowup'] and not rows['董方']['canOpenCard']
+    assert not rows['新访客']['canFollowup'] and not rows['新访客']['canOpenCard']
+    assert rows['甲']['batchKey'] == batch_id
+    assert rows['甲']['funded_amount'] == 26.37
+    assert rows['甲']['funding_source_kind'] == 'asset'
+    assert rows['甲']['funding_source_date'] == '2026-09-11'
+    assert rows['新访客']['funded_amount'] is None
+    detail = client.get('/api/priority-inferior/product-batches/' + batch_id).json()
+    assert len(detail['rows']) == 3
+    assert workspace_note(client, batchKey=batch_id).status_code == 201
+    card = client.get('/api/workspace/card', params={'key': 'tw:TW2026001'}).json()
+    assert card['priorityBatches'][0]['id'] == batch_id
+    assert card['followups'][0]['batch_key'] == batch_id
+    assert card['funded_amount'] == 26.37
+    assert card['crm'][0]['version'] >= 1
+    assert workspace_note(client, key='tw:TW202609039', batchKey=batch_id).status_code == 404
+
+
+def test_manager_full_scope_and_collaborator_cannot_write_non_owned_followups(client):
+    publish(client, [master(), icc(owner='演示顾问二')])
+    with main.db() as conn:
+        customer = dict(conn.execute("SELECT * FROM customers WHERE customer_code='TW2026001'").fetchone())
+        main.replace_collaborators(conn, customer['id'], [main.public_platform_user(main.DEMO_USERS['manager'])], client.test_user)
+    existing = workspace_note(client, nextFollowupAt='2026-09-20T09:00:00+08:00')
+    assert existing.status_code == 201
+    client.test_user.update(id='demo-manager',name='演示顾问',rolePermission='manager',customerScope='all',team='演示一组')
+    card = client.get('/api/workspace/card', params={'key': 'tw:TW2026001'})
+    assert card.status_code == 200
+    assert not card.json()['canFollowup']
+    assert workspace_note(client).status_code == 403
+    assert client.post('/api/workspace/followups/' + existing.json()['id'] + '/complete').status_code == 403
+    assert client.post('/api/customers/' + customer['id'] + '/followups', json={
+        'method': '电话', 'content': '越权测试', 'outcome': '', 'nextAction': '',
+        'stageAfter': '初步接洽',
+    }).status_code == 403
+    client.test_user['customerScope'] = 'self'
+    assert client.get('/api/workspace/card', params={'key': 'tw:TW2026001'}).status_code == 200
+    assert workspace_note(client).status_code == 403
+    assert client.post('/api/customers/' + customer['id'] + '/followups', json={
+        'method': '电话', 'content': '协同查看不可越权跟进', 'outcome': '', 'nextAction': '',
+        'stageAfter': '初步接洽',
+    }).status_code == 403
+
+
+def test_followup_monitor_permission_names_zero_counts_and_beijing_day(client, monkeypatch):
+    users = {key: dict(value) for key, value in main.DEMO_USERS.items()}
+    users.pop('manager2')
+    # Two accounts can have the same display name; monitoring must keep them separate.
+    users['manager-2'] = dict(users['manager'], id='manager-other', username='manager-other')
+    users['inactive-manager'] = dict(users['manager'], id='manager-inactive', username='manager-inactive', active=False)
+    monkeypatch.setattr(main, 'DEMO_USERS', users)
+    publish(client, [master(), icc()])
+    with main.db() as conn:
+        conn.execute("UPDATE customers SET owner_id='demo-manager',owner_name='演示顾问',owner_team='演示一组' WHERE customer_code='TW2026001'")
+    client.test_user.update(id='demo-manager', name='演示顾问', rolePermission='manager', customerScope='self')
+    result = workspace_note(client)
+    assert result.status_code == 201, result.text
+    note_id = result.json()['id']
+    with main.db() as conn:
+        conn.execute('UPDATE workspace_followups SET created_at=? WHERE id=?',
+                     ('2026-10-14T16:30:00+00:00', note_id))
+    assert client.get('/api/workspace/followups/monitor?day=2026-10-15').status_code == 403
+    # Monitoring can be granted without broadening the account's customer access.
+    client.test_user.update(id='manager-other', canMonitorFollowups=True)
+    assert not client.get('/api/workspace/customers').json()['items']
+    response = client.get('/api/workspace/followups/monitor?day=2026-10-15')
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data['total'] == 1 and data['followedCount'] == 1
+    assert data['records'][0]['customer_name'] == '甲'
+    assert data['records'][0]['tw_code'] == 'TW2026001'
+    summary = {row['authorId']: row for row in data['summary']}
+    assert summary['demo-manager']['count'] == 1
+    assert summary['manager-other']['count'] == 0
+    assert 'manager-inactive' not in summary
+    assert [row['authorId'] for row in data['notFollowed']] == ['manager-other']
+    previous_day = client.get('/api/workspace/followups/monitor?day=2026-10-14').json()
+    assert previous_day['total'] == 0 and len(previous_day['notFollowed']) == 2
+    assert client.get('/api/workspace/followups/monitor?day=bad-date').status_code == 422
+
+
+def test_priority_batch_current_funding_tracks_manual_latest_revision_and_duplicate(client):
+    publish(client, [master(), icc(), assets()])
+    created = client.post('/api/priority-inferior/product-batches', json={
+        'name': '资金同步批次', 'participationDate': '2026-09-20', 'activityDates': ['2026-09-09'],
+    })
+    assert created.status_code == 201, created.text
+    batch_id = created.json()['id']
+    card = client.get('/api/workspace/card?key=tw:TW2026001').json()
+    customer = card['crm'][0]
+    manual = client.patch('/api/customers/' + customer['id'], json={
+        'fundedAmount': 88, 'version': customer['version'], 'changeReason': '核对到账',
+    })
+    assert manual.status_code == 200, manual.text
+    publish(client, [assets()])
+    row = client.get('/api/priority-inferior/product-batches/' + batch_id).json()['rows'][0]
+    assert row['funded_amount'] == 88 and row['funding_source_kind'] == 'manual'
+    # A corrected file for the latest business date replaces the manual correction.
+    publish(client, [assets(amount='40')])
+    row = client.get('/api/priority-inferior/product-batches/' + batch_id).json()['rows'][0]
+    assert row['funded_amount'] == 46.37 and row['funding_source_kind'] == 'asset'
+    card = client.get('/api/workspace/card?key=tw:TW2026001').json()
+    assert card['funded_amount'] == 46.37 and card['funding_source_date'] == '2026-09-11'
+
+
+def test_workspace_and_priority_dashboards_use_same_real_batch_totals(client):
+    publish(client, [master(), icc(amount='100')])
+    publish(client, [icc(amount='250', batch='2026.09.16')],
+            date='2026-09-18', batches=['2026-09-16'])
+    created = client.post('/api/priority-inferior/product-batches', json={
+        'name': '两周活动同一参与批次', 'participationDate': '2026-09-20',
+        'activityDates': ['2026-09-09', '2026-09-16'],
+    })
+    assert created.status_code == 201, created.text
+    workspace = client.get('/api/workspace/dashboard').json()['priority']
+    product = client.get('/api/priority-inferior/overview').json()['summary']
+    assert workspace['agreementUsd'] == product['agreementUsd'] == '250'
+    assert workspace['participants'] == product['participants'] == 1
+    assert workspace['records'] == product['participationRecords'] == 1

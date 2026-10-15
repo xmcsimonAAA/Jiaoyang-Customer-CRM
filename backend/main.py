@@ -162,6 +162,7 @@ def init_sqlite_db() -> None:
                 can_manage_assignments INTEGER,
                 can_manage_advisor_bindings INTEGER,
                 can_manage_crm_permissions INTEGER,
+                can_monitor_followups INTEGER,
                 updated_by TEXT,
                 updated_at TEXT NOT NULL
             );
@@ -333,6 +334,7 @@ def init_sqlite_db() -> None:
                 intent_amount REAL NOT NULL DEFAULT 0,
                 funded_amount REAL NOT NULL DEFAULT 0,
                 actual_amount REAL NOT NULL DEFAULT 0,
+                share_quantity INTEGER,
                 notes TEXT NOT NULL DEFAULT '',
                 source_label TEXT NOT NULL DEFAULT '手工录入',
                 source_row INTEGER,
@@ -395,9 +397,13 @@ def init_sqlite_db() -> None:
             "can_manage_assignments": "INTEGER",
             "can_manage_advisor_bindings": "INTEGER",
             "can_manage_crm_permissions": "INTEGER",
+            "can_monitor_followups": "INTEGER",
         }.items():
             if column not in permission_columns:
                 conn.execute(f"ALTER TABLE user_permissions ADD COLUMN {column} {definition}")
+        participation_columns = {row["name"] for row in conn.execute("PRAGMA table_info(batch_participations)").fetchall()}
+        if "share_quantity" not in participation_columns:
+            conn.execute("ALTER TABLE batch_participations ADD COLUMN share_quantity INTEGER")
         import_job_columns = {row["name"] for row in conn.execute("PRAGMA table_info(import_jobs)").fetchall()}
         if "updated_count" not in import_job_columns:
             conn.execute("ALTER TABLE import_jobs ADD COLUMN updated_count INTEGER NOT NULL DEFAULT 0")
@@ -463,8 +469,10 @@ def init_db() -> None:
         init_sqlite_db()
     from backend.workspace import SCHEMA as workspace_schema
     from backend.shared_ownership import SCHEMA as owner_schema
+    from backend.shared_funding import SCHEMA as funding_schema
     with db() as conn:
         conn.execute(owner_schema)
+        conn.execute(funding_schema)
         for statement in workspace_schema:
             conn.execute(statement)
 
@@ -627,6 +635,7 @@ class PermissionPayload(BaseModel):
     canManageAssignments: bool | None = None
     canManageAdvisorBindings: bool | None = None
     canManageCrmPermissions: bool | None = None
+    canMonitorFollowups: bool | None = None
 
 
 class CustomerFieldPayload(BaseModel):
@@ -669,6 +678,7 @@ class BatchParticipationPayload(BaseModel):
     intentAmount: float = Field(default=0, ge=0)
     fundedAmount: float = Field(default=0, ge=0)
     actualAmount: float = Field(default=0, ge=0)
+    shareQuantity: int | None = Field(default=None, ge=0)
     notes: str = ""
     sourceLabel: str = "手工录入"
     sourceRow: int | None = Field(default=None, ge=1)
@@ -679,6 +689,7 @@ class BatchParticipationPatch(BaseModel):
     intentAmount: float | None = Field(default=None, ge=0)
     fundedAmount: float | None = Field(default=None, ge=0)
     actualAmount: float | None = Field(default=None, ge=0)
+    shareQuantity: int | None = Field(default=None, ge=0)
     notes: str | None = None
 
 
@@ -925,7 +936,7 @@ def enrich_user(user: dict[str, Any]) -> dict[str, Any]:
         row = conn.execute(
             """SELECT can_import_customers, can_export_all, can_manage_customer_fields,
             scope_override, can_manage_assignments, can_manage_advisor_bindings,
-            can_manage_crm_permissions FROM user_permissions WHERE user_id = ?""",
+            can_manage_crm_permissions, can_monitor_followups FROM user_permissions WHERE user_id = ?""",
             (user["id"],),
         ).fetchone()
     result = dict(user)
@@ -938,6 +949,7 @@ def enrich_user(user: dict[str, Any]) -> dict[str, Any]:
     result["canManageAssignments"] = stored_permission(row, "can_manage_assignments", default_assignment_permission(user))
     result["canManageAdvisorBindings"] = stored_permission(row, "can_manage_advisor_bindings", default_advisor_binding_permission(user))
     result["canManageCrmPermissions"] = stored_permission(row, "can_manage_crm_permissions", default_crm_permission_management(user))
+    result["canMonitorFollowups"] = stored_permission(row, "can_monitor_followups", user["rolePermission"] in {"admin", "developer"})
     return result
 
 
@@ -1188,7 +1200,8 @@ def attach_tw_identifiers(conn: sqlite3.Connection, customers: list[dict[str, An
 
 
 def attach_customer_relations(conn: sqlite3.Connection, customers: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return attach_collaborators(conn, attach_tw_identifiers(conn, attach_custom_values(conn, customers)))
+    from backend.shared_funding import attach as attach_funding
+    return attach_funding(conn, attach_collaborators(conn, attach_tw_identifiers(conn, attach_custom_values(conn, customers))))
 
 
 def access_clause(user: dict[str, Any], alias: str = "c") -> tuple[str, tuple[Any, ...]]:
@@ -1502,11 +1515,23 @@ def batch_participation_values(raw_row: dict[str, Any], existing: dict[str, Any]
     def amount_value(key: str, default: float, label: str) -> float:
         return parse_import_amount(raw_row[key], label) if key in raw_row else default
 
+    def quantity_value(key: str, default: int | None) -> int | None:
+        if key not in raw_row:
+            return default
+        raw = clean_import_cell(raw_row[key])
+        if raw in (None, ""):
+            return None
+        value = parse_import_amount(raw, "股数")
+        if value < 0 or int(value) != value:
+            raise HTTPException(422, "股数必须是大于等于 0 的整数。")
+        return int(value)
+
     return {
         "status": normalize_batch_participation_status(text_value("status", str(existing["status"]) if existing else "已参与")) or "已参与",
         "intent_amount": amount_value("intentAmount", float(existing["intent_amount"]) if existing else 0, "意向金额"),
         "funded_amount": amount_value("fundedAmount", float(existing["funded_amount"]) if existing else 0, "到账金额"),
         "actual_amount": amount_value("actualAmount", float(existing["actual_amount"]) if existing else 0, "实际参与金额"),
+        "share_quantity": quantity_value("shareQuantity", existing.get("share_quantity") if existing else None),
         "notes": text_value("notes", str(existing["notes"]) if existing else ""),
     }
 
@@ -1525,17 +1550,27 @@ def save_batch_participation(
         (batch_id, customer_id),
     ).fetchone()
     existing = dict(existing_row) if existing_row else None
+    customer_funding = conn.execute('SELECT funded_amount FROM customers WHERE id=?', (customer_id,)).fetchone()
+    raw_values = dict(raw_values)
+    if 'fundedAmount' not in raw_values and not existing:
+        raw_values['fundedAmount'] = customer_funding['funded_amount']
     values = batch_participation_values(raw_values, existing)
     if values["status"] not in BATCH_PARTICIPATION_STATUSES:
         raise HTTPException(422, "无效的批次参与状态。")
     timestamp = now_iso()
+    funding_changed = 'fundedAmount' in raw_values and (
+        not existing or values['funded_amount'] != float(existing['funded_amount'])
+    )
+    if funding_changed and values['funded_amount'] != float(customer_funding['funded_amount']):
+        from backend.shared_funding import manual as set_manual_funding
+        set_manual_funding(conn, customer_id, values['funded_amount'], user, now_iso, audit, source_label)
     if existing:
         changed = any(existing[key] != value for key, value in values.items())
         if changed or source_label != existing["source_label"] or source_row != existing["source_row"]:
             conn.execute(
-                """UPDATE batch_participations SET status=?, intent_amount=?, funded_amount=?, actual_amount=?, notes=?,
+                """UPDATE batch_participations SET status=?, intent_amount=?, funded_amount=?, actual_amount=?, share_quantity=?, notes=?,
                 source_label=?, source_row=?, updated_by=?, updated_by_name=?, updated_at=? WHERE id=?""",
-                (values["status"], values["intent_amount"], values["funded_amount"], values["actual_amount"], values["notes"],
+                (values["status"], values["intent_amount"], values["funded_amount"], values["actual_amount"], values["share_quantity"], values["notes"],
                  source_label[:240], source_row, user["id"], user["name"], timestamp, existing["id"]),
             )
             action = "updated"
@@ -1546,10 +1581,10 @@ def save_batch_participation(
     participation_id = str(uuid4())
     conn.execute(
         """INSERT INTO batch_participations(
-        id, batch_id, customer_id, status, intent_amount, funded_amount, actual_amount, notes, source_label, source_row,
+        id, batch_id, customer_id, status, intent_amount, funded_amount, actual_amount, share_quantity, notes, source_label, source_row,
         created_by, created_by_name, created_at, updated_by, updated_by_name, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (participation_id, batch_id, customer_id, values["status"], values["intent_amount"], values["funded_amount"], values["actual_amount"], values["notes"],
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (participation_id, batch_id, customer_id, values["status"], values["intent_amount"], values["funded_amount"], values["actual_amount"], values["share_quantity"], values["notes"],
          source_label[:240], source_row, user["id"], user["name"], timestamp, user["id"], user["name"], timestamp),
     )
     row = conn.execute("SELECT * FROM batch_participations WHERE id=?", (participation_id,)).fetchone()
@@ -2496,6 +2531,8 @@ def update_customer(customer_id: str, payload: CustomerPatch, user: dict[str, An
     }
     values = {key: value for key, value in values.items() if key in allowed}
     with db() as conn:
+        if 'funded_amount' in values:
+            conn.execute('UPDATE priority_write_lock SET version=version+1 WHERE id=1')
         current = assert_customer_access(conn, customer_id, user)
         if current["version"] != expected_version:
             raise HTTPException(409, "客户资料已被其他人更新，请刷新后重试。")
@@ -2513,6 +2550,9 @@ def update_customer(customer_id: str, payload: CustomerPatch, user: dict[str, An
         if matches:
             raise HTTPException(409, detail={"message": "手机号或邮箱与其他客户重复，请交由主管确认合并。", "matches": matches})
         if values:
+            if 'funded_amount' in values and values['funded_amount'] != current['funded_amount']:
+                from backend.shared_funding import manual as set_manual_funding
+                set_manual_funding(conn, customer_id, values['funded_amount'], user, now_iso, audit, write_customer=False)
             assignments = ", ".join(f"{key} = ?" for key in values)
             conn.execute(f"UPDATE customers SET {assignments}, updated_at = ?, version = version + 1 WHERE id = ?", (*values.values(), now_iso(), customer_id))
             if "phone" in values or "email" in values:
@@ -2536,7 +2576,12 @@ def add_followup(customer_id: str, payload: FollowupPayload, user: dict[str, Any
         raise HTTPException(422, "无效的客户阶段。")
     followup_id, created_at = str(uuid4()), now_iso()
     with db() as conn:
-        assert_customer_access(conn, customer_id, user)
+        customer = assert_customer_access(conn, customer_id, user)
+        owner_id = customer["owner_id"]
+        from backend.followup_access import can_followup, disabled_reason
+
+        if not can_followup(user, owner_id):
+            raise HTTPException(403, disabled_reason(user, owner_id))
         conn.execute(
             "INSERT INTO followups VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (followup_id, customer_id, user["id"], user["name"], payload.method, payload.content.strip(), payload.outcome.strip(), payload.nextAction.strip(), payload.nextFollowupAt or None, payload.stageAfter, created_at),
@@ -2753,7 +2798,9 @@ def list_followups(
 
 @app.get("/api/batches")
 def list_batches(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    clause, params = access_clause(user)
+    from backend.followup_access import batch_read_user
+
+    clause, params = access_clause(batch_read_user(user))
     with db() as conn:
         rows = conn.execute(
             f"""SELECT b.*,
@@ -2837,7 +2884,11 @@ def update_batch(batch_id: str, payload: BatchPatch, user: dict[str, Any] = Depe
 
 @app.get("/api/batches/{batch_id}/participations")
 def list_batch_participations(batch_id: str, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    clause, params = access_clause(user)
+    # A batch roster is shared so managers can see the whole current cohort,
+    # while writes and customer cards still follow each customer's owner.
+    from backend.followup_access import batch_read_user
+
+    clause, params = access_clause(batch_read_user(user))
     with db() as conn:
         batch = conn.execute("SELECT * FROM placement_batches WHERE id=?", (batch_id,)).fetchone()
         if not batch:
@@ -2846,6 +2897,7 @@ def list_batch_participations(batch_id: str, user: dict[str, Any] = Depends(curr
             f"""SELECT bp.id participation_id, bp.batch_id, bp.status participation_status,
             bp.intent_amount participation_intent_amount, bp.funded_amount participation_funded_amount,
             bp.actual_amount participation_actual_amount, bp.notes participation_notes,
+            bp.share_quantity participation_share_quantity,
             bp.source_label, bp.source_row, bp.created_at participation_created_at,
             bp.updated_at participation_updated_at, bp.updated_by_name,
             c.*, b.name batch_name, b.close_date batch_close_date, b.status batch_lifecycle_status
@@ -2866,6 +2918,30 @@ def list_batch_participations(batch_id: str, user: dict[str, Any] = Depends(curr
             (batch_id, *params),
         ).fetchall()
         target_customers = attach_customer_relations(conn, [dict(row) for row in target_rows])
+        original_clause, original_params = access_clause(user)
+        visible_ids = {row['id'] for row in conn.execute(
+            f"SELECT c.id FROM customers c WHERE c.archived_at IS NULL AND {original_clause}", original_params
+        ).fetchall()}
+        from backend.followup_access import can_followup, disabled_reason
+
+        def batch_row(customer):
+            readable = customer['id'] in visible_ids
+            owner_id = customer.get('owner_id')
+            metadata = dict(subjectKey='crm:' + customer['id'], batchKey=batch_id,
+                            ownerName=customer.get('owner_name') or '待分配',
+                            canOpenCard=readable, canFollowup=can_followup(user, owner_id, readable),
+                            followupDisabledReason=disabled_reason(user, owner_id, readable))
+            if not readable:
+                roster_fields = {'id', 'name', 'wechat_nickname', 'customer_code', 'tw_code', 'owner_id',
+                                 'owner_name', 'owner_team', 'batch_id', 'batch_name', 'batch_close_date',
+                                 'batch_lifecycle_status', 'target_batch_name', 'source_label', 'source_row',
+                                 'updated_by_name', 'funded_amount'}
+                customer = {key: value for key, value in customer.items()
+                            if key in roster_fields or key.startswith(('participation_', 'funding_'))}
+            return dict(customer, **metadata)
+
+        customers = [batch_row(customer) for customer in customers]
+        target_customers = [batch_row(customer) for customer in target_customers]
     return {"batch": dict(batch), "items": customers, "targetCustomers": target_customers}
 
 
@@ -2877,7 +2953,7 @@ def create_batch_participation(batch_id: str, payload: BatchParticipationPayload
             raise HTTPException(404, "批次不存在。")
         assert_customer_access(conn, payload.customerId, user)
         participation, action = save_batch_participation(
-            conn, batch_id, payload.customerId, payload.model_dump(), user, "手工录入", payload.sourceRow,
+            conn, batch_id, payload.customerId, payload.model_dump(exclude_unset=True), user, "手工录入", payload.sourceRow,
         )
         audit(conn, user, f"batch_participation.{action}", "batch_participation", participation["id"], {"batchId": batch_id, "customerId": payload.customerId, "source": "manual"})
     return {"participation": participation, "action": action}
@@ -2896,10 +2972,12 @@ def update_batch_participation(participation_id: str, payload: BatchParticipatio
         raw_values = {
             "status": values.get("status", participation["status"]),
             "intentAmount": values.get("intentAmount", participation["intent_amount"]),
-            "fundedAmount": values.get("fundedAmount", participation["funded_amount"]),
             "actualAmount": values.get("actualAmount", participation["actual_amount"]),
+            "shareQuantity": values.get("shareQuantity", participation.get("share_quantity")),
             "notes": values.get("notes", participation["notes"]),
         }
+        if 'fundedAmount' in values:
+            raw_values['fundedAmount'] = values['fundedAmount']
         saved, action = save_batch_participation(
             conn, participation["batch_id"], participation["customer_id"], raw_values, user,
             participation["source_label"], participation["source_row"],
@@ -2984,7 +3062,7 @@ HEADER_ALIASES = {
     "intentStatus": ["定增意向", "意向状态", "顾问判断"], "placementStatus": ["定增推进", "节点进度", "定增状态"], "batchName": ["定增批次", "批次名称", "批次"],
     "status": ["本批状态", "参与状态", "定增参与状态", "是否参与定增", "是否参加定增", "参与定增"],
     "intentAmount": ["意向金额", "意向定增金额", "意向额度", "意向额度(USD)"], "fundedAmount": ["到账金额", "到账金额(USD)"],
-    "actualAmount": ["实际参与金额", "实际定增", "定增金额"], "lostReason": ["流失原因", "取消原因"],
+    "actualAmount": ["实际参与金额", "实际定增", "定增金额"], "shareQuantity": ["股数", "参与股数", "定增股数", "大宗股数", "成交股数"], "lostReason": ["流失原因", "取消原因"],
     "notes": ["备注", "备注说明", "情况说明", "最新跟进"],
 }
 
@@ -4428,7 +4506,7 @@ def placement_workflow_desired_fields(
         return {
             "stage": "已参与定增", "capital_destination": "参与定增", "intent_status": "已锁定",
             "placement_status": "已参与", "intent_amount": float(totals["intent_amount"]),
-            "funded_amount": float(totals["funded_amount"]), "actual_amount": float(totals["actual_amount"]),
+            "actual_amount": float(totals["actual_amount"]),
             "lost_reason": "",
         }
     if profile == "placement_lost":
@@ -5153,21 +5231,21 @@ def rollback_placement_workflow_job(
             if current:
                 conn.execute("DELETE FROM batch_participations WHERE id=?", (current["id"],))
             continue
-        fields = ("status", "intent_amount", "funded_amount", "actual_amount", "notes", "source_label", "source_row")
+        fields = ("status", "intent_amount", "funded_amount", "actual_amount", "share_quantity", "notes", "source_label", "source_row")
         if current:
             conn.execute(
-                """UPDATE batch_participations SET status=?, intent_amount=?, funded_amount=?, actual_amount=?, notes=?,
+                """UPDATE batch_participations SET status=?, intent_amount=?, funded_amount=?, actual_amount=?, share_quantity=?, notes=?,
                 source_label=?, source_row=?, updated_by=?, updated_by_name=?, updated_at=? WHERE id=?""",
                 (*(before.get(field) for field in fields), user["id"], user["name"], timestamp, current["id"]),
             )
         else:
             conn.execute(
                 """INSERT INTO batch_participations(
-                id, batch_id, customer_id, status, intent_amount, funded_amount, actual_amount, notes, source_label, source_row,
+                id, batch_id, customer_id, status, intent_amount, funded_amount, actual_amount, share_quantity, notes, source_label, source_row,
                 created_by, created_by_name, created_at, updated_by, updated_by_name, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (before["id"], before["batch_id"], before["customer_id"], before["status"], before["intent_amount"],
-                 before["funded_amount"], before["actual_amount"], before["notes"], before["source_label"], before["source_row"],
+                 before["funded_amount"], before["actual_amount"], before.get("share_quantity"), before["notes"], before["source_label"], before["source_row"],
                  before["created_by"], before["created_by_name"], before["created_at"], user["id"], user["name"], timestamp),
             )
     conn.execute("UPDATE import_jobs SET rolled_back_at=?, rolled_back_by=? WHERE id=?", (timestamp, user["id"], job_id))
@@ -5323,7 +5401,7 @@ def update_permissions(user_id: str, payload: PermissionPayload, user: dict[str,
         existing = conn.execute(
             """SELECT can_import_customers, can_export_all, can_manage_customer_fields,
             scope_override, can_manage_assignments, can_manage_advisor_bindings,
-            can_manage_crm_permissions FROM user_permissions WHERE user_id = ?""",
+            can_manage_crm_permissions, can_monitor_followups FROM user_permissions WHERE user_id = ?""",
             (user_id,),
         ).fetchone()
         import_value = int(payload.canImportCustomers) if payload.canImportCustomers is not None else (existing["can_import_customers"] if existing else None)
@@ -5332,6 +5410,7 @@ def update_permissions(user_id: str, payload: PermissionPayload, user: dict[str,
         assignment_value = int(payload.canManageAssignments) if payload.canManageAssignments is not None else (existing["can_manage_assignments"] if existing else None)
         binding_value = int(payload.canManageAdvisorBindings) if payload.canManageAdvisorBindings is not None else (existing["can_manage_advisor_bindings"] if existing else None)
         permission_value = int(payload.canManageCrmPermissions) if payload.canManageCrmPermissions is not None else (existing["can_manage_crm_permissions"] if existing else None)
+        monitor_value = int(payload.canMonitorFollowups) if payload.canMonitorFollowups is not None else (existing["can_monitor_followups"] if existing else None)
         scope_value = (
             None if payload.crmScopeMode == "inherit"
             else payload.crmScopeMode if payload.crmScopeMode is not None
@@ -5341,8 +5420,8 @@ def update_permissions(user_id: str, payload: PermissionPayload, user: dict[str,
             """INSERT INTO user_permissions(
             user_id, can_import_customers, can_export_all, can_manage_customer_fields,
             scope_override, can_manage_assignments, can_manage_advisor_bindings,
-            can_manage_crm_permissions, updated_by, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            can_manage_crm_permissions, can_monitor_followups, updated_by, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
             can_import_customers=excluded.can_import_customers,
             can_export_all=excluded.can_export_all,
@@ -5351,8 +5430,9 @@ def update_permissions(user_id: str, payload: PermissionPayload, user: dict[str,
             can_manage_assignments=excluded.can_manage_assignments,
             can_manage_advisor_bindings=excluded.can_manage_advisor_bindings,
             can_manage_crm_permissions=excluded.can_manage_crm_permissions,
+            can_monitor_followups=excluded.can_monitor_followups,
             updated_by=excluded.updated_by, updated_at=excluded.updated_at""",
-            (user_id, import_value, export_value, fields_value, scope_value, assignment_value, binding_value, permission_value, user["id"], now_iso()),
+            (user_id, import_value, export_value, fields_value, scope_value, assignment_value, binding_value, permission_value, monitor_value, user["id"], now_iso()),
         )
         audit(conn, user, "permission.updated", "user", user_id, {
             "crmScopeMode": payload.crmScopeMode,
@@ -5362,6 +5442,7 @@ def update_permissions(user_id: str, payload: PermissionPayload, user: dict[str,
             "canManageAssignments": payload.canManageAssignments,
             "canManageAdvisorBindings": payload.canManageAdvisorBindings,
             "canManageCrmPermissions": payload.canManageCrmPermissions,
+            "canMonitorFollowups": payload.canMonitorFollowups,
         })
     return {"user": enrich_user(target)}
 

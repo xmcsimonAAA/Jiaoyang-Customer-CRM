@@ -23,12 +23,16 @@ from backend.priority_import import FIELDS, iso, normalized, number, parse, sum_
 
 from backend.priority_identity import reconcile, excluded_codes
 from backend import shared_ownership
+from backend import shared_funding
+from backend.priority_batches import SCHEMA as PRODUCT_BATCH_SCHEMA, install as install_product_batches, rollup_activity
 from backend.workspace import SCHEMA as WORKSPACE_SCHEMA, install as install_workspace
 
 SCHEMA = [
     *WORKSPACE_SCHEMA,
     shared_ownership.SCHEMA,
+    shared_funding.SCHEMA,
     BINDING_SCHEMA,
+    *PRODUCT_BATCH_SCHEMA,
     "CREATE TABLE IF NOT EXISTS priority_write_lock (id INTEGER PRIMARY KEY, version INTEGER NOT NULL)",
     "INSERT INTO priority_write_lock VALUES (1,0) ON CONFLICT(id) DO NOTHING",
     """CREATE TABLE IF NOT EXISTS priority_datasets (
@@ -230,6 +234,7 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
         conn.execute('UPDATE priority_write_lock SET version=version+1 WHERE id=1')
         sync_customers(conn, heads(conn), {'id':'system-shared-registry','name':'共用客户主档迁移',
                       'customerScope':'all','canManageAssignments':True,'canManageAdvisorBindings':True})
+        shared_funding.sync(conn, heads(conn), {'id':'system-shared-registry','name':'共用资金资料迁移'}, now_iso, audit)
 
     def shared_registry(conn, datasets):
         from backend.shared_customers import identities, archived_codes
@@ -362,6 +367,8 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                     date=dataset.get('date') or dataset.get('business_date'), records=len(rows),
                     participants=len(participating), agreementUsd=sum_values(r['agreementAmountUsd'] for r in participating),
                     assetUsd=sum_values(r.get('assetUsd') for r in rows), quantity=sum_values(r.get('quantity') for r in rows),
+                    secondaryQuantity=sum_values(r.get('secondaryQuantity') for r in rows),
+                    blockQuantity=sum_values(r.get('blockQuantity') for r in rows),
                     automaticIdentity=dataset.get('automaticIdentity', False),
                     pending=sum(1 for r in rows if dataset['kind'] == 'icc' and not r.get('twCode')),
                     iccAccountFilter=dataset.get('iccAccountFilter'),
@@ -569,6 +576,7 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                     conn.execute('INSERT INTO priority_revisions VALUES (?,?,?,?,?,?,?,?,?)', (rev, key, d['parent'], job_id, dumps(d['rows']), d['filename'], d['fingerprint'], now_iso(), user['id']))
                     conn.execute('UPDATE priority_datasets SET head_id=? WHERE dataset_key=?', (rev, key))
                 shared_result = sync_customers(conn, heads(conn), user)
+                shared_funding.sync(conn, heads(conn), user, now_iso, audit)
                 sync_owners(conn, user)
                 conn.execute("UPDATE priority_uploads SET status='committed' WHERE id=?", (job_id,))
                 audit(conn, user, 'priority.import', 'priority_upload', job_id, {'datasets': [summary(d) for d in payload['datasets']], 'identityReconciliation':payload.get('identityReconciliation'), 'identitySelections':[s.model_dump() for s in chosen]})
@@ -622,6 +630,7 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
             for r in revisions:
                 conn.execute('UPDATE priority_datasets SET head_id=? WHERE dataset_key=?', (r['parent_id'], r['dataset_key']))
             conn.execute("UPDATE priority_uploads SET status='rolled_back' WHERE id=?", (job_id,))
+            shared_funding.sync(conn, heads(conn), user, now_iso, audit, rollback=True)
             sync_owners(conn, user)
             audit(conn, user, 'priority.rollback', 'priority_upload', job_id, {})
         return {'status': 'rolled_back'}
@@ -647,7 +656,11 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                 latest = max(sources, key=lambda d: d['business_date']) if sources else None
                 rows_by_kind[kind] = {r['twCode']: r for r in latest['rows']} if latest else {}
                 date_by_kind[kind] = latest['business_date'] if latest else None
-            activity = [dict(r, datasetKey=k, revision=d['head_id']) for k, d in all_heads.items() if d['kind'] == 'icc' for r in d['rows']]
+            # Weekly ICC activities remain the source of truth.  Once an operator
+            # groups several activities into a real participation batch, collapse
+            # matched TW rows there using the latest activity amount; unresolved
+            # rows keep their activity/record anchor and are never merged by name.
+            activity = rollup_activity(conn, all_heads)['rows']
             customers = {}
             for code in set(identities) | set(rows_by_kind['assets']) | set(rows_by_kind['secondary']) | {r['twCode'] for r in activity if r.get('twCode')}:
                 identity = identities.get(code, {})
@@ -656,7 +669,8 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                 participating = [r for r in own if r.get('agreementAmountUsd') and Decimal(r['agreementAmountUsd']) > 0]
                 customers[code] = dict(twCode=code, customerName=identity.get('customerName') or (own[-1].get('canonicalName') or own[-1]['customerName'] if own else '') or (a or q or {}).get('customerName', ''),
                     brokerAccountStatus=identity.get('brokerAccountStatus', ''), assetUsd=a.get('assetUsd') if a else None,
-                    quantity=q.get('quantity') if q else None, secondaryPresent=q is not None,
+                    quantity=q.get('quantity') if q else None, secondaryQuantity=q.get('secondaryQuantity') if q else None,
+                    blockQuantity=q.get('blockQuantity') if q else None, holdingTypes=q.get('holdingTypes', []) if q else [], secondaryPresent=q is not None,
                     isSecondary=q is not None and Decimal(q['quantity']) > 0,
                     agreementUsd=sum_values(r['agreementAmountUsd'] for r in participating),
                     batchDates=[r['batchDate'] for r in participating],
@@ -676,6 +690,8 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                                      assetsUsd=sum_values(r['assetUsd'] for r in customers.values()) if date_by_kind['assets'] else None,
                                      secondaryParticipants=sum(1 for r in customers.values() if r['isSecondary']),
                                      quantity=sum_values(r['quantity'] for r in customers.values()) if date_by_kind['secondary'] else None,
+                                     secondaryQuantity=sum_values(r['secondaryQuantity'] for r in customers.values() if r.get('secondaryQuantity') is not None) if date_by_kind['secondary'] else None,
+                                     blockQuantity=sum_values(r['blockQuantity'] for r in customers.values() if r.get('blockQuantity') is not None) if date_by_kind['secondary'] else None,
                                      pending=sum(1 for r in activity if not r.get('twCode'))))
 
     @app.get('/api/priority-inferior/tasks')
@@ -843,4 +859,5 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
             r['rows'] = json.loads(r.pop('rows_json'))
             return r
 
-    install_workspace(app, db, current_user, access_clause, audit, now_iso, scope_rows, heads)
+    install_workspace(app, db, current_user, access_clause, audit, now_iso, scope_rows, heads, platform_users)
+    install_product_batches(app, db, current_user, now_iso, audit, heads, scoped, require_edit)
