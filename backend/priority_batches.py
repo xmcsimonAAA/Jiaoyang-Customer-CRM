@@ -197,6 +197,8 @@ def install(app: Any, db: Callable, current_user: Callable, now_iso: Callable,
 
     def normalize_dates(conn: Any, values: list[str]) -> list[str]:
         dates = [_clean_date(value, "活动日期") for value in values if str(value or "").strip()]
+        if not dates:
+            raise HTTPException(422, "参与批次至少要导入一个完整的 ICC 活动批次；客户不能单独添加或移除。")
         if len(dates) != len(set(dates)):
             raise HTTPException(422, "活动日期不能重复。")
         missing = [value for value in dates if value not in existing_activity_dates(conn)]

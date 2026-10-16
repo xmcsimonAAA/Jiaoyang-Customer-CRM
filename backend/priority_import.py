@@ -62,6 +62,91 @@ def sum_values(values):
     return format(sum((Decimal(v) for v in values if v is not None), Decimal(0)), 'f')
 
 
+def summary_number(value):
+    """Read optional dashboard cells without making notes such as '/' numeric."""
+    value = text(value).replace(',', '').replace('$', '')
+    if not value or value in {'/', '-'}:
+        return None
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation:
+        return None
+    return format(parsed, 'f') if parsed.is_finite() else None
+
+
+def asset_summary(workbook, sheet):
+    """Capture the optional F:I management summary beside the A:C roster."""
+    cells = {}
+    for index, values in workbook.rows(sheet, {'F', 'G', 'H', 'I'}, limit=120):
+        label = text(values.get('F'))
+        if label:
+            cells.setdefault(normalized(label), []).append(dict(row=index, label=label, value=values.get('G'), share=values.get('H'), note=values.get('I')))
+
+    def cell(label, first=0, last=120):
+        return next((value for value in cells.get(normalized(label), []) if first <= value['row'] <= last), {})
+
+    def item(label, count_label=None):
+        row = cell(label)
+        result = dict(label=label, count=summary_number(row.get('value')), share=summary_number(row.get('share')))
+        if count_label:
+            result['countLabel'] = count_label
+        return result
+
+    buckets = [item(label) for label in ('10万美金以上', '5-10万美金', '1-5万美金', '1500美金-1万美金', '1500美金以下', '无入金或已出金')]
+    buckets = [row for row in buckets if row['count'] is not None]
+    def pair(count_label, amount_label, first=0, last=120):
+        count_row = cell(count_label, first, last)
+        amount = summary_number(count_row.get('share'))
+        if amount is None:
+            amount = summary_number(count_row.get('note'))
+        if amount is None:
+            amount = summary_number(cell(amount_label, first, last).get('value'))
+        return dict(count=summary_number(count_row.get('value')), amount=amount)
+
+    def note_number(label, pattern, first=0, last=120):
+        match = re.search(pattern, text(cell(label, first, last).get('note')))
+        return summary_number(match.group(1)) if match else None
+
+    return dict(
+        assetBuckets=buckets,
+        fundedAccounts=summary_number(cell('入金账户').get('value')),
+        activationRate=summary_number(cell('入金激活率').get('value')),
+        historicalPlacementUsd=summary_number(cell('历史已定增金额').get('value')),
+        liveAccountAumUsd=summary_number(cell('实时账户总资产(USD)').get('value')),
+        liveTotalAumUsd=summary_number(cell('实时总资产金额(USD)').get('value')),
+        registration=dict(
+            total=summary_number(cell('总注册开户数').get('value')),
+            opened=summary_number(cell('开户成功数').get('value')),
+            rate=summary_number(cell('开户成功率').get('value')),
+        ),
+        onsite=dict(
+            signed=pair('签约总人数/金额', '签约总人数/金额', 27, 32),
+            converted=pair('转化总人数/金额', '转化总人数/金额', 27, 32),
+            dropped=pair('已放弃或转二级人数/金额', '已放弃或转二级人数/金额', 27, 32),
+            pending=pair('待转化人数/金额', '待转化人数/金额', 27, 32),
+        ),
+        singleSign=dict(
+            consulted=summary_number(cell('单签咨询人数', 33, 39).get('value')),
+            converted=pair('转化总人数/金额', '转化总人数/金额', 33, 39),
+            pending=dict(count=summary_number(cell('待转化人数', 33, 39).get('value')), amount=None),
+        ),
+        xmax=dict(
+            holders=summary_number(cell('持仓人数', 40, 45).get('value')),
+            holderShare=summary_number(cell('持仓人数占比', 40, 45).get('value')),
+            quantity=summary_number(cell('持仓股数', 40, 45).get('value')),
+            marketValue=summary_number(cell('持仓市值：$8.74/股', 40, 45).get('value')),
+            blockHolders=note_number('持仓人数', r'大宗\s*(\d+)\s*人', 40, 45),
+            blockQuantity=note_number('持仓股数', r'大宗[^\d]*(\d+)[^\d]*股', 40, 45),
+            price='8.74',
+        ),
+        promisePlan=dict(
+            signed=pair('意向签约人数', '意向签约人数', 46, 50),
+            converted=pair('转化总人数/金额', '转化总人数/金额', 46, 50),
+            pending=dict(count=summary_number(cell('待转化人数', 46, 50).get('value')), amount=summary_number(cell('待转化人数', 46, 50).get('share'))),
+        ),
+    )
+
+
 def tw(value):
     result = text(value).upper()
     if not re.fullmatch(r'TW\d+', result):
@@ -266,4 +351,5 @@ def _parse(workbook, filename, as_of, batch_dates):
                 raise HTTPException(422, f'{label}持仓明细股数与表尾合计不一致，请核对来源文件。')
     if not records:
         raise HTTPException(422, f'{filename} 没有可导入记录。')
-    return [dict(kind=kind, date=as_of, rows=records, sheet=sheet[0])]
+    return [dict(kind=kind, date=as_of, rows=records, sheet=sheet[0],
+                 summary=asset_summary(workbook, sheet) if kind == 'assets' else {})]

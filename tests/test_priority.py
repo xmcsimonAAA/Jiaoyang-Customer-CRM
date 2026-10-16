@@ -275,6 +275,22 @@ def test_shared_dashboard_history_uses_uploaded_snapshots_without_estimating_mis
     assert latest['holdingMarketValue'] is None
 
 
+def test_shareholder_report_rolls_up_asset_structure_and_keeps_missing_market_value_explicit(client):
+    publish(client, [master(), assets(), icc()])
+    result = client.get('/api/workspace/dashboard/report')
+    assert result.status_code == 200, result.text
+    body = result.json()
+    assert body['asOf'] == '2026-09-11'
+    assert body['kpis']['customers'] == 2
+    assert body['kpis']['opened'] == 1
+    assert body['kpis']['accountSuccessRate'] == 50.0
+    assert body['assets']['accounts'] == 2
+    assert body['assets']['totalUsd'] == 26.37
+    assert body['assets']['fundedAccounts'] == 2
+    assert body['holdings']['marketValue'] is None
+    assert body['priority']['participants'] == 1
+
+
 def test_permissions_on_totals_rows_history_raw_and_mutations(client):
     p=publish(client,[master(),icc(owner='演示顾问'),assets()])
     client.test_user.update(id='demo-manager-2',name='演示顾问二',team='演示一组',customerScope='self',canImportCustomers=False,canManageAdvisorBindings=False)
@@ -1217,6 +1233,34 @@ def test_priority_product_batch_roster_exposes_read_and_followup_flags(client):
     assert card['funded_amount'] == 26.37
     assert card['crm'][0]['version'] >= 1
     assert workspace_note(client, key='tw:TW202609039', batchKey=batch_id).status_code == 404
+
+
+def test_priority_product_batch_requires_whole_activity_batches(client):
+    publish(client, [master(), icc()])
+    empty = client.post('/api/priority-inferior/product-batches', json={
+        'name': '不能空导入', 'participationDate': '2026-09-20', 'activityDates': [],
+    })
+    assert empty.status_code == 422
+    assert '完整的 ICC 活动批次' in empty.json()['detail']
+
+    created = client.post('/api/priority-inferior/product-batches', json={
+        'name': '完整活动批次', 'participationDate': '2026-09-20',
+        'activityDates': ['2026-09-09'],
+    })
+    assert created.status_code == 201, created.text
+    batch_id = created.json()['id']
+    cleared = client.patch('/api/priority-inferior/product-batches/' + batch_id, json={'activityDates': []})
+    assert cleared.status_code == 422
+    detail = client.get('/api/priority-inferior/product-batches/' + batch_id).json()
+    assert detail['activityDates'] == ['2026-09-09']
+
+
+def test_workspace_directory_exposes_pinyin_search_fields(client):
+    publish(client, [master()])
+    items = client.get('/api/workspace/customers').json()['items']
+    customer = next(item for item in items if item['name'] == '董方')
+    assert customer['namePinyin'] == 'DONG FANG'
+    assert customer['namePinyinInitials'] == 'DF'
 
 
 def test_manager_full_scope_and_collaborator_cannot_write_non_owned_followups(client):

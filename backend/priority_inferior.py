@@ -102,10 +102,21 @@ def digest(value):
 
 def heads(conn):
     result = {}
-    for row in conn.execute('''SELECT d.*,r.rows_json,r.filename,r.created_at FROM priority_datasets d
-                              LEFT JOIN priority_revisions r ON r.id=d.head_id''').fetchall():
+    for row in conn.execute('''SELECT d.*,r.rows_json,r.filename,r.created_at,r.job_id,u.payload_json,u.summary_json
+                              FROM priority_datasets d
+                              LEFT JOIN priority_revisions r ON r.id=d.head_id
+                              LEFT JOIN priority_uploads u ON u.id=r.job_id''').fetchall():
         r = dict(row)
         r['rows'] = json.loads(r.pop('rows_json') or '[]')
+        payload = json.loads(r.pop('payload_json') or '{}') if r.get('payload_json') else {}
+        stored_summaries = json.loads(r.pop('summary_json') or '[]') if r.get('summary_json') else []
+        r.pop('job_id', None)
+        stored = next((item for item in stored_summaries
+                       if item.get('key') == r.get('dataset_key')), {})
+        r['summary'] = payload.get('summary') or stored.get('sourceSummary') or {}
+        if not r['summary']:
+            r['summary'] = next((item.get('summary', {}) for item in payload.get('datasets', [])
+                                 if item.get('key') == r.get('dataset_key')), {})
         result[r['dataset_key']] = r
     return result
 
@@ -372,6 +383,7 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                     automaticIdentity=dataset.get('automaticIdentity', False),
                     pending=sum(1 for r in rows if dataset['kind'] == 'icc' and not r.get('twCode')),
                     iccAccountFilter=dataset.get('iccAccountFilter'),
+                    sourceSummary=dataset.get('summary') or {},
                     missingCount=dataset.get('missingCount', 0), duplicate=dataset.get('duplicate', False),
                     changes=dataset.get('changes', []))
 
@@ -840,7 +852,7 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
             r['manualCorrection'] = {'reason': payload.reason, 'by': user['name'], 'at': now_iso(), 'fields': correction_fields}
             rev, job = str(uuid4()), str(uuid4())
             conn.execute('INSERT INTO priority_uploads VALUES (?,?,?,?,?,?,?)',
-                         (job, 'committed', '{}', '[]', dumps([{'label': '人工修订', 'date': batch_date, 'records': 1, 'changes': []}]), now_iso(), user['id']))
+                         (job, 'committed', dumps({'summary': d.get('summary', {})}), '[]', dumps([{'label': '人工修订', 'date': batch_date, 'records': 1, 'changes': []}]), now_iso(), user['id']))
             conn.execute('INSERT INTO priority_revisions VALUES (?,?,?,?,?,?,?,?,?)',
                          (rev, key, d['head_id'], job, dumps(rows), d['filename'], 'manual:' + rev, now_iso(), user['id']))
             conn.execute('UPDATE priority_datasets SET head_id=? WHERE dataset_key=?', (rev, key))
