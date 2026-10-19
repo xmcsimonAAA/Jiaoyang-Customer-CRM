@@ -697,3 +697,25 @@ body { background: #dff08a; padding: 30px; }
 .follow-customer-use { flex: 0 0 auto; margin-left: 10px; color: #6c7f29; font-size: 10px; font-weight: 700; }
 .follow-customer-empty { padding: 14px 10px; border: 1px dashed #dcdcdf; border-radius: 9px; color: #85848b; background: #fafafa; font-size: 10px; text-align: center; }
 @media (max-width:480px) { .follow-search-row { grid-template-columns: 1fr; }.follow-search-row .secondary-btn { width: 100%; }.follow-customer-results { max-height: 190px; } }
+
+/* Keep the permissions matrix readable without letting identity columns consume the sheet. */
+.permission-table { min-width: 1088px; table-layout: fixed; }
+.permission-table th,
+.permission-table td { padding: 8px 7px; }
+.permission-table th { white-space: normal; line-height: 1.25; vertical-align: middle; }
+.permission-table td { min-width: 0; max-width: none; }
+.permission-table th:nth-child(1),
+.permission-table td:nth-child(1) { width: 130px; min-width: 130px; }
+.permission-table th:nth-child(2),
+.permission-table td:nth-child(2) { width: 135px; min-width: 135px; }
+.permission-table th:nth-child(3),
+.permission-table td:nth-child(3) { width: 126px; min-width: 126px; }
+.permission-table th:nth-child(n+4),
+.permission-table td:nth-child(n+4) { width: 87px; min-width: 87px; }
+.permission-table td:first-child > strong,
+.permission-table td:first-child > .hint,
+.permission-table td:nth-child(2) .tag,
+.permission-table td:nth-child(2) .hint { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.permission-table select { width: 100%; min-width: 0; padding: 5px 6px; font-size: 10px; }
+.permission-table .switch { gap: 5px; font-size: 10px; }
+.permission-table .switch input { width: 15px; height: 15px; }
