@@ -269,13 +269,17 @@ def install(app, db, current_user, access_clause, audit, now_iso, priority_scope
 
     @app.get('/api/workspace/dashboard/report')
     def dashboard_report(as_of: str = '', user=Depends(current_user)):
-        require_shareholder_report_permission(user)
         """Return the shareholder-report metrics from uploaded source snapshots.
 
         The report deliberately keeps source coverage visible.  It can combine
         snapshots from different dates, but every metric carries the source date
         and missing financial fields remain null instead of being inferred.
         """
+        report_permission = user.get('canViewShareholderReport')
+        if report_permission is None:
+            report_permission = user.get('rolePermission') in {'manager', 'supervisor', 'admin', 'developer'}
+        if not report_permission:
+            raise HTTPException(403, '您的账号未开通股东报告查看权限。')
         def decimal(value):
             try:
                 return Decimal(str(value or 0))

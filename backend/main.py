@@ -5415,7 +5415,8 @@ def update_permissions(user_id: str, payload: PermissionPayload, user: dict[str,
         existing = conn.execute(
             """SELECT can_import_customers, can_export_all, can_manage_customer_fields,
             scope_override, can_manage_assignments, can_manage_advisor_bindings,
-            can_manage_crm_permissions, can_monitor_followups FROM user_permissions WHERE user_id = ?""",
+            can_manage_crm_permissions, can_monitor_followups, can_view_shareholder_report
+            FROM user_permissions WHERE user_id = ?""",
             (user_id,),
         ).fetchone()
         import_value = int(payload.canImportCustomers) if payload.canImportCustomers is not None else (existing["can_import_customers"] if existing else None)

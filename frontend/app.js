@@ -72,7 +72,7 @@ async function api(path, options = {}) {
     throw new Error("无法连接客户系统服务，请确认本机服务正在运行后重试。");
   }
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) { const fallback = response.status >= 500 ? "服务器处理本次导入时发生异常。文件预览已通过，请勿重复导入，并联系管理员查看服务日志。" : "操作失败，请稍后重试。"; const message = typeof data.detail === "string" ? data.detail : data.detail?.message || fallback; throw Object.assign(new Error(message), {status: response.status, data}); }
+  if (!response.ok) { const fallback = response.status >= 500 ? "服务器处理请求时发生异常，请联系管理员查看服务日志。" : "操作失败，请稍后重试。"; const message = typeof data.detail === "string" ? data.detail : data.detail?.message || fallback; throw Object.assign(new Error(message), {status: response.status, data}); }
   return data;
 }
 
@@ -136,6 +136,7 @@ async function navigate(view, options = {}) {
   if (view === "bindings" && !state.user.canManageAdvisorBindings) view = "dashboard";
   if (["permissions", "audit"].includes(view) && !state.user.canManageCrmPermissions) view = "dashboard";
   if (view === "fields" && !state.user.canManageCustomerFields) view = "dashboard";
+  if (view === "shareholder-report" && !state.user.canViewShareholderReport) view = "dashboard";
   if (view === "reviews" && !state.user.canImportCustomers && !state.user.canManageCrmPermissions) view = "dashboard";
   saveWorkspaceState();
   const previousView = state.view;
