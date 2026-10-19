@@ -269,6 +269,7 @@ def install(app, db, current_user, access_clause, audit, now_iso, priority_scope
 
     @app.get('/api/workspace/dashboard/report')
     def dashboard_report(as_of: str = '', user=Depends(current_user)):
+        require_shareholder_report_permission(user)
         """Return the shareholder-report metrics from uploaded source snapshots.
 
         The report deliberately keeps source coverage visible.  It can combine

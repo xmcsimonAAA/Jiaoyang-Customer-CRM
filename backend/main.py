@@ -163,6 +163,7 @@ def init_sqlite_db() -> None:
                 can_manage_advisor_bindings INTEGER,
                 can_manage_crm_permissions INTEGER,
                 can_monitor_followups INTEGER,
+                can_view_shareholder_report INTEGER,
                 updated_by TEXT,
                 updated_at TEXT NOT NULL
             );
@@ -398,6 +399,7 @@ def init_sqlite_db() -> None:
             "can_manage_advisor_bindings": "INTEGER",
             "can_manage_crm_permissions": "INTEGER",
             "can_monitor_followups": "INTEGER",
+            "can_view_shareholder_report": "INTEGER",
         }.items():
             if column not in permission_columns:
                 conn.execute(f"ALTER TABLE user_permissions ADD COLUMN {column} {definition}")
@@ -636,6 +638,7 @@ class PermissionPayload(BaseModel):
     canManageAdvisorBindings: bool | None = None
     canManageCrmPermissions: bool | None = None
     canMonitorFollowups: bool | None = None
+    canViewShareholderReport: bool | None = None
 
 
 class CustomerFieldPayload(BaseModel):
@@ -927,6 +930,10 @@ def default_crm_permission_management(user: dict[str, Any]) -> bool:
     return user["rolePermission"] in {"admin", "developer"}
 
 
+def default_shareholder_report_permission(user: dict[str, Any]) -> bool:
+    return user["rolePermission"] in {"manager", "supervisor", "admin", "developer"}
+
+
 def stored_permission(row: Any | None, column: str, default: bool) -> bool:
     return bool(row[column]) if row and row[column] is not None else default
 
@@ -936,7 +943,8 @@ def enrich_user(user: dict[str, Any]) -> dict[str, Any]:
         row = conn.execute(
             """SELECT can_import_customers, can_export_all, can_manage_customer_fields,
             scope_override, can_manage_assignments, can_manage_advisor_bindings,
-            can_manage_crm_permissions, can_monitor_followups FROM user_permissions WHERE user_id = ?""",
+            can_manage_crm_permissions, can_monitor_followups, can_view_shareholder_report
+            FROM user_permissions WHERE user_id = ?""",
             (user["id"],),
         ).fetchone()
     result = dict(user)
@@ -950,6 +958,7 @@ def enrich_user(user: dict[str, Any]) -> dict[str, Any]:
     result["canManageAdvisorBindings"] = stored_permission(row, "can_manage_advisor_bindings", default_advisor_binding_permission(user))
     result["canManageCrmPermissions"] = stored_permission(row, "can_manage_crm_permissions", default_crm_permission_management(user))
     result["canMonitorFollowups"] = stored_permission(row, "can_monitor_followups", user["rolePermission"] in {"admin", "developer"})
+    result["canViewShareholderReport"] = stored_permission(row, "can_view_shareholder_report", default_shareholder_report_permission(user))
     return result
 
 
@@ -984,6 +993,11 @@ def require_advisor_binding_manager(user: dict[str, Any]) -> None:
 def require_crm_permission_manager(user: dict[str, Any]) -> None:
     if not user["canManageCrmPermissions"]:
         raise HTTPException(403, "您的账号未开通 CRM 权限管理权限。")
+
+
+def require_shareholder_report_permission(user: dict[str, Any]) -> None:
+    if not user["canViewShareholderReport"]:
+        raise HTTPException(403, "您的账号未开通股东报告查看权限。")
 
 
 def require_hongan_advisor_permission(user: dict[str, Any], value: Any) -> None:
@@ -5411,6 +5425,7 @@ def update_permissions(user_id: str, payload: PermissionPayload, user: dict[str,
         binding_value = int(payload.canManageAdvisorBindings) if payload.canManageAdvisorBindings is not None else (existing["can_manage_advisor_bindings"] if existing else None)
         permission_value = int(payload.canManageCrmPermissions) if payload.canManageCrmPermissions is not None else (existing["can_manage_crm_permissions"] if existing else None)
         monitor_value = int(payload.canMonitorFollowups) if payload.canMonitorFollowups is not None else (existing["can_monitor_followups"] if existing else None)
+        shareholder_value = int(payload.canViewShareholderReport) if payload.canViewShareholderReport is not None else (existing["can_view_shareholder_report"] if existing else None)
         scope_value = (
             None if payload.crmScopeMode == "inherit"
             else payload.crmScopeMode if payload.crmScopeMode is not None
@@ -5420,8 +5435,9 @@ def update_permissions(user_id: str, payload: PermissionPayload, user: dict[str,
             """INSERT INTO user_permissions(
             user_id, can_import_customers, can_export_all, can_manage_customer_fields,
             scope_override, can_manage_assignments, can_manage_advisor_bindings,
-            can_manage_crm_permissions, can_monitor_followups, updated_by, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            can_manage_crm_permissions, can_monitor_followups, can_view_shareholder_report,
+            updated_by, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
             can_import_customers=excluded.can_import_customers,
             can_export_all=excluded.can_export_all,
@@ -5431,8 +5447,9 @@ def update_permissions(user_id: str, payload: PermissionPayload, user: dict[str,
             can_manage_advisor_bindings=excluded.can_manage_advisor_bindings,
             can_manage_crm_permissions=excluded.can_manage_crm_permissions,
             can_monitor_followups=excluded.can_monitor_followups,
+            can_view_shareholder_report=excluded.can_view_shareholder_report,
             updated_by=excluded.updated_by, updated_at=excluded.updated_at""",
-            (user_id, import_value, export_value, fields_value, scope_value, assignment_value, binding_value, permission_value, monitor_value, user["id"], now_iso()),
+            (user_id, import_value, export_value, fields_value, scope_value, assignment_value, binding_value, permission_value, monitor_value, shareholder_value, user["id"], now_iso()),
         )
         audit(conn, user, "permission.updated", "user", user_id, {
             "crmScopeMode": payload.crmScopeMode,
@@ -5443,6 +5460,7 @@ def update_permissions(user_id: str, payload: PermissionPayload, user: dict[str,
             "canManageAdvisorBindings": payload.canManageAdvisorBindings,
             "canManageCrmPermissions": payload.canManageCrmPermissions,
             "canMonitorFollowups": payload.canMonitorFollowups,
+            "canViewShareholderReport": payload.canViewShareholderReport,
         })
     return {"user": enrich_user(target)}
 

@@ -35,6 +35,7 @@ POSTGRES_SCHEMA_STATEMENTS = [
         can_manage_advisor_bindings INTEGER,
         can_manage_crm_permissions INTEGER,
         can_monitor_followups INTEGER,
+        can_view_shareholder_report INTEGER,
         updated_by TEXT,
         updated_at TEXT NOT NULL
     )
@@ -44,6 +45,7 @@ POSTGRES_SCHEMA_STATEMENTS = [
     "ALTER TABLE user_permissions ADD COLUMN IF NOT EXISTS can_manage_advisor_bindings INTEGER",
     "ALTER TABLE user_permissions ADD COLUMN IF NOT EXISTS can_manage_crm_permissions INTEGER",
     "ALTER TABLE user_permissions ADD COLUMN IF NOT EXISTS can_monitor_followups INTEGER",
+    "ALTER TABLE user_permissions ADD COLUMN IF NOT EXISTS can_view_shareholder_report INTEGER",
     """
     CREATE TABLE IF NOT EXISTS counters (
         counter_key TEXT PRIMARY KEY,
