@@ -22,6 +22,27 @@ FIELDS = ['sourceSequence', 'customerName', 'brokerAccountStatus', 'depositAmoun
 HEADERS = ['序号', '客户姓名', '是否开券商户', '入金金额', '骄阳现场开户人',
            '保险经纪人', '中阳见证人', '客户类型', '签署优先劣后协议',
            '优先劣后金额', '骄阳负责人', '备注说明']
+BLOCK_AMOUNT_FIELD = 'blockAgreementAmountUsd'
+BLOCK_AMOUNT_HEADER = '大宗交易金额'
+ICC_HEADER_FIELDS = {
+    '序号': 'sourceSequence',
+    '客户姓名': 'customerName',
+    '是否开券商户': 'brokerAccountStatus',
+    '是否完成开户': 'brokerAccountStatus',
+    '券商开户状态': 'brokerAccountStatus',
+    '入金金额': 'depositAmount',
+    '骄阳现场开户人': 'onSiteOpener',
+    '保险经纪人': 'insuranceBroker',
+    '中阳见证人': 'zhongyangWitness',
+    '客户类型': 'customerType',
+    '签署优先劣后协议': 'agreementSigned',
+    '优先劣后金额': 'agreementAmountUsd',
+    '优先劣后协议金额': 'agreementAmountUsd',
+    '骄阳负责人': 'jiaoyangOwner',
+    '备注说明': 'notes',
+    '备注': 'notes',
+    BLOCK_AMOUNT_HEADER: BLOCK_AMOUNT_FIELD,
+}
 
 
 def text(value):
@@ -234,13 +255,19 @@ def _parse(workbook, filename, as_of, batch_dates):
                            and '优先劣后金额' in {normalized(v) for v in row.values()}), None)
             if not header:
                 raise HTTPException(422, f'{sheet[0]} 不是已识别的港安 ICC 格式。')
-            # Recognize labels, so reordering business columns is safe.
+            # Map known labels by name. The simplified template deliberately
+            # omits legacy fields, while raw source cells remain available.
             mapping = {}
-            for field, label in zip(FIELDS, HEADERS):
-                cols = [c for c, v in header[1].items() if normalized(v) == normalized(label)]
-                if len(cols) != 1:
-                    raise HTTPException(422, f'{sheet[0]} 缺少或重复表头：{label}')
-                mapping[field] = cols[0]
+            for col, value in header[1].items():
+                field = ICC_HEADER_FIELDS.get(normalized(value))
+                if not field:
+                    continue
+                if field in mapping:
+                    raise HTTPException(422, f'{sheet[0]} 表头重复：{text(value)}')
+                mapping[field] = col
+            if 'customerName' not in mapping or 'agreementAmountUsd' not in mapping:
+                raise HTTPException(422, f'{sheet[0]} 缺少必需表头：客户姓名、优先劣后金额')
+            block_col = mapping.get(BLOCK_AMOUNT_FIELD)
             tw_cols = [c for c, v in header[1].items() if normalized(v) in {'tw', 'tw编号'}]
             if len(tw_cols) > 1:
                 raise HTTPException(422, f'{sheet[0]} TW 编号表头重复。')
@@ -251,11 +278,12 @@ def _parse(workbook, filename, as_of, batch_dates):
                 name = text(values.get(mapping['customerName']))
                 if not name or name in {'合计', '总计'}:
                     continue
-                r = {field: text(values.get(col)) for field, col in mapping.items()}
+                r = {field: text(values.get(mapping[field])) if field in mapping else '' for field in FIELDS}
                 code = text(values.get(tw_cols[0])) if tw_cols else ''
                 r.update(sourceRow=index, sourceSheet=sheet[0], raw=values, twCode=tw(code) if code else '', batchDate=batch_date)
-                r['agreementAmountUsd'] = number(r['agreementAmountUsd'], f'{sheet[0]}!J{index}', nonnegative=True)
-                r['depositAmount'] = number(r['depositAmount'], f'{sheet[0]}!D{index}', nonnegative=True)
+                r['agreementAmountUsd'] = number(r['agreementAmountUsd'], f'{sheet[0]}!{mapping["agreementAmountUsd"]}{index}', nonnegative=True)
+                r[BLOCK_AMOUNT_FIELD] = number(values.get(block_col), f'{sheet[0]}!{block_col}{index}', nonnegative=True) if block_col else None
+                r['depositAmount'] = number(r['depositAmount'], f'{sheet[0]}!{mapping["depositAmount"]}{index}', nonnegative=True) if 'depositAmount' in mapping else None
                 r['recordKey'] = f'row:{index}'
                 records.append(r)
             datasets.append(dict(kind='icc', date=batch_date, rows=records, sheet=sheet[0]))

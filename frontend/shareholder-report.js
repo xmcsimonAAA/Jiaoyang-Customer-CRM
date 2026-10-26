@@ -93,7 +93,7 @@ function shareholderReportMarkup(data, {standalone = false} = {}) {
     {label:'现场转化', count:f.onsite?.converted?.count, note:'已形成实际参与'},
   ];
   const sourceLines = Object.entries(data.sourceDates || {}).filter(([, value]) => value).map(([key, value]) => `<span>${esc({master:'开户名单',assets:'资产明细',secondary:'XMAX 持仓',icc:'优先劣后'}[key] || key)} · ${esc(shareholderDateLabel(value))}</span>`).join('');
-  const asOfOptions = [...new Set(trend.map(item => item.date).filter(Boolean))].sort().reverse().map(value => `<option value="${esc(value)}" ${value === data.asOf ? 'selected' : ''}>${esc(shareholderDateLabel(value))}</option>`).join('');
+  const asOfOptions = [...new Set((data.reportDates || trend.map(item => item.date)).filter(Boolean))].sort().reverse().map(value => `<option value="${esc(value)}" ${value === data.asOf ? 'selected' : ''}>${esc(shareholderDateLabel(value))}</option>`).join('');
   const top10Text = a.top10Share === null || a.top10Share === undefined ? '暂无' : shareholderPercent(a.top10Share, 1);
   return `<div class="shareholder-report" id="shareholder-report-page">
     <header class="shareholder-hero">

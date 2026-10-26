@@ -116,6 +116,7 @@ def install(app, db, current_user, access_clause, audit, now_iso, priority_scope
     def summary(p, user=None):
         latest_crm = p['crm'][-1] if p['crm'] else {}
         latest_secondary = p['secondary'][-1] if p['secondary'] else {}
+        latest_asset = max(p['assets'], key=lambda row: str(row.get('date') or '')) if p['assets'] else {}
         name_pinyin = str(latest_crm.get('name_pinyin') or '').strip()
         return dict(key=p['key'], name=p['name'], twCode=p['twCode'], crmIds=[c['id'] for c in p['crm']],
                     searchTerms=[v for c in p['crm'] for v in (c['phone'],c['email'],c['customer_code']) if v],
@@ -131,6 +132,8 @@ def install(app, db, current_user, access_clause, audit, now_iso, priority_scope
                     funding_source_date=latest_crm.get('funding_source_date',''),
                     funding_source_label=latest_crm.get('funding_source_label',''),
                     funding_updated_at=latest_crm.get('funding_updated_at',''),
+                    latestAssetUsd=latest_asset.get('assetUsd') if latest_asset else None,
+                    latestAssetDate=latest_asset.get('date','') if latest_asset else '',
                     xmaxQuantity=latest_secondary.get('quantity') if latest_secondary else None,
                     secondaryQuantity=latest_secondary.get('secondaryQuantity') if latest_secondary else None,
                     blockQuantity=latest_secondary.get('blockQuantity') if latest_secondary else None,
@@ -313,6 +316,16 @@ def install(app, db, current_user, access_clause, audit, now_iso, priority_scope
                 rows.extend(row.get('sourceRows') or [row])
             return rows
 
+        def asset_customer_count(dataset):
+            """Count opened customers from unique TW identities in the asset snapshot.
+
+            One TW account can have several source rows/accounts.  The shareholder
+            funnel is a customer funnel, so those rows must count once.
+            """
+            rows = (dataset or {}).get('rows', [])
+            codes = {str(row.get('twCode') or '').strip() for row in rows if str(row.get('twCode') or '').strip()}
+            return len(codes) if codes else (len(rows) if dataset else None)
+
         def placement_rollup(conn, crm_ids):
             records = []
             if crm_ids:
@@ -403,7 +416,7 @@ def install(app, db, current_user, access_clause, audit, now_iso, priority_scope
             known_statuses = [value for value in master_statuses if value]
             registration_summary = asset_summary.get('registration') or {}
             registered = int(decimal(registration_summary.get('total'))) if registration_summary.get('total') is not None else (len(master_rows) if latest_master else len({p['key'] for p in people.values() if p.get('twCode')}))
-            opened = int(decimal(registration_summary.get('opened'))) if registration_summary.get('opened') is not None else (sum(status_success(value) for value in master_statuses) if latest_master else None)
+            opened = asset_customer_count(latest_assets) if latest_assets else (int(decimal(registration_summary.get('opened'))) if registration_summary.get('opened') is not None else (sum(status_success(value) for value in master_statuses) if latest_master else None))
             registration_rate = (float(decimal(registration_summary['rate']) * 100)
                                  if registration_summary.get('rate') is not None
                                  else (round(opened / registered * 100, 2) if opened is not None and registered else None))
@@ -490,7 +503,7 @@ def install(app, db, current_user, access_clause, audit, now_iso, priority_scope
                 trend_summary = (assets or {}).get('summary') or {}
                 trend_asset_aum = decimal(trend_summary.get('liveTotalAumUsd')) if trend_summary.get('liveTotalAumUsd') is not None else sum(values, Decimal('0'))
                 trend.append(dict(date=trend_date, customers=(int(decimal((trend_summary.get('registration') or {}).get('total'))) if (trend_summary.get('registration') or {}).get('total') is not None else (len(master_values) if master else None)),
-                                  opened=(int(decimal((trend_summary.get('registration') or {}).get('opened'))) if (trend_summary.get('registration') or {}).get('opened') is not None else (sum(status_success(value) for value in statuses) if master else None)),
+                                  opened=(asset_customer_count(assets) if assets else (int(decimal((trend_summary.get('registration') or {}).get('opened'))) if (trend_summary.get('registration') or {}).get('opened') is not None else (sum(status_success(value) for value in statuses) if master else None))),
                                   assetAum=money_value(trend_asset_aum) if assets else None,
                                   fundedRate=(float(decimal(trend_summary['activationRate']) * 100) if trend_summary.get('activationRate') is not None else (round(sum(value > 0 for value in values) / len(values) * 100, 2) if values else None)),
                                   secondaryQuantity=(money_value(sum((decimal(row.get('secondaryQuantity')) for row in (secondary or {}).get('rows', [])), Decimal('0'))) if secondary else None),
@@ -508,7 +521,7 @@ def install(app, db, current_user, access_clause, audit, now_iso, priority_scope
                 conversion_rate = onsite['converted']['count'] / onsite['signed']['count'] * 100
                 insights.append(dict(tone='positive' if conversion_rate >= 30 else 'attention', title='定增现场签约转化', body=f"现场签约 {onsite['signed']['count']:,} 人，已转化 {onsite['converted']['count']:,} 人，人数转化率 {conversion_rate:.1f}%。"))
 
-            return dict(asOf=selected, scope=('全量客户' if user.get('customerScope') == 'all' else '当前账号可见范围'),
+            return dict(asOf=selected, reportDates=all_dates, scope=('全量客户' if user.get('customerScope') == 'all' else '当前账号可见范围'),
                         sourceDates=source_dates,
                         kpis=dict(customers=registered, opened=opened, accountSuccessRate=registration_rate,
                                   fundedAccounts=funded_accounts if latest_assets else None, activationRate=activation_rate,

@@ -83,6 +83,7 @@ class IdentitySelection(BaseModel):
 
 class CommitSelections(BaseModel):
     identities: list[IdentitySelection] = Field(default_factory=list, max_length=500)
+    boardSelections: list[dict[str, Any]] = Field(default_factory=list, max_length=5000)
 
 
 class Edit(BaseModel):
@@ -205,6 +206,8 @@ def prepare_dataset(dataset, previous):
                 r['excludedTwCodes'] = before['excludedTwCodes']
             if 'participationIntent' in before:
                 r['participationIntent'] = before['participationIntent']
+            if 'blockAgreementAmountUsd' in before:
+                r['blockAgreementAmountUsd'] = before['blockAgreementAmountUsd']
             if before.get('originalCustomerName'):
                 r['customerName'] = before['customerName']
                 r['originalCustomerName'] = before['originalCustomerName']
@@ -216,7 +219,7 @@ def prepare_dataset(dataset, previous):
                         carried[field] = before.get('carriedFields', {}).get(field) or {'revision': previous['head_id'], 'row': before.get('sourceRow')}
                 if carried:
                     r['carriedFields'] = carried
-            fields = [f for f in set(FIELDS + ['assetUsd', 'quantity', 'twCode']) if r.get(f) != before.get(f)]
+            fields = [f for f in set(FIELDS + ['assetUsd', 'quantity', 'twCode', 'blockAgreementAmountUsd']) if r.get(f) != before.get(f)]
             if fields:
                 changes.append({'name': r['customerName'], 'twCode': r.get('twCode'), 'fields': fields,
                                 'before': {f: before.get(f) for f in fields}, 'after': {f: r.get(f) for f in fields}})
@@ -377,6 +380,8 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
         return dict(key=dataset.get('key') or dataset.get('dataset_key'), kind=dataset['kind'], label=LABELS[dataset['kind']],
                     date=dataset.get('date') or dataset.get('business_date'), records=len(rows),
                     participants=len(participating), agreementUsd=sum_values(r['agreementAmountUsd'] for r in participating),
+                    blockParticipants=sum(1 for r in rows if r.get('blockAgreementAmountUsd') is not None and Decimal(r['blockAgreementAmountUsd']) > 0),
+                    blockAgreementUsd=sum_values(r['blockAgreementAmountUsd'] for r in rows if r.get('blockAgreementAmountUsd') is not None and Decimal(r['blockAgreementAmountUsd']) > 0),
                     assetUsd=sum_values(r.get('assetUsd') for r in rows), quantity=sum_values(r.get('quantity') for r in rows),
                     secondaryQuantity=sum_values(r.get('secondaryQuantity') for r in rows),
                     blockQuantity=sum_values(r.get('blockQuantity') for r in rows),
@@ -512,7 +517,11 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
             job = str(uuid4())
             conn.execute('INSERT INTO priority_uploads VALUES (?,?,?,?,?,?,?)',
                          (job, 'preview', dumps({'matchingVersion': MATCHING_VERSION, 'identityReconciliation': identity_summary, 'datasets': datasets, 'baseHeads': {k: v['head_id'] for k, v in current.items()}}), dumps(sources), dumps(result), now_iso(), user['id']))
-        return {'id': job, 'datasets': result, 'identityReconciliation':identity_summary, 'sharedCustomers':shared_preview, 'issues': [dict(key=d['key'], recordKey=r['recordKey'], name=r['customerName'], sourceRow=r['sourceRow'], status=r['matchStatus'], candidates=r['candidates'])
+        board_rows = [dict(key=d['key'], recordKey=r['recordKey'], customerName=r['customerName'], twCode=r.get('twCode',''),
+                           agreementAmountUsd=r.get('agreementAmountUsd'), blockAgreementAmountUsd=r.get('blockAgreementAmountUsd'),
+                           sourceRow=r.get('sourceRow'), activityDate=d['date'])
+                      for d in datasets if d['kind'] == 'icc' and not d.get('automaticIdentity') for r in d['rows']]
+        return {'id': job, 'datasets': result, 'boardRows': board_rows, 'identityReconciliation':identity_summary, 'sharedCustomers':shared_preview, 'issues': [dict(key=d['key'], recordKey=r['recordKey'], name=r['customerName'], sourceRow=r['sourceRow'], status=r['matchStatus'], candidates=r['candidates'])
                 for d in datasets if d['kind'] == 'icc' and not d['duplicate'] for r in d['rows'] if not r.get('twCode')]}
 
     @app.post('/api/priority-inferior/imports/{job_id}/commit')
@@ -538,6 +547,7 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                 if {k: v['head_id'] for k, v in current.items()} != payload['baseHeads']:
                     raise HTTPException(409, '数据已被其他操作更新，请重新生成预览后保存。')
                 chosen = selections.identities if selections else []
+                board_selections = selections.boardSelections if selections else []
                 issues = {(i['key'], i.get('recordKey')):i for i in payload.get('identityReconciliation',{}).get('issues',[])}
                 datasets = {d['key']:d for d in payload['datasets']}
                 original_keys = set(datasets)
@@ -577,6 +587,32 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                     if selection.key not in original_keys or was_duplicate or d.get('fingerprint','').startswith('manual:'):
                         d['fingerprint']='manual:identity:'+str(uuid4())
                     d['changes'].append(dict(name=row['customerName'],twCode=code,fields=['twCode'],before={'twCode':''},after={'twCode':code}))
+                seen_board = set()
+                for selection in board_selections:
+                    key = str(selection.get('key') or '')
+                    record_key = str(selection.get('recordKey') or '')
+                    anchor = (key, record_key)
+                    d = datasets.get(key)
+                    row = next((item for item in d.get('rows', []) if item.get('recordKey') == record_key), None) if d else None
+                    if anchor in seen_board or not row or d.get('kind') != 'icc':
+                        raise HTTPException(422, '板块选择无效，请重新核对上传预览。')
+                    seen_board.add(anchor)
+                    priority_amount = number(selection.get('agreementAmountUsd'), '优先劣后金额', nonnegative=True)
+                    block_amount = number(selection.get('blockAgreementAmountUsd'), '大宗交易金额', nonnegative=True)
+                    if not selection.get('priority'):
+                        priority_amount = None
+                    if not selection.get('block'):
+                        block_amount = None
+                    if selection.get('priority') and (priority_amount is None or Decimal(priority_amount) <= 0):
+                        raise HTTPException(422, f"{row.get('customerName', '客户')} 已选择优先劣后，但金额为空或为零。")
+                    if selection.get('block') and (block_amount is None or Decimal(block_amount) <= 0):
+                        raise HTTPException(422, f"{row.get('customerName', '客户')} 已选择大宗交易，但金额为空或为零。")
+                    row['agreementAmountUsd'] = priority_amount
+                    row['blockAgreementAmountUsd'] = block_amount
+                    row['manualCorrection'] = dict(reason='上传预览中确认产品板块与意向金额', by=user['name'], at=now_iso(), fields=['agreementAmountUsd','blockAgreementAmountUsd'])
+                    d['changes'].append(dict(name=row['customerName'], twCode=row.get('twCode'), fields=['agreementAmountUsd','blockAgreementAmountUsd']))
+                    d['duplicate'] = False
+                    d['fingerprint'] = 'manual:board:' + str(uuid4())
                 if chosen:
                     conn.execute('UPDATE priority_uploads SET summary_json=? WHERE id=?',(dumps([summary(d) for d in payload['datasets']]),job_id))
                 for d in payload['datasets']:
@@ -782,7 +818,7 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
             require_assignment(user)
         else:
             require_edit(user)
-        allowed = set(FIELDS) - {'sourceSequence'} | {'twCode', 'participationIntent'}
+        allowed = set(FIELDS) - {'sourceSequence'} | {'twCode', 'participationIntent', 'blockAgreementAmountUsd'}
         if not payload.changes or set(payload.changes) - allowed:
             raise HTTPException(422, '包含不可编辑字段。')
         key = 'icc:' + iso(batch_date)
@@ -814,13 +850,13 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                     changes.update(twCode=code, canonicalName=identities[code]['customerName'], matchStatus='matched', matchReason=payload.reason, candidates=[code], identityDetached='')
                 else:
                     changes.update(detached_identity(r, payload.reason))
-            for field in ('depositAmount', 'agreementAmountUsd'):
+            for field in ('depositAmount', 'agreementAmountUsd', 'blockAgreementAmountUsd'):
                 if field in changes:
                     changes[field] = number(changes[field], field, nonnegative=True)
             for field, value in changes.items():
                 if isinstance(value, (dict, list)) and field not in {'candidates', 'excludedTwCodes'}:
                     raise HTTPException(422, '字段值类型错误。')
-                if field not in {'depositAmount', 'agreementAmountUsd', 'candidates', 'excludedTwCodes'}:
+                if field not in {'depositAmount', 'agreementAmountUsd', 'blockAgreementAmountUsd', 'candidates', 'excludedTwCodes'}:
                     changes[field] = text(value)
                     if len(changes[field]) > 5000:
                         raise HTTPException(422, '字段内容过长。')

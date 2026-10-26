@@ -106,6 +106,34 @@ def test_real_rows_selection_and_all_fields():
     assert 'E' not in d['rows'][0]['raw']
 
 
+def test_icc_big_lot_intent_header_is_parsed_as_a_separate_amount():
+    file = source('icc-big-lot.xlsx', [('2026.09.09', [
+        (2, {**dict(zip('ABCDEFGHIJKL', HEADERS)), 'M': 'TW 编号', 'N': '大宗交易金额'}),
+        (5, dict(A=1, B='甲', C='已开户', I='☑', J='1200', K='演示顾问', M='TW2026001', N='800')),
+    ])])
+    dataset = parse(base64.b64decode(file['contentBase64']), file['filename'], '2026-09-11', ['2026-09-09'])[0]
+    assert dataset['rows'][0]['agreementAmountUsd'] == '1200'
+    assert dataset['rows'][0]['blockAgreementAmountUsd'] == '800'
+
+
+def test_icc_simplified_offline_template_parses_without_legacy_columns():
+    file = source('港安ICC线下沙龙客户数据跟踪.xlsx', [('2026.10.26', [
+        (2, dict(A='序号', B='客户姓名', C='是否开券商户', D='保险经纪人', E='优先劣后金额',
+                 F='大宗交易金额', G='骄阳负责人', H='备注说明', M='TW 编号')),
+        (3, dict(A=1, B='甲', C='已开户', D='雅朵', E='1500', F='800', G='演示顾问',
+                 H='线下确认', M='TW2026001')),
+    ])])
+    dataset = parse(base64.b64decode(file['contentBase64']), file['filename'], '2026-10-26', ['2026-10-26'])[0]
+    row = dataset['rows'][0]
+    assert row['customerName'] == '甲'
+    assert row['brokerAccountStatus'] == '已开户'
+    assert row['insuranceBroker'] == '雅朵'
+    assert row['agreementAmountUsd'] == '1500'
+    assert row['blockAgreementAmountUsd'] == '800'
+    assert row['jiaoyangOwner'] == '演示顾问' and row['notes'] == '线下确认'
+    assert row['depositAmount'] is None and row['onSiteOpener'] == '' and row['zhongyangWitness'] == ''
+
+
 def test_complete_upload_duplicate_and_unmatched_preserved(client):
     p=publish(client,[icc(name='董芳'),master(),assets()])
     result=client.get('/api/priority-inferior/overview').json()
@@ -124,6 +152,40 @@ def test_complete_upload_duplicate_and_unmatched_preserved(client):
         assert c.execute('SELECT count(*) FROM batch_participations').fetchone()[0]==0
         assert len(c.execute('SELECT * FROM priority_revisions').fetchall())==4
         assert 'contentBase64' in c.execute('SELECT sources_json FROM priority_uploads WHERE id=?',(p['id'],)).fetchone()[0]
+
+
+def test_icc_upload_board_confirmation_keeps_priority_and_block_amounts_independent(client):
+    file = source('icc-big-lot.xlsx', [('2026.09.09', [
+        (2, {**dict(zip('ABCDEFGHIJKL', HEADERS)), 'M': 'TW 编号', 'N': '大宗交易金额'}),
+        (5, dict(A=1, B='甲', C='已开户', I='☑', J='1200', K='演示顾问', M='TW2026001', N='800')),
+    ])])
+    result = preview(client, [master(), file])
+    assert result['boardRows'][0]['agreementAmountUsd'] == '1200'
+    assert result['boardRows'][0]['blockAgreementAmountUsd'] == '800'
+    board_row = result['boardRows'][0]
+    committed = client.post(f"/api/priority-inferior/imports/{result['id']}/commit", json={
+        'boardSelections': [{
+            'key': board_row['key'], 'recordKey': board_row['recordKey'],
+            'priority': True, 'agreementAmountUsd': '1200',
+            'block': True, 'blockAgreementAmountUsd': '800',
+        }],
+    })
+    assert committed.status_code == 200, committed.text
+    row = client.get('/api/priority-inferior/batches/2026-09-09/participations').json()['rows'][0]
+    assert row['agreementAmountUsd'] == '1200'
+    assert row['blockAgreementAmountUsd'] == '800'
+    batches = client.get('/api/priority-inferior/batches').json()
+    item = next(batch for batch in batches if batch['date'] == '2026-09-09')
+    assert item['participants'] == 1 and item['agreementUsd'] == '1200'
+    assert item['blockParticipants'] == 1 and item['blockAgreementUsd'] == '800'
+    current = client.get('/api/priority-inferior/batches/2026-09-09/participations').json()
+    edited = client.patch('/api/priority-inferior/batches/2026-09-09/records/' + board_row['recordKey'].replace(':', '%3A'), json={
+        'expectedRevision': current['revision'],
+        'changes': {'blockAgreementAmountUsd': '950'}, 'reason': '人工拖入大宗交易并确认意向金额',
+    })
+    assert edited.status_code == 200, edited.text
+    row = client.get('/api/priority-inferior/batches/2026-09-09/participations').json()['rows'][0]
+    assert row['agreementAmountUsd'] == '1200' and row['blockAgreementAmountUsd'] == '950'
 
 
 def test_latest_asset_snapshot_is_shared_as_funded_amount_and_manual_override(client):
@@ -289,6 +351,28 @@ def test_shareholder_report_rolls_up_asset_structure_and_keeps_missing_market_va
     assert body['assets']['fundedAccounts'] == 2
     assert body['holdings']['marketValue'] is None
     assert body['priority']['participants'] == 1
+    publish(client, [assets(date='2026-09-18', amount='30')], date='2026-09-18')
+    earlier = client.get('/api/workspace/dashboard/report?as_of=2026-09-11').json()
+    assert '2026-09-18' in earlier['reportDates']
+
+
+def test_shareholder_report_counts_opened_customers_from_unique_asset_tw_codes(client):
+    master_file = source('开户名单.xlsx', [('全部', [
+        (1, dict(A='客户姓名', B='是否完成开户', C='备注')),
+        (2, dict(A='甲', B='已开户', C='TW2026001')),
+        (3, dict(A='乙', B='已开户', C='TW2026002')),
+    ])])
+    asset_file = source('客户权益资产.xlsx', [('Sheet1', [
+        (1, dict(A='客户编码', B='客戶姓名', C='客户权益资产（基币为USD，汇率@7.8）')),
+        (2, dict(A='TW2026001', B='甲', C='100')),
+        (3, dict(A='TW2026001', B='甲', C='200')),
+        (4, dict(A='TW2026002', B='乙', C='0')),
+    ])])
+    publish(client, [master_file, asset_file])
+    body = client.get('/api/workspace/dashboard/report').json()
+    assert body['kpis']['customers'] == 2
+    assert body['kpis']['opened'] == 2
+    assert body['kpis']['accountSuccessRate'] == 100.0
 
 
 def test_permissions_on_totals_rows_history_raw_and_mutations(client):
@@ -1263,6 +1347,14 @@ def test_workspace_directory_exposes_pinyin_search_fields(client):
     assert customer['namePinyinInitials'] == 'DF'
 
 
+def test_workspace_directory_exposes_latest_asset_amount(client):
+    publish(client, [master(), assets(date='2026.09.11', amount='20')])
+    items = client.get('/api/workspace/customers').json()['items']
+    customer = next(item for item in items if item['twCode'] == 'TW2026001')
+    assert customer['latestAssetUsd'] == '26.37'
+    assert customer['latestAssetDate'] == '2026-09-11'
+
+
 def test_manager_full_scope_and_collaborator_cannot_write_non_owned_followups(client):
     publish(client, [master(), icc(owner='演示顾问二')])
     with main.db() as conn:
@@ -1364,3 +1456,35 @@ def test_workspace_and_priority_dashboards_use_same_real_batch_totals(client):
     assert workspace['agreementUsd'] == product['agreementUsd'] == '250'
     assert workspace['participants'] == product['participants'] == 1
     assert workspace['records'] == product['participationRecords'] == 1
+
+
+def test_priority_batch_roster_filters_zero_and_tracks_completion_and_block_shares(client):
+    publish(client, [master(), icc(amount='100')])
+    created = client.post('/api/priority-inferior/product-batches', json={
+        'name': '跟进状态批次', 'participationDate': '2026-09-20', 'activityDates': ['2026-09-09'],
+    })
+    assert created.status_code == 201, created.text
+    batch_id = created.json()['id']
+    data = client.get('/api/priority-inferior/product-batches').json()['items'][0]
+    assert len(data['rosterRows']) == 1 and data['rosterRows'][0]['priority_status'] == 'followup'
+    row = data['rosterRows'][0]
+    completed = client.patch(f'/api/priority-inferior/product-batches/{batch_id}/roster/{row["id"]}', json={
+        'subjectKey': row['subjectKey'], 'board': 'priority', 'status': 'completed',
+        'priorityAmount': row['priority_amount'], 'priorityActualAmount': '90',
+    })
+    assert completed.status_code == 200, completed.text
+    added = client.post(f'/api/priority-inferior/product-batches/{batch_id}/roster', json={
+        'subjectKey': row['subjectKey'], 'board': 'block', 'status': 'followup',
+        'blockAmount': '200', 'twCode': row['twCode'], 'customerName': row['name'],
+    })
+    assert added.status_code == 201, added.text
+    block_id = added.json()['item']['id']
+    assert client.post(f'/api/priority-inferior/product-batches/{batch_id}/roster/{block_id}/resolve', json={
+        'subjectKey': row['subjectKey'], 'board': 'block', 'status': 'completed',
+        'blockAmount': '200',
+    }).status_code == 422
+    done = client.patch(f'/api/priority-inferior/product-batches/{batch_id}/roster/{block_id}', json={
+        'subjectKey': row['subjectKey'], 'board': 'block', 'status': 'completed',
+        'blockAmount': '200', 'blockActualAmount': '100', 'blockBuyPrice': '2',
+    })
+    assert done.status_code == 200 and done.json()['item']['block_share_quantity'] == '50.0000'
