@@ -43,7 +43,7 @@ async function renderPriorityRosterBatches(panel, board) {
   try {
     const data = await pget('product-batches'); const canEdit = priorityProductBatchCanEdit();
     const refresh = async () => renderPriorityRosterBatches(panel, board);
-    panel.innerHTML = `<div class="p-panel-heading"><div><h4>${board === 'block' ? '大宗交易' : '跟进客户表'}</h4><p>${board === 'block' ? '填写实际参与金额和买入股价后计算参与股数，确认完成才进入大宗交易卡片。' : '只展示协议金额大于 0 的签约客户；手动完成后进入优先劣后批次卡片。'}</p></div></div><div class="priority-product-batch-list">${data.items?.length ? data.items.map(item => `<article class="priority-product-batch-card"><div class="section-header"><div><span class="eyebrow">${esc(item.participationDate || item.participation_date || '')}</span><h4>${esc(item.name)}</h4><p>${esc(item.activityDates?.join('、') || '')} · ${esc(item.status)}</p></div>${canEdit ? `<button class="secondary-btn" data-edit-product-batch="${esc(item.id)}">编辑批次</button>` : ''}</div><div class="p-metrics"><article><span>优先劣后意向金额</span><strong>${pnum(item.agreementUsd || 0)}</strong></article><article><span>大宗交易意向金额</span><strong>${pnum(item.blockAgreementUsd || 0)}</strong></article></div>${priorityRosterTable(item, board === 'block' ? (item.blockRows || []) : (item.rosterRows || []), board, refresh)}</article>`).join('') : '<div class="p-empty"><h4>还没有批次</h4><p>先创建一个活动参与批次。</p></div>'}</div>`;
+    panel.innerHTML = `<div class="p-panel-heading"><div><h4>${board === 'block' ? '大宗交易' : '跟进客户表'}</h4><p>${board === 'block' ? '客户可以单独参加大宗交易，也可以同时参加优先劣后；在本页独立增删大宗名单。填写实际参与金额和买入股价后计算参与股数，确认完成才进入大宗交易卡片。' : '只展示协议金额大于 0 的签约客户；手动完成后进入优先劣后批次卡片。'}</p></div></div><div class="priority-product-batch-list">${data.items?.length ? data.items.map(item => `<article class="priority-product-batch-card"><div class="section-header"><div><span class="eyebrow">${esc(item.participationDate || item.participation_date || '')}</span><h4>${esc(item.name)}</h4><p>${esc(item.activityDates?.join('、') || '')} · ${esc(item.status)}</p></div>${canEdit ? `<button class="secondary-btn" data-edit-product-batch="${esc(item.id)}">编辑批次</button>` : ''}</div><div class="p-metrics"><article><span>优先劣后意向金额</span><strong>${pnum(item.agreementUsd || 0)}</strong></article><article><span>大宗交易意向金额</span><strong>${pnum(item.blockAgreementUsd || 0)}</strong></article></div>${priorityRosterTable(item, board === 'block' ? (item.blockRows || []) : (item.rosterRows || []), board, refresh)}</article>`).join('') : '<div class="p-empty"><h4>还没有批次</h4><p>先创建一个活动参与批次。</p></div>'}</div>`;
     const abandoned = data.items.flatMap(item => (board === 'block' ? (item.blockRows || []) : (item.rosterRows || [])).filter(row => row.status === 'abandoned').map(row => ({...row, batchName: item.name})));
     if (abandoned.length) panel.querySelector('.priority-product-batch-list').insertAdjacentHTML('afterbegin', `<section class="priority-abandoned-summary"><div class="section-header"><div><h4>全部已放弃客户</h4><span class="hint">${abandoned.length} 人 · 可在这里恢复到原批次跟进表</span></div></div><div class="p-table-wrap"><table class="p-table"><thead><tr><th>客户</th><th>所属批次</th><th>意向金额 · USD</th><th>操作</th></tr></thead><tbody>${abandoned.map(row => `<tr><td>${esc(row.name || row.customerName)}<small>${esc(row.twCode || '')}</small></td><td>${esc(row.batchName)}</td><td>${pnum(board === 'block' ? row.block_amount : row.priority_amount)}</td><td><button class="p-link" data-roster-restore="${row.id}">恢复跟进</button></td></tr>`).join('')}</tbody></table></div></section>`);
     panel.querySelectorAll('[data-edit-product-batch]').forEach(button => button.onclick = () => { const item = data.items.find(v => v.id === button.dataset.editProductBatch); if (item) priorityProductBatchEditor(item, data.activityOptions || [], refresh); });
@@ -64,6 +64,13 @@ async function renderPriorityRosterBatches(panel, board) {
 }
 
 async function renderPriorityBlockBatches(panel) { return renderPriorityRosterBatches(panel, 'block'); }
+
+async function renderBlockTrading(content) {
+  content.innerHTML = `<section class="section"><div id="block-trading-panel" class="priority-page"></div></section>`;
+  const panel = content.querySelector('#block-trading-panel');
+  try { priorityState.data = await pget('overview'); } catch { /* Existing batch data remains usable if the customer lookup is unavailable. */ }
+  await renderPriorityBlockBatches(panel);
+}
 
 function priorityProductBatchDate(value) {
   return String(value || '').slice(0, 10);

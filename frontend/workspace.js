@@ -34,7 +34,7 @@ function openWorkspaceFunding(person) {
     }
   };
 }
-const placementViews = new Set(['placement-dashboard','placement','customers','imports','reviews','assignments','bindings','fields']);
+const placementViews = new Set(['placement-dashboard','placement','block-trading','customers','imports','reviews','assignments','bindings','fields']);
 function workspaceNavigation() {
   return `<div class="nav-caption">日常工作</div><nav class="nav">${navButton('dashboard','⌗','工作台',state.view==='dashboard')}${navButton('followups','◌','我的跟进',state.view==='followups')}${state.user.canMonitorFollowups?navButton('followup-monitor','▤','跟进监控',state.view==='followup-monitor'):''}</nav><div class="nav-caption">经营分析</div><nav class="nav">${state.user.canViewShareholderReport?navButton('shareholder-report','◉','股东报告',state.view==='shareholder-report'):''}</nav><div class="nav-caption">客户中心</div><nav class="nav">${navButton('directory','▦','全部客户',state.view==='directory')}${pcanImport()?navButton('shared-import','＋','资料导入',state.view==='shared-import'):''}</nav><div class="nav-caption">产品业务</div><nav class="nav product-nav">${navButton('placement','◈','定增',placementViews.has(state.view))}${navButton('priority','▤','优先劣后',state.view==='priority')}</nav><div class="nav-caption">系统管理</div><nav class="nav">${state.user.canManageCrmPermissions?navButton('permissions','⚙','人员与权限',state.view==='permissions')+navButton('audit','≡','操作日志',state.view==='audit'):'<span class="hint">由管理员维护</span>'}</nav>`;
 }
@@ -52,7 +52,7 @@ async function renderFollowupMonitor(content) {
 }
 function placementNavigation(content) {
   if (!placementViews.has(state.view)) return;
-  const tabs=[['placement','批次管理',true],['placement-dashboard','经营分析',true],['customers','业务客户',true],['imports','资料录入',true],['reviews','导入复核',state.user.canImportCustomers||state.user.canManageCrmPermissions],['assignments','负责人分配',state.user.canManageAssignments],['bindings','经纪人绑定',state.user.canManageAdvisorBindings],['fields','业务表头',state.user.canManageCustomerFields]];
+  const tabs=[['placement','批次管理',true],['placement-dashboard','经营分析',true],['block-trading','大宗交易',true],['customers','业务客户',true],['imports','资料录入',true],['reviews','导入复核',state.user.canImportCustomers||state.user.canManageCrmPermissions],['assignments','负责人分配',state.user.canManageAssignments],['bindings','经纪人绑定',state.user.canManageAdvisorBindings],['fields','业务表头',state.user.canManageCustomerFields]];
   content.insertAdjacentHTML('beforebegin',`<div class="business-context" id="business-navigation"><span>产品业务 / 定增</span><h3>定增业务</h3><p>批次、业务进度、资料录入与负责人分配。</p><nav class="workspace-tabs">${tabs.filter(t=>t[2]).map(([key,label])=>`<button class="${state.view===key?'active':''}" data-product-view="${key}">${label}</button>`).join('')}<button id="placement-followups">业务跟进</button></nav></div>`);
   document.querySelector('#business-navigation').querySelectorAll('[data-product-view]').forEach(b=>b.onclick=()=>navigate(b.dataset.productView));
   document.querySelector('#placement-followups').onclick=()=>{workspaceBusiness='placement';navigate('followups');};

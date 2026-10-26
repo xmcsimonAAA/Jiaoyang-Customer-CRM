@@ -8,6 +8,7 @@ const pcall = (path, body, method='POST') => api(`/api/priority-inferior/${path}
 const pdate = () => new Date().toLocaleDateString('sv-SE');
 
 async function renderPriority(content) {
+  if (priorityState.tab === 'block-batches') priorityState.tab = 'batches';
   if (priorityState.userId !== state.user.id) {
     Object.assign(priorityState, {userId:state.user.id, preview:null, rows:[], data:null, query:'', broker:'', owner:'', participation:'', secondary:'', holding:'', type:'', minimum:'', maximum:''});
   }
@@ -19,7 +20,7 @@ async function renderPriority(content) {
   const taskCount=(pcanImport()||pcanAssign())?(await pget('tasks')).items.length:0;
   content.innerHTML = `<div class="priority-page ${priorityState.tab==='tasks'?'priority-task-view':''}"><div class="priority-heading"><div><span class="eyebrow">优先劣后 · 每周数据</span><h3>本周资料，一处查清</h3><p>按批次查协议与负责人，按客户查资产和 XMax 持仓。</p></div><label>查看截至日期<input id="p-asof" type="date" value="${esc(priorityState.asOf)}" aria-label="查看截至日期"></label></div>
     <div class="p-metrics"><article><span>参与客户（去重）</span><strong>${s.participants}<small> 人</small></strong><p>${s.participationRecords} 条参与记录${s.unmatchedParticipations ? ` · <button class="p-link" id="p-metric-pending">${s.unmatchedParticipations} 条身份待确认 · 去处理</button>` : ''}</p></article><article><span>协议总额 · USD</span><strong>${pnum(s.agreementUsd)}</strong><p>按已填协议金额统计</p></article><article><span>XMax 当前持仓客户</span><strong>${s.secondaryParticipants}<small> 人</small></strong><p>${data.dates.secondary || '尚未上传'} · 合计 ${pnum(s.quantity)} 股${s.secondaryQuantity != null || s.blockQuantity != null ? `（二级 ${pnum(s.secondaryQuantity)} · 大宗 ${pnum(s.blockQuantity)}）` : ''}</p></article><article><span>客户总资产 · USD</span><strong>${pnum(s.assetsUsd)}</strong><p>${data.dates.assets || '尚未上传'} · 同一 TW 账户相加</p></article></div>
-    <div class="p-tabs" role="tablist">${[['tasks','待处理中心'],['batches','活动记录'],['product-batches','跟进客户表'],['block-batches','大宗交易'],['customers','客户综合查询'],['upload','资料导入'],['history','上传历史'],['bindings','负责人分配'],['followups','业务跟进']].filter(([key]) => key==='bindings' ? state.user.customerScope==='all' && state.user.canManageAssignments && state.user.canManageAdvisorBindings : !['upload','history'].includes(key) || pcanImport()).map(([key,label])=>`<button role="tab" aria-selected="${priorityState.tab === key}" data-p-tab="${key}">${label}${key==='tasks' && taskCount ? ` <span>${taskCount} 待处理</span>`:''}</button>`).join('')}</div>
+    <div class="p-tabs" role="tablist">${[['tasks','待处理中心'],['batches','活动记录'],['product-batches','跟进客户表'],['customers','客户综合查询'],['upload','资料导入'],['history','上传历史'],['bindings','负责人分配'],['followups','业务跟进']].filter(([key]) => key==='bindings' ? state.user.customerScope==='all' && state.user.canManageAssignments && state.user.canManageAdvisorBindings : !['upload','history'].includes(key) || pcanImport()).map(([key,label])=>`<button role="tab" aria-selected="${priorityState.tab === key}" data-p-tab="${key}">${label}${key==='tasks' && taskCount ? ` <span>${taskCount} 待处理</span>`:''}</button>`).join('')}</div>
     <section id="p-panel" class="p-panel"></section></div>`;
   content.querySelector('#p-metric-pending')?.addEventListener('click',priorityOpenTasks);
   content.querySelector('#p-asof').onchange = async e => { priorityState.asOf=e.target.value; await renderPriority(content); };
@@ -29,7 +30,6 @@ async function renderPriority(content) {
   if (priorityState.tab==='followups') { workspaceBusiness='priority'; await renderUnifiedFollowups(panel); }
   else if (priorityState.tab==='tasks') await renderPriorityTasks(panel);
   else if (priorityState.tab==='product-batches') await renderPriorityProductBatches(panel);
-  else if (priorityState.tab==='block-batches') await renderPriorityBlockBatches(panel);
   else if (priorityState.tab==='bindings') await renderPriorityBindings(panel);
   else if (priorityState.tab==='upload') renderPriorityUpload(panel);
   else if (priorityState.tab==='customers') renderPriorityCustomers(panel);
@@ -55,11 +55,17 @@ function pbindFilters(panel, update) {
 async function renderPriorityBatches(panel) {
   const batches=priorityState.data.batches.sort((a,b)=>b.date.localeCompare(a.date));
   if (!batches.length) {panel.innerHTML='<div class="p-empty"><h4>还没有优先劣后批次</h4><p>上传客户名单和港安 ICC 文件后，这里会显示批次、协议金额与负责人。</p></div>'; return;}
-  if (!batches.some(b=>b.date===priorityState.batch)) priorityState.batch=batches[0].date;
+  const selectedBatch=batches.find(b=>b.date===priorityState.batch);
+  if (!selectedBatch) priorityState.batch='';
+  if (!priorityState.batch) {
+    panel.innerHTML=`<div class="p-panel-heading"><div><h4>每周活动批次</h4><p>选择一个批次查看客户记录、协议金额及大宗交易意向。</p></div><span>${batches.length} 个批次</span></div><div class="priority-activity-batch-cards">${batches.map(b=>`<button type="button" class="priority-activity-batch-card" data-activity-batch="${esc(b.date)}"><span>活动日期 · ${esc(b.date)}</span><strong>${Number(b.participants||0).toLocaleString('zh-CN')} <small>优先劣后客户</small></strong><small>协议意向 ${pnum(b.agreementUsd)} USD</small><small>大宗 ${b.blockParticipants||0} 人 · ${pnum(b.blockAgreementUsd||0)} USD</small><footer>查看本批详情 →</footer></button>`).join('')}</div>`;
+    panel.querySelectorAll('[data-activity-batch]').forEach(button=>button.onclick=async()=>{priorityState.batch=button.dataset.activityBatch;await renderPriorityBatches(panel);});
+    return;
+  }
   const data=await pget(`batches/${priorityState.batch}/participations`);
   priorityState.rows=data.rows;
-  panel.innerHTML=`<div class="p-panel-heading"><div><h4>每周活动批次</h4><p>按活动日期展示；一个人可同时参与优先劣后与大宗交易，金额分开记录。</p></div><span>${batches.length} 个批次</span></div><div class="priority-activity-batch-cards">${batches.map(b=>`<button type="button" class="priority-activity-batch-card ${b.date===priorityState.batch?'active':''}" data-activity-batch="${esc(b.date)}"><span>${esc(b.date)}</span><strong>${Number(b.participants||0).toLocaleString('zh-CN')} <small>优先劣后人</small></strong><small>意向金额 ${pnum(b.agreementUsd)} USD</small><small>大宗 ${b.blockParticipants||0} 人 · ${pnum(b.blockAgreementUsd||0)} USD</small></button>`).join('')}</div><div class="p-batch-roster-heading"><strong>${esc(data.filename)} · ${data.rows.length} 条活动记录</strong><span class="hint">客户负责人全产品共用；原表负责人仅供追溯。</span></div>${pfilterMarkup(data.rows)}<p class="p-hint">可将名单中的客户拖到“大宗交易”区域，确认本批大宗意向金额后保存。上传表头“大宗交易金额”有数字的会自动预选。</p><div id="p-records"></div>`;
-  panel.querySelectorAll('[data-activity-batch]').forEach(button=>button.onclick=async()=>{priorityState.batch=button.dataset.activityBatch;await renderPriorityBatches(panel);});
+  panel.innerHTML=`<div class="p-batch-detail-heading"><div><button type="button" class="secondary-btn" id="p-batch-back">← 返回全部批次</button><span class="eyebrow">优先劣后活动批次</span><h4>${esc(data.filename)} · ${esc(priorityState.batch)}</h4><p>共 ${data.rows.length} 条活动记录 · ${Number(selectedBatch.participants||0)} 位有协议金额客户 · 协议意向 ${pnum(selectedBatch.agreementUsd)} USD</p></div><div class="p-batch-detail-metrics"><span>大宗客户 <b>${selectedBatch.blockParticipants||0}</b></span><span>大宗意向 <b>${pnum(selectedBatch.blockAgreementUsd||0)} USD</b></span></div></div>${pfilterMarkup(data.rows)}<p class="p-hint">可将名单中的客户拖到“大宗交易”区域，确认本批大宗意向金额后保存。上传表头“大宗交易金额”有数字的会自动预选。</p><div id="p-records"></div>`;
+  panel.querySelector('#p-batch-back').onclick=async()=>{priorityState.batch='';priorityState.rows=[];await renderPriorityBatches(panel);};
   const update=()=>{
     const rows=pfilterRows(data.rows);
     // Keep the activity roster aligned with the simplified offline template.
