@@ -1319,6 +1319,39 @@ def test_priority_product_batch_roster_exposes_read_and_followup_flags(client):
     assert workspace_note(client, key='tw:TW202609039', batchKey=batch_id).status_code == 404
 
 
+def test_priority_roster_owner_can_save_amount_and_complete_without_import_permissions(client):
+    publish(client, [master(), icc(amount='100')])
+    created = client.post('/api/priority-inferior/product-batches', json={
+        'name': '商务经理日常跟进', 'participationDate': '2026-09-20', 'activityDates': ['2026-09-09'],
+    })
+    batch_id = created.json()['id']
+    row = client.get('/api/priority-inferior/product-batches').json()['items'][0]['rosterRows'][0]
+    card = client.post('/api/priority-inferior/participation-batches', json={
+        'board': 'priority', 'name': '商务经理可选择的发车批次', 'participationDate': '2026-09-22',
+    })
+    assert card.status_code == 201
+    with main.db() as conn:
+        conn.execute("UPDATE customers SET owner_id='demo-manager',owner_name='演示顾问',owner_team='演示一组' WHERE customer_code='TW2026001'")
+    client.test_user.update(id='demo-manager', name='演示顾问', rolePermission='manager', customerScope='self',
+                            canImportCustomers=False, canManageAdvisorBindings=False, team='演示一组')
+    saved = client.patch(f'/api/priority-inferior/product-batches/{batch_id}/roster/{row["id"]}', json={
+        'subjectKey': row['subjectKey'], 'board': 'priority', 'status': 'followup',
+        'priorityAmount': row['priority_amount'], 'priorityActualAmount': '90',
+    })
+    assert saved.status_code == 200, saved.text
+    done = client.post(f'/api/priority-inferior/product-batches/{batch_id}/roster/{row["id"]}/resolve', json={
+        'subjectKey': row['subjectKey'], 'board': 'priority', 'status': 'completed',
+        'completionBatchId': card.json()['id'], 'priorityAmount': row['priority_amount'],
+        'priorityActualAmount': '90',
+    })
+    assert done.status_code == 200, done.text
+    client.test_user.update(id='demo-manager-2', name='演示顾问二')
+    denied = client.post(f'/api/priority-inferior/product-batches/{batch_id}/roster/{row["id"]}/resolve', json={
+        'subjectKey': row['subjectKey'], 'board': 'priority', 'status': 'followup',
+    })
+    assert denied.status_code == 403
+
+
 def test_priority_product_batch_requires_whole_activity_batches(client):
     publish(client, [master(), icc()])
     empty = client.post('/api/priority-inferior/product-batches', json={
@@ -1468,9 +1501,14 @@ def test_priority_batch_roster_filters_zero_and_tracks_completion_and_block_shar
     data = client.get('/api/priority-inferior/product-batches').json()['items'][0]
     assert len(data['rosterRows']) == 1 and data['rosterRows'][0]['priority_status'] == 'followup'
     row = data['rosterRows'][0]
+    priority_card = client.post('/api/priority-inferior/participation-batches', json={
+        'board': 'priority', 'name': '优先劣后第一车', 'participationDate': '2026-09-22',
+    })
+    assert priority_card.status_code == 201, priority_card.text
     completed = client.patch(f'/api/priority-inferior/product-batches/{batch_id}/roster/{row["id"]}', json={
         'subjectKey': row['subjectKey'], 'board': 'priority', 'status': 'completed',
         'priorityAmount': row['priority_amount'], 'priorityActualAmount': '90',
+        'completionBatchId': priority_card.json()['id'],
     })
     assert completed.status_code == 200, completed.text
     added = client.post(f'/api/priority-inferior/product-batches/{batch_id}/roster', json={
@@ -1483,11 +1521,31 @@ def test_priority_batch_roster_filters_zero_and_tracks_completion_and_block_shar
         'subjectKey': row['subjectKey'], 'board': 'block', 'status': 'completed',
         'blockAmount': '200',
     }).status_code == 422
+    block_card = client.post('/api/priority-inferior/participation-batches', json={
+        'board': 'block', 'name': '大宗第一车', 'participationDate': '2026-09-23',
+    })
+    assert block_card.status_code == 201, block_card.text
     done = client.patch(f'/api/priority-inferior/product-batches/{batch_id}/roster/{block_id}', json={
         'subjectKey': row['subjectKey'], 'board': 'block', 'status': 'completed',
         'blockAmount': '200', 'blockActualAmount': '100', 'blockBuyPrice': '2',
+        'completionBatchId': block_card.json()['id'],
     })
     assert done.status_code == 200 and done.json()['item']['block_share_quantity'] == '50.0000'
+    overview = client.get('/api/priority-inferior/product-batches').json()
+    assert overview['participationBatches']['priority'][0]['rows'][0]['name'] == row['name']
+    assert overview['participationBatches']['block'][0]['rows'][0]['block_share_quantity'] == '50.0000'
+    second_card = client.post('/api/priority-inferior/participation-batches', json={
+        'board': 'priority', 'name': '优先劣后第二车', 'participationDate': '2026-10-01',
+    }).json()['id']
+    moved = client.post(f'/api/priority-inferior/product-batches/{batch_id}/roster/{row["id"]}/resolve', json={
+        'subjectKey': row['subjectKey'], 'board': 'priority', 'status': 'completed',
+        'completionBatchId': second_card, 'priorityActualAmount': '90',
+    })
+    assert moved.status_code == 200, moved.text
+    overview = client.get('/api/priority-inferior/product-batches').json()
+    assert overview['participationBatches']['priority'][0]['id'] == second_card
+    assert len(overview['participationBatches']['priority'][0]['rows']) == 1
+    assert not overview['participationBatches']['priority'][1]['rows']
 
 
 def test_priority_product_roster_falls_back_to_shared_customer_name_when_snapshot_is_blank(client):
@@ -1542,3 +1600,28 @@ def test_priority_roster_exposes_activity_dates_owner_and_current_funding(client
     assert rows[0]['ownerName'] == '演示顾问'
     assert rows[0]['funded_amount'] == 26.37
     assert rows[0]['funding_source_kind'] == 'asset'
+
+
+def test_priority_and_block_batch_dates_are_independent(client):
+    publish(client, [master(), icc()])
+    created = client.post('/api/priority-inferior/product-batches', json={
+        'name': '日期隔离批次', 'participationDate': '2026-09-20', 'activityDates': ['2026-09-09'],
+    })
+    assert created.status_code == 201, created.text
+    batch_id = created.json()['id']
+
+    priority_update = client.patch(f'/api/priority-inferior/product-batches/{batch_id}', json={
+        'participationDate': '2026-10-01', 'board': 'priority',
+    })
+    assert priority_update.status_code == 200, priority_update.text
+    item = client.get('/api/priority-inferior/product-batches').json()['items'][0]
+    assert item['priorityParticipationDate'] == '2026-10-01'
+    assert item['blockParticipationDate'] == '2026-09-20'
+
+    block_update = client.patch(f'/api/priority-inferior/product-batches/{batch_id}', json={
+        'participationDate': '2026-10-05', 'board': 'block',
+    })
+    assert block_update.status_code == 200, block_update.text
+    item = client.get('/api/priority-inferior/product-batches').json()['items'][0]
+    assert item['priorityParticipationDate'] == '2026-10-01'
+    assert item['blockParticipationDate'] == '2026-10-05'

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from decimal import Decimal
+import os
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -19,6 +20,7 @@ from pydantic import BaseModel, Field
 from backend.priority_import import iso, normalized
 from backend.followup_access import batch_read_user, can_followup, disabled_reason
 from backend.shared_funding import attach as attach_funding
+from backend.database import uses_postgres
 
 
 SCHEMA = [
@@ -26,6 +28,8 @@ SCHEMA = [
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         participation_date TEXT NOT NULL,
+        priority_participation_date TEXT NOT NULL DEFAULT '',
+        block_participation_date TEXT NOT NULL DEFAULT '',
         status TEXT NOT NULL DEFAULT '筹备中',
         notes TEXT NOT NULL DEFAULT '',
         created_by TEXT NOT NULL,
@@ -59,6 +63,8 @@ SCHEMA = [
         block_actual_amount TEXT NOT NULL DEFAULT '',
         block_buy_price TEXT NOT NULL DEFAULT '',
         block_share_quantity TEXT NOT NULL DEFAULT '',
+        priority_completion_batch_id TEXT NOT NULL DEFAULT '',
+        block_completion_batch_id TEXT NOT NULL DEFAULT '',
         notes TEXT NOT NULL DEFAULT '',
         created_by TEXT NOT NULL,
         created_at TEXT NOT NULL,
@@ -66,6 +72,17 @@ SCHEMA = [
         UNIQUE(batch_id, subject_key),
         FOREIGN KEY(batch_id) REFERENCES priority_product_batches(id)
     )""",
+    """CREATE TABLE IF NOT EXISTS priority_completion_batches (
+        id TEXT PRIMARY KEY,
+        board TEXT NOT NULL,
+        name TEXT NOT NULL,
+        participation_date TEXT NOT NULL,
+        notes TEXT NOT NULL DEFAULT '',
+        created_by TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_priority_completion_batches_board ON priority_completion_batches(board, participation_date DESC)",
     "CREATE INDEX IF NOT EXISTS idx_priority_batch_roster_batch_status ON priority_batch_roster(batch_id, priority_status, block_status)",
 ]
 
@@ -83,9 +100,17 @@ class ProductBatchPayload(BaseModel):
 class ProductBatchPatch(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=160)
     participationDate: str | None = Field(default=None, min_length=8, max_length=20)
+    board: str | None = None
     status: str | None = None
     notes: str | None = Field(default=None, max_length=4000)
     activityDates: list[str] | None = Field(default=None, max_length=100)
+
+
+class CompletionBatchPayload(BaseModel):
+    board: str
+    name: str = Field(min_length=1, max_length=160)
+    participationDate: str = Field(min_length=8, max_length=20)
+    notes: str = Field(default="", max_length=4000)
 
 
 class RosterPayload(BaseModel):
@@ -98,6 +123,7 @@ class RosterPayload(BaseModel):
     blockActualAmount: str | float | int | None = None
     blockBuyPrice: str | float | int | None = None
     blockShareQuantity: str | float | int | None = None
+    completionBatchId: str | None = None
     customerName: str = Field(default="", max_length=250)
     twCode: str = Field(default="", max_length=100)
     notes: str = Field(default="", max_length=4000)
@@ -211,7 +237,9 @@ def summarize_batches(conn: Any, all_heads: dict[str, dict[str, Any]], user_scop
         matched = {row["twCode"] for row in positive if row.get("twCode")}
         pending = sum(1 for row in positive if not row.get("twCode"))
         result.append(dict(batch,
-                           participationDate=batch["participation_date"],
+                           participationDate=batch.get("priority_participation_date") or batch["participation_date"],
+                           priorityParticipationDate=batch.get("priority_participation_date") or batch["participation_date"],
+                           blockParticipationDate=batch.get("block_participation_date") or batch["participation_date"],
                            activityDates=[item["activity_date"] for item in activities.get(batch["id"], [])],
                            activityCount=len(activities.get(batch["id"], [])),
                            participantCount=len(matched),
@@ -229,6 +257,38 @@ def install(app: Any, db: Callable, current_user: Callable, now_iso: Callable,
     with db() as conn:
         for statement in SCHEMA:
             conn.execute(statement)
+        if uses_postgres(os.getenv('DATABASE_URL', '').strip()):
+            columns = {row['column_name'] for row in conn.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name='priority_product_batches'").fetchall()}
+        else:
+            columns = {row['name'] for row in conn.execute('PRAGMA table_info(priority_product_batches)').fetchall()}
+        for column in ('priority_participation_date', 'block_participation_date'):
+            if column not in columns:
+                conn.execute(f"ALTER TABLE priority_product_batches ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+        conn.execute("UPDATE priority_product_batches SET priority_participation_date=participation_date WHERE priority_participation_date=''")
+        conn.execute("UPDATE priority_product_batches SET block_participation_date=participation_date WHERE block_participation_date=''")
+        if uses_postgres(os.getenv('DATABASE_URL', '').strip()):
+            roster_columns = {row['column_name'] for row in conn.execute("SELECT column_name FROM information_schema.columns WHERE table_name='priority_batch_roster'").fetchall()}
+        else:
+            roster_columns = {row['name'] for row in conn.execute('PRAGMA table_info(priority_batch_roster)').fetchall()}
+        for column in ('priority_completion_batch_id', 'block_completion_batch_id'):
+            if column not in roster_columns:
+                conn.execute(f"ALTER TABLE priority_batch_roster ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+        # Preserve existing completed customers by placing them in clearly named
+        # legacy cards, one card per source activity batch and product.
+        for board, status_col, pointer_col, date_col in (
+            ('priority', 'priority_status', 'priority_completion_batch_id', 'priority_participation_date'),
+            ('block', 'block_status', 'block_completion_batch_id', 'block_participation_date'),
+        ):
+            legacy_rows = conn.execute(f'''SELECT r.batch_id,b.name,b.{date_col},COUNT(*) n
+                FROM priority_batch_roster r JOIN priority_product_batches b ON b.id=r.batch_id
+                WHERE r.{status_col}='completed' AND r.{pointer_col}=''
+                GROUP BY r.batch_id,b.name,b.{date_col}''').fetchall()
+            for source_id, source_name, participation_date, _ in legacy_rows:
+                card_id, timestamp = str(uuid4()), now_iso()
+                conn.execute('''INSERT INTO priority_completion_batches(id,board,name,participation_date,notes,created_by,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?)''', (card_id, board, f"历史完成 · {source_name}", participation_date or '', '系统迁移的历史完成客户，可编辑后重新归入发车批次。', 'system', timestamp, timestamp))
+                conn.execute(f"UPDATE priority_batch_roster SET {pointer_col}=? WHERE batch_id=? AND {status_col}='completed' AND {pointer_col}=''", (card_id, source_id))
 
     def check_status(status: str | None) -> str:
         value = str(status or "筹备中").strip()
@@ -290,9 +350,11 @@ def install(app: Any, db: Callable, current_user: Callable, now_iso: Callable,
                                if row.get('productBatchId') == batch_id}
         result = []
         for row in rows:
+            pointer_col = 'priority_completion_batch_id' if board == 'priority' else 'block_completion_batch_id'
             item = dict(row, id=row["id"], subjectKey=row["subject_key"], twCode=row["tw_code"],
                         name=row["customer_name"], agreementAmountUsd=row["priority_amount"],
-                        blockAgreementAmountUsd=row["block_amount"], status=row[status_col], batchKey=batch_id)
+                        blockAgreementAmountUsd=row["block_amount"], status=row[status_col], batchKey=batch_id,
+                        completionBatchId=row[pointer_col])
             activity = activity_by_subject.get(row['subject_key'], {})
             item['activityDates'] = activity.get('activityDates') or ([activity['activityDate']] if activity.get('activityDate') else [])
             item['serviceOwner'] = activity.get('serviceOwner') or activity.get('jiaoyangOwner') or ''
@@ -307,10 +369,18 @@ def install(app: Any, db: Callable, current_user: Callable, now_iso: Callable,
         if not batch:
             raise HTTPException(404, "参与批次不存在。")
         status_col = "priority_status" if payload.board == "priority" else "block_status"
+        completion_col = "priority_completion_batch_id" if payload.board == "priority" else "block_completion_batch_id"
         amount_col = "priority_amount" if payload.board == "priority" else "block_amount"
         status = payload.status or "followup"
         if status not in {"followup", "completed", "abandoned", "none"}:
             raise HTTPException(422, "客户状态无效。")
+        completion_batch_id = payload.completionBatchId
+        if status == 'completed':
+            if not completion_batch_id:
+                raise HTTPException(422, '请先选择客户要进入的发车批次。')
+            completion_batch = conn.execute('SELECT id FROM priority_completion_batches WHERE id=? AND board=?', (completion_batch_id, payload.board)).fetchone()
+            if not completion_batch:
+                raise HTTPException(422, '所选发车批次不存在或业务板块不匹配。')
         current = conn.execute("SELECT * FROM priority_batch_roster WHERE batch_id=? AND subject_key=?", (batch_id, payload.subjectKey)).fetchone()
         if not current:
             amount = str(payload.priorityAmount if payload.board == "priority" else payload.blockAmount or "0")
@@ -324,6 +394,8 @@ def install(app: Any, db: Callable, current_user: Callable, now_iso: Callable,
                  user["id"], now_iso(), now_iso()))
             current = conn.execute("SELECT * FROM priority_batch_roster WHERE batch_id=? AND subject_key=?", (batch_id, payload.subjectKey)).fetchone()
         updates = {status_col: status, "updated_at": now_iso()}
+        if status == 'completed': updates[completion_col] = completion_batch_id
+        elif status in {'followup', 'abandoned', 'none'}: updates[completion_col] = ''
         amount = payload.priorityAmount if payload.board == "priority" else payload.blockAmount
         if amount is not None:
             if _decimal(amount) < 0:
@@ -376,6 +448,47 @@ def install(app: Any, db: Callable, current_user: Callable, now_iso: Callable,
                     canOpenCard=readable, canFollowup=can_followup(user, owner_id, readable),
                     followupDisabledReason=disabled_reason(user, owner_id, readable))
 
+    def require_roster_edit(conn: Any, current: Any, batch_id: str, user: dict[str, Any]) -> None:
+        """Allow a customer owner to update their own operational followup row.
+
+        Import and batch configuration remain management-only; status and actual
+        participation fields are part of the owner's daily followup workflow.
+        """
+        if user.get('customerScope') == 'all' and user.get('canImportCustomers') and user.get('canManageAdvisorBindings'):
+            return
+        all_heads, owners, allowed = roster_context(conn, user)
+        row = dict(current)
+        row.update(id=current['id'], subjectKey=current['subject_key'], twCode=current['tw_code'],
+                   name=current['customer_name'], batchKey=batch_id)
+        decorated = roster_row(row, batch_id, user, owners, allowed)
+        if not decorated.get('canFollowup'):
+            raise HTTPException(403, decorated.get('followupDisabledReason') or '仅客户当前负责人可更新跟进状态。')
+
+    def completion_batches(conn: Any, board: str, user: dict[str, Any], owners: dict, allowed: set[str], all_heads: dict[str, dict[str, Any]]):
+        if board not in {'priority', 'block'}:
+            raise HTTPException(422, '业务板块无效。')
+        status_col = 'priority_status' if board == 'priority' else 'block_status'
+        pointer_col = 'priority_completion_batch_id' if board == 'priority' else 'block_completion_batch_id'
+        source_batches = conn.execute('SELECT id,name FROM priority_product_batches').fetchall()
+        completed = []
+        for source in source_batches:
+            completed.extend(row for row in roster_items(conn, source['id'], board, user, owners, allowed, all_heads)
+                             if row['status'] == 'completed')
+        by_card: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in completed:
+            if row.get('completionBatchId'):
+                row['sourceBatchName'] = next((b['name'] for b in source_batches if b['id'] == row['batchKey']), '')
+                by_card[row['completionBatchId']].append(row)
+        cards = []
+        for raw in conn.execute('SELECT * FROM priority_completion_batches WHERE board=? ORDER BY participation_date DESC,created_at DESC', (board,)).fetchall():
+            card = dict(raw)
+            card['participationDate'] = card.get('participation_date', '')
+            card['rows'] = by_card.get(card['id'], [])
+            card['participantCount'] = len(card['rows'])
+            card['actualUsd'] = str(sum((_decimal(row.get('priority_actual_amount') if board == 'priority' else row.get('block_actual_amount')) for row in card['rows']), Decimal(0)))
+            cards.append(card)
+        return cards
+
     @app.get('/api/priority-inferior/product-batches')
     def product_batches(user=Depends(current_user)):
         with db() as conn:
@@ -389,12 +502,48 @@ def install(app: Any, db: Callable, current_user: Callable, now_iso: Callable,
                                 if row.get('productBatchId') == item['id']]
                 item['rosterRows'] = roster_items(conn, item['id'], 'priority', user, owners, allowed, all_heads)
                 item['blockRows'] = roster_items(conn, item['id'], 'block', user, owners, allowed, all_heads)
+            participation_batches = {
+                board: completion_batches(conn, board, user, owners, allowed, all_heads)
+                for board in ('priority', 'block')
+            }
             mapped = {row["activity_date"]: row["batch_id"] for row in conn.execute("SELECT activity_date,batch_id FROM priority_batch_activities").fetchall()}
             activity_options = [{"date": dataset['business_date'], "batchId": mapped.get(dataset['business_date']),
                                  "records": len(dataset.get("rows", []))}
                                 for dataset in sorted(all_heads.values(), key=lambda item: item.get("business_date", ""), reverse=True)
                                 if dataset.get("kind") == "icc" and dataset.get("head_id")]
-        return {"items": items, "activityOptions": activity_options, "statuses": sorted(STATUSES)}
+        return {"items": items, "activityOptions": activity_options, "statuses": sorted(STATUSES),
+                "participationBatches": participation_batches}
+
+    @app.post('/api/priority-inferior/participation-batches', status_code=201)
+    def create_participation_batch(payload: CompletionBatchPayload, user=Depends(current_user)):
+        require_edit(user)
+        if payload.board not in {'priority', 'block'}:
+            raise HTTPException(422, '业务板块无效。')
+        name, date = payload.name.strip(), _clean_date(payload.participationDate)
+        with db() as conn:
+            batch_id, timestamp = str(uuid4()), now_iso()
+            conn.execute('''INSERT INTO priority_completion_batches(id,board,name,participation_date,notes,created_by,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?)''', (batch_id, payload.board, name, date, payload.notes.strip(), user['id'], timestamp, timestamp))
+            audit(conn, user, 'priority.participation_batch.created', 'priority_completion_batch', batch_id,
+                  {'board': payload.board, 'name': name, 'participationDate': date})
+        return {'id': batch_id}
+
+    @app.patch('/api/priority-inferior/participation-batches/{completion_batch_id}')
+    def update_participation_batch(completion_batch_id: str, payload: CompletionBatchPayload, user=Depends(current_user)):
+        require_edit(user)
+        if payload.board not in {'priority', 'block'}:
+            raise HTTPException(422, '业务板块无效。')
+        with db() as conn:
+            current = conn.execute('SELECT * FROM priority_completion_batches WHERE id=?', (completion_batch_id,)).fetchone()
+            if not current:
+                raise HTTPException(404, '发车批次不存在。')
+            if current['board'] != payload.board:
+                raise HTTPException(422, '不能将发车批次切换到其他业务板块。')
+            values = (payload.name.strip(), _clean_date(payload.participationDate), payload.notes.strip(), now_iso(), completion_batch_id)
+            conn.execute('UPDATE priority_completion_batches SET name=?,participation_date=?,notes=?,updated_at=? WHERE id=?', values)
+            audit(conn, user, 'priority.participation_batch.updated', 'priority_completion_batch', completion_batch_id,
+                  {'name': values[0], 'participationDate': values[1], 'notes': values[2]})
+        return {'id': completion_batch_id}
 
     @app.post('/api/priority-inferior/product-batches', status_code=201)
     def create_product_batch(payload: ProductBatchPayload, user=Depends(current_user)):
@@ -405,8 +554,8 @@ def install(app: Any, db: Callable, current_user: Callable, now_iso: Callable,
             dates = normalize_dates(conn, payload.activityDates)
             batch_id = str(uuid4())
             timestamp = now_iso()
-            conn.execute("INSERT INTO priority_product_batches(id,name,participation_date,status,notes,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                         (batch_id, name, participation_date, check_status(payload.status), payload.notes.strip(), user["id"], timestamp, timestamp))
+            conn.execute("INSERT INTO priority_product_batches(id,name,participation_date,priority_participation_date,block_participation_date,status,notes,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                         (batch_id, name, participation_date, participation_date, participation_date, check_status(payload.status), payload.notes.strip(), user["id"], timestamp, timestamp))
             write_activities(conn, batch_id, dates, user)
             all_heads, _ = scoped(conn, batch_read_user(user))
             sync_roster(conn, batch_id, all_heads, user)
@@ -427,7 +576,10 @@ def install(app: Any, db: Callable, current_user: Callable, now_iso: Callable,
             if "name" in values:
                 updates["name"] = str(values["name"]).strip()
             if "participationDate" in values:
-                updates["participation_date"] = _clean_date(values["participationDate"])
+                board = values.get('board')
+                if board not in {'priority', 'block'}:
+                    raise HTTPException(422, '请指定要修改日期的业务板块。')
+                updates[f"{board}_participation_date"] = _clean_date(values["participationDate"])
             if "status" in values:
                 updates["status"] = check_status(values["status"])
             if "notes" in values:
@@ -486,24 +638,24 @@ def install(app: Any, db: Callable, current_user: Callable, now_iso: Callable,
 
     @app.patch('/api/priority-inferior/product-batches/{batch_id}/roster/{roster_id}')
     def update_product_batch_roster(batch_id: str, roster_id: str, payload: RosterPayload, user=Depends(current_user)):
-        require_edit(user)
         with db() as conn:
             current = conn.execute('SELECT * FROM priority_batch_roster WHERE id=? AND batch_id=?', (roster_id, batch_id)).fetchone()
             if not current:
                 raise HTTPException(404, '批次客户不存在。')
+            require_roster_edit(conn, current, batch_id, user)
             payload.subjectKey = current['subject_key']
             row = save_roster(conn, batch_id, payload, user)
         return {'item': dict(row)}
 
     @app.post('/api/priority-inferior/product-batches/{batch_id}/roster/{roster_id}/resolve')
     def resolve_product_batch_roster(batch_id: str, roster_id: str, payload: RosterPayload, user=Depends(current_user)):
-        require_edit(user)
         if payload.status not in {'completed', 'abandoned', 'followup', 'none'}:
             raise HTTPException(422, '状态无效。')
         with db() as conn:
             current = conn.execute('SELECT * FROM priority_batch_roster WHERE id=? AND batch_id=?', (roster_id, batch_id)).fetchone()
             if not current:
                 raise HTTPException(404, '批次客户不存在。')
+            require_roster_edit(conn, current, batch_id, user)
             payload.subjectKey = current['subject_key']
             row = save_roster(conn, batch_id, payload, user)
         return {'item': dict(row)}

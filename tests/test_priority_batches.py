@@ -25,7 +25,7 @@ def activity(dataset_key, date, rows):
 
 def test_same_tw_in_one_real_batch_uses_latest_amount_and_keeps_activity_dates():
     conn = db()
-    conn.execute("INSERT INTO priority_product_batches VALUES (?,?,?,?,?,?,?,?)",
+    conn.execute("INSERT INTO priority_product_batches(id,name,participation_date,status,notes,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
                  ("batch-1", "九月优先劣后", "2026-09-20", "进行中", "", "u", "now", "now"))
     for date in ("2026-09-09", "2026-09-16"):
         conn.execute("INSERT INTO priority_batch_activities VALUES (?,?,?,?,?,?)",
@@ -48,7 +48,7 @@ def test_same_tw_in_one_real_batch_uses_latest_amount_and_keeps_activity_dates()
 
 def test_unmatched_same_name_is_never_merged_and_unmapped_activity_is_preserved():
     conn = db()
-    conn.execute("INSERT INTO priority_product_batches VALUES (?,?,?,?,?,?,?,?)",
+    conn.execute("INSERT INTO priority_product_batches(id,name,participation_date,status,notes,created_by,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
                  ("batch-1", "九月优先劣后", "2026-09-20", "筹备中", "", "u", "now", "now"))
     conn.execute("INSERT INTO priority_batch_activities VALUES (?,?,?,?,?,?)",
                  ("a-1", "batch-1", "2026-09-09", "icc:2026-09-09", "u", "now"))
