@@ -1488,3 +1488,23 @@ def test_priority_batch_roster_filters_zero_and_tracks_completion_and_block_shar
         'blockAmount': '200', 'blockActualAmount': '100', 'blockBuyPrice': '2',
     })
     assert done.status_code == 200 and done.json()['item']['block_share_quantity'] == '50.0000'
+
+
+def test_priority_product_roster_falls_back_to_shared_customer_name_when_snapshot_is_blank(client):
+    publish(client, [master(), icc(amount='100')])
+    created = client.post('/api/priority-inferior/product-batches', json={
+        'name': '客户名称回退', 'participationDate': '2026-09-20', 'activityDates': ['2026-09-09'],
+    })
+    assert created.status_code == 201, created.text
+    batch_id = created.json()['id']
+    added = client.post(f'/api/priority-inferior/product-batches/{batch_id}/roster', json={
+        'subjectKey': 'tw:TW2026001', 'board': 'block', 'blockAmount': '200',
+        'twCode': 'TW2026001', 'customerName': '',
+    })
+    assert added.status_code == 201, added.text
+    with main.db() as conn:
+        conn.execute("UPDATE priority_batch_roster SET customer_name='' WHERE batch_id=?", (batch_id,))
+
+    item = client.get('/api/priority-inferior/product-batches').json()['items'][0]
+    assert item['rosterRows'][0]['name'] == '甲'
+    assert item['blockRows'][0]['name'] == '甲'

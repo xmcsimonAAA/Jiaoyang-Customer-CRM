@@ -345,7 +345,7 @@ def install(app: Any, db: Callable, current_user: Callable, now_iso: Callable,
         own_heads, visible = scoped(conn, user)
         allowed = {row['subjectKey'] for row in _activity_rows(own_heads)}
         allowed.update('tw:' + code for code in visible if str(code).startswith('TW'))
-        owner_rows = conn.execute('''SELECT c.id,c.owner_id,c.owner_name,c.customer_code,c.funded_amount,i.normalized_value tw_code
+        owner_rows = conn.execute('''SELECT c.id,c.name,c.wechat_nickname,c.owner_id,c.owner_name,c.customer_code,c.funded_amount,i.normalized_value tw_code
             FROM customers c LEFT JOIN customer_identifiers i ON i.customer_id=c.id AND i.kind='tw'
             WHERE c.archived_at IS NULL''').fetchall()
         owner_rows = attach_funding(conn, [dict(row) for row in owner_rows])
@@ -359,7 +359,9 @@ def install(app: Any, db: Callable, current_user: Callable, now_iso: Callable,
         owner_name = owner.get('owner_name') if owner else row.get('serviceOwner') or '待分配'
         subject = row['subjectKey']
         readable = subject in allowed
-        return dict(row, name=row.get('canonicalName') or row.get('customerName', ''),
+        display_name = (row.get('canonicalName') or row.get('customerName') or owner.get('name')
+                        or owner.get('wechat_nickname') or row.get('twCode') or '身份待确认')
+        return dict(row, name=display_name,
                     subjectKey=subject, batchKey=batch_id, ownerId=owner_id, ownerName=owner_name,
                     funded_amount=owner.get('funded_amount'),
                     funding_source_kind=owner.get('funding_source_kind', ''),
