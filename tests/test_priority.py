@@ -1548,6 +1548,51 @@ def test_priority_batch_roster_filters_zero_and_tracks_completion_and_block_shar
     assert not overview['participationBatches']['priority'][1]['rows']
 
 
+def test_existing_operator_batch_is_a_card_after_upgrade_and_followups_stay_pending(client):
+    from backend.priority_batches import migrate_legacy_participation_batches
+    publish(client, [master(), icc(amount='100')])
+    response = client.post('/api/priority-inferior/product-batches', json={
+        'name': '10.22发车批次', 'participationDate': '2026-10-22', 'activityDates': ['2026-09-09'],
+    })
+    assert response.status_code == 201, response.text
+    with main.db() as conn:
+        conn.execute('DELETE FROM priority_batch_schema_migrations')
+        migrate_legacy_participation_batches(conn, main.now_iso())
+    overview = client.get('/api/priority-inferior/product-batches').json()
+    cards = overview['participationBatches']['priority']
+    assert len(cards) == 1
+    assert (cards[0]['name'], cards[0]['participationDate'], cards[0]['participantCount']) == ('10.22发车批次', '2026-10-22', 0)
+    assert overview['items'][0]['rosterRows'][0]['status'] == 'followup'
+    assert overview['items'][0]['rosterRows'][0]['priority_amount'] == '100'
+
+
+def test_new_departure_batches_all_remain_cards_and_edit_independently(client):
+    ids = {}
+    for board, name, date in (
+        ('priority', '10.22发车批次', '2026-10-22'),
+        ('priority', '第二车', '2026-11-01'),
+        ('priority', '第三车', '2026-11-15'),
+        ('block', '大宗第一车', '2026-10-23'),
+    ):
+        response = client.post('/api/priority-inferior/participation-batches', json={
+            'board': board, 'name': name, 'participationDate': date,
+        })
+        assert response.status_code == 201, response.text
+        ids[name] = response.json()['id']
+    response = client.patch('/api/priority-inferior/participation-batches/' + ids['第二车'], json={
+        'board': 'priority', 'name': '第二车', 'participationDate': '2026-11-05',
+    })
+    assert response.status_code == 200, response.text
+    for _ in range(2):
+        cards = client.get('/api/priority-inferior/product-batches').json()['participationBatches']
+        assert {row['name'] for row in cards['priority']} == {'10.22发车批次', '第二车', '第三车'}
+        assert {row['name']: row['participationDate'] for row in cards['priority']} == {
+            '10.22发车批次': '2026-10-22', '第二车': '2026-11-05', '第三车': '2026-11-15',
+        }
+        assert len(cards['block']) == 1 and cards['block'][0]['participationDate'] == '2026-10-23'
+        assert all(not row['rows'] and row['participantCount'] == 0 for row in cards['priority'])
+
+
 def test_priority_product_roster_falls_back_to_shared_customer_name_when_snapshot_is_blank(client):
     publish(client, [master(), icc(amount='100')])
     created = client.post('/api/priority-inferior/product-batches', json={

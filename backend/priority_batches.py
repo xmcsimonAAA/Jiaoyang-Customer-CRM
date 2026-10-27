@@ -84,6 +84,10 @@ SCHEMA = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_priority_completion_batches_board ON priority_completion_batches(board, participation_date DESC)",
     "CREATE INDEX IF NOT EXISTS idx_priority_batch_roster_batch_status ON priority_batch_roster(batch_id, priority_status, block_status)",
+    """CREATE TABLE IF NOT EXISTS priority_batch_schema_migrations (
+        name TEXT PRIMARY KEY,
+        applied_at TEXT NOT NULL
+    )""",
 ]
 
 STATUSES = {"筹备中", "进行中", "已完成", "已取消"}
@@ -252,6 +256,68 @@ def summarize_batches(conn: Any, all_heads: dict[str, dict[str, Any]], user_scop
     return result
 
 
+def migrate_legacy_participation_batches(conn: Any, timestamp: str) -> None:
+    """Keep operator-created batches as cards without inventing past purchases.
+
+    Older product batches doubled as both activity groups and departure batches.
+    Preserve their names/dates as cards once, and move only completed customers
+    lacking a valid card. Followup rows and explicit assignments stay intact.
+    Read mapping rows by key: PostgreSQL dict rows iterate over column names.
+    """
+    migration = 'operator_batch_cards_v2'
+    if conn.execute('SELECT 1 FROM priority_batch_schema_migrations WHERE name=?', (migration,)).fetchone():
+        return
+    legacy_note = '系统迁移的历史完成客户，可编辑后重新归入发车批次。'
+    sources = [dict(row) for row in conn.execute('SELECT * FROM priority_product_batches').fetchall()]
+    cards = [dict(row) for row in conn.execute('SELECT * FROM priority_completion_batches').fetchall()]
+    malformed = {card['id'] for card in cards
+                 if card['created_by'] == 'system' and card['notes'] == legacy_note
+                 and card['name'] == '历史完成 · name'
+                 and card['participation_date'] in {'priority_participation_date', 'block_participation_date'}}
+    roster = [dict(row) for row in conn.execute('SELECT * FROM priority_batch_roster').fetchall()]
+    for source in sources:
+        source_rows = [row for row in roster if row['batch_id'] == source['id']]
+        for board in ('priority', 'block'):
+            status_col, pointer_col = f'{board}_status', f'{board}_completion_batch_id'
+            if board == 'block' and not any(row[status_col] != 'none' for row in source_rows):
+                continue
+            # Reuse a correctly migrated old card, but never merge manual cards
+            # merely because their names happen to match.
+            candidates = [card for card in cards if card['board'] == board
+                          and card['created_by'] == 'system' and card['notes'] == legacy_note
+                          and card['name'] == f"历史完成 · {source['name']}"
+                          and card['id'] not in malformed
+                          and not any(row[pointer_col] == card['id'] and row['batch_id'] != source['id'] for row in roster)]
+            date = ''
+            for value in (source.get(f'{board}_participation_date'), source['participation_date']):
+                try:
+                    date = _clean_date(value or '')
+                    break
+                except HTTPException:
+                    continue
+            if candidates:
+                card_id = candidates[0]['id']
+                conn.execute('UPDATE priority_completion_batches SET name=?,participation_date=?,notes=?,updated_at=? WHERE id=?',
+                             (source['name'], date, source['notes'], timestamp, card_id))
+            else:
+                card_id = str(uuid4())
+                conn.execute('''INSERT INTO priority_completion_batches
+                    (id,board,name,participation_date,notes,created_by,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?)''',
+                    (card_id, board, source['name'], date, source['notes'], source['created_by'], source['created_at'], timestamp))
+            for row in source_rows:
+                if row[status_col] == 'completed' and (not row[pointer_col] or row[pointer_col] in malformed):
+                    conn.execute(f'UPDATE priority_batch_roster SET {pointer_col}=? WHERE id=?', (card_id, row['id']))
+    # Delete only the exact malformed artifacts created by the buggy migration,
+    # and only after checking that no customer still references them.
+    for card_id in malformed:
+        referenced = conn.execute('''SELECT 1 FROM priority_batch_roster
+            WHERE priority_completion_batch_id=? OR block_completion_batch_id=?''', (card_id, card_id)).fetchone()
+        if not referenced:
+            conn.execute('DELETE FROM priority_completion_batches WHERE id=?', (card_id,))
+    conn.execute('INSERT INTO priority_batch_schema_migrations(name,applied_at) VALUES(?,?)', (migration, timestamp))
+
+
 def install(app: Any, db: Callable, current_user: Callable, now_iso: Callable,
             audit: Callable, heads: Callable, scoped: Callable, require_edit: Callable) -> None:
     with db() as conn:
@@ -274,21 +340,7 @@ def install(app: Any, db: Callable, current_user: Callable, now_iso: Callable,
         for column in ('priority_completion_batch_id', 'block_completion_batch_id'):
             if column not in roster_columns:
                 conn.execute(f"ALTER TABLE priority_batch_roster ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
-        # Preserve existing completed customers by placing them in clearly named
-        # legacy cards, one card per source activity batch and product.
-        for board, status_col, pointer_col, date_col in (
-            ('priority', 'priority_status', 'priority_completion_batch_id', 'priority_participation_date'),
-            ('block', 'block_status', 'block_completion_batch_id', 'block_participation_date'),
-        ):
-            legacy_rows = conn.execute(f'''SELECT r.batch_id,b.name,b.{date_col},COUNT(*) n
-                FROM priority_batch_roster r JOIN priority_product_batches b ON b.id=r.batch_id
-                WHERE r.{status_col}='completed' AND r.{pointer_col}=''
-                GROUP BY r.batch_id,b.name,b.{date_col}''').fetchall()
-            for source_id, source_name, participation_date, _ in legacy_rows:
-                card_id, timestamp = str(uuid4()), now_iso()
-                conn.execute('''INSERT INTO priority_completion_batches(id,board,name,participation_date,notes,created_by,created_at,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?)''', (card_id, board, f"历史完成 · {source_name}", participation_date or '', '系统迁移的历史完成客户，可编辑后重新归入发车批次。', 'system', timestamp, timestamp))
-                conn.execute(f"UPDATE priority_batch_roster SET {pointer_col}=? WHERE batch_id=? AND {status_col}='completed' AND {pointer_col}=''", (card_id, source_id))
+        migrate_legacy_participation_batches(conn, now_iso())
 
     def check_status(status: str | None) -> str:
         value = str(status or "筹备中").strip()
