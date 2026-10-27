@@ -283,14 +283,19 @@ def install(app: Any, db: Callable, current_user: Callable, now_iso: Callable,
                  row.get("canonicalName") or row.get("customerName", ""), priority_amount, block_amount,
                  priority_status, block_status, user["id"], now_iso(), now_iso()))
 
-    def roster_items(conn: Any, batch_id: str, board: str, user: dict[str, Any], owners: dict, allowed: set[str]):
+    def roster_items(conn: Any, batch_id: str, board: str, user: dict[str, Any], owners: dict, allowed: set[str], all_heads: dict[str, dict[str, Any]]):
         status_col = "priority_status" if board == "priority" else "block_status"
         rows = [dict(row) for row in conn.execute(f"SELECT * FROM priority_batch_roster WHERE batch_id=? AND {status_col}!='none' ORDER BY customer_name", (batch_id,)).fetchall()]
+        activity_by_subject = {row['subjectKey']: row for row in rollup_activity(conn, all_heads)['rows']
+                               if row.get('productBatchId') == batch_id}
         result = []
         for row in rows:
             item = dict(row, id=row["id"], subjectKey=row["subject_key"], twCode=row["tw_code"],
                         name=row["customer_name"], agreementAmountUsd=row["priority_amount"],
                         blockAgreementAmountUsd=row["block_amount"], status=row[status_col], batchKey=batch_id)
+            activity = activity_by_subject.get(row['subject_key'], {})
+            item['activityDates'] = activity.get('activityDates') or ([activity['activityDate']] if activity.get('activityDate') else [])
+            item['serviceOwner'] = activity.get('serviceOwner') or activity.get('jiaoyangOwner') or ''
             item.update(roster_row(item, batch_id, user, owners, allowed))
             result.append(item)
         return result
@@ -359,7 +364,7 @@ def install(app: Any, db: Callable, current_user: Callable, now_iso: Callable,
         owner_name = owner.get('owner_name') if owner else row.get('serviceOwner') or '待分配'
         subject = row['subjectKey']
         readable = subject in allowed
-        display_name = (row.get('canonicalName') or row.get('customerName') or owner.get('name')
+        display_name = (row.get('canonicalName') or row.get('customerName') or row.get('name') or owner.get('name')
                         or owner.get('wechat_nickname') or row.get('twCode') or '身份待确认')
         return dict(row, name=display_name,
                     subjectKey=subject, batchKey=batch_id, ownerId=owner_id, ownerName=owner_name,
@@ -382,8 +387,8 @@ def install(app: Any, db: Callable, current_user: Callable, now_iso: Callable,
             for item in items:
                 item['rows'] = [roster_row(row, item['id'], user, owners, allowed) for row in rolled
                                 if row.get('productBatchId') == item['id']]
-                item['rosterRows'] = roster_items(conn, item['id'], 'priority', user, owners, allowed)
-                item['blockRows'] = roster_items(conn, item['id'], 'block', user, owners, allowed)
+                item['rosterRows'] = roster_items(conn, item['id'], 'priority', user, owners, allowed, all_heads)
+                item['blockRows'] = roster_items(conn, item['id'], 'block', user, owners, allowed, all_heads)
             mapped = {row["activity_date"]: row["batch_id"] for row in conn.execute("SELECT activity_date,batch_id FROM priority_batch_activities").fetchall()}
             activity_options = [{"date": dataset['business_date'], "batchId": mapped.get(dataset['business_date']),
                                  "records": len(dataset.get("rows", []))}
@@ -451,8 +456,8 @@ def install(app: Any, db: Callable, current_user: Callable, now_iso: Callable,
             sync_roster(conn, batch_id, all_heads, user)
             rows = [row for row in rollup_activity(conn, all_heads)["rows"] if row.get("productBatchId") == batch_id]
             rows = [roster_row(row, batch_id, user, owners, allowed) for row in rows]
-            followup_rows = roster_items(conn, batch_id, 'priority', user, owners, allowed)
-            block_rows = roster_items(conn, batch_id, 'block', user, owners, allowed)
+            followup_rows = roster_items(conn, batch_id, 'priority', user, owners, allowed, all_heads)
+            block_rows = roster_items(conn, batch_id, 'block', user, owners, allowed, all_heads)
             summary = summarize_batches(conn, all_heads)
             item = next((value for value in summary if value["id"] == batch_id), None)
         return {"item": item or dict(batch), "activityDates": sorted(dates), "rows": rows,
@@ -467,7 +472,7 @@ def install(app: Any, db: Callable, current_user: Callable, now_iso: Callable,
             if not conn.execute('SELECT 1 FROM priority_product_batches WHERE id=?', (batch_id,)).fetchone():
                 raise HTTPException(404, '参与批次不存在。')
             sync_roster(conn, batch_id, all_heads, user)
-            rows = roster_items(conn, batch_id, board, user, owners, allowed)
+            rows = roster_items(conn, batch_id, board, user, owners, allowed, all_heads)
         return {'items': rows, 'board': board}
 
     @app.post('/api/priority-inferior/product-batches/{batch_id}/roster', status_code=201)

@@ -1508,3 +1508,37 @@ def test_priority_product_roster_falls_back_to_shared_customer_name_when_snapsho
     item = client.get('/api/priority-inferior/product-batches').json()['items'][0]
     assert item['rosterRows'][0]['name'] == '甲'
     assert item['blockRows'][0]['name'] == '甲'
+
+
+def test_priority_roster_shows_known_activity_name_for_unmatched_identity(client):
+    # The activity source knows the name, but no TW number can link it to the master list.
+    publish(client, [master(), icc(amount='100', name='陆丽珍', code='')])
+    created = client.post('/api/priority-inferior/product-batches', json={
+        'name': '身份待确认客户', 'participationDate': '2026-09-20', 'activityDates': ['2026-09-09'],
+    })
+    assert created.status_code == 201, created.text
+    batch_id = created.json()['id']
+    with main.db() as conn:
+        conn.execute("UPDATE priority_batch_roster SET customer_name='身份待确认' WHERE batch_id=?", (batch_id,))
+
+    response = client.get('/api/priority-inferior/product-batches').json()
+    item = response['items'][0]
+    assert len(item['rosterRows']) == 1
+    assert item['rosterRows'][0]['name'] == '陆丽珍', repr(item)
+    assert item['rosterRows'][0]['twCode'] == ''
+
+
+def test_priority_roster_exposes_activity_dates_owner_and_current_funding(client):
+    publish(client, [master(), icc(amount='100')])
+    publish(client, [assets()], date='2026-09-11', batches=[])
+    created = client.post('/api/priority-inferior/product-batches', json={
+        'name': '客户信息展示批次', 'participationDate': '2026-09-20', 'activityDates': ['2026-09-09'],
+    })
+    assert created.status_code == 201, created.text
+
+    rows = client.get('/api/priority-inferior/product-batches').json()['items'][0]['rosterRows']
+    assert len(rows) == 1
+    assert rows[0]['activityDates'] == ['2026-09-09']
+    assert rows[0]['ownerName'] == '演示顾问'
+    assert rows[0]['funded_amount'] == 26.37
+    assert rows[0]['funding_source_kind'] == 'asset'
