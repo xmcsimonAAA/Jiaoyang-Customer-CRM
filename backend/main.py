@@ -616,6 +616,9 @@ class ImportCommitPayload(BaseModel):
     confirmHonganActivity: bool = False
     createUnmatchedHonganCustomers: bool = False
     confirmPinyinHolding: bool = False
+    # Broker holding exports are point-in-time full snapshots. When enabled,
+    # customers absent from the newest file receive an explicit zero row.
+    reconcileMissingHoldingRows: bool = False
 
 
 class ImportImpactPayload(ImportCommitPayload):
@@ -4372,6 +4375,7 @@ def commit_pinyin_holding_import(payload: ImportCommitPayload, user: dict[str, A
         matched_by_row = {item["row"]: item for item in diagnostics["matched"]}
         created: list[dict[str, Any]] = []
         updated: list[dict[str, Any]] = []
+        zeroed: list[dict[str, Any]] = []
         unchanged_count = 0
         errors: list[dict[str, Any]] = []
         for index, raw_row in enumerate(payload.rows, start=1):
@@ -4395,9 +4399,45 @@ def commit_pinyin_holding_import(payload: ImportCommitPayload, user: dict[str, A
             else:
                 updated.append({"row": index, "id": customer_id, "customerCode": matched["customerCode"], "changes": {"holdingSnapshot": True}})
                 audit(conn, user, "customer.pinyin_holding_snapshot_saved", "customer", customer_id, {"twCode": matched["twCode"], "pinyinName": matched["pinyinName"]})
+        # The broker export is a full snapshot. A customer absent from the
+        # newest file therefore has zero current shares; preserve history and
+        # write an explicit zero row for the new date.
+        if payload.reconcileMissingHoldingRows:
+            snapshot_rows = {
+                (str(snapshot["snapshotDate"]), str(snapshot["securityName"])): snapshot
+                for raw_row in payload.rows
+                for snapshot in (raw_row.get("holdingSnapshots") or [])
+                if snapshot.get("snapshotDate") and snapshot.get("securityName")
+            }
+            matched_customer_ids = {item["customerId"] for item in diagnostics["matched"]}
+            for (snapshot_date, security_name), snapshot in snapshot_rows.items():
+                prior_customers = conn.execute(
+                    "SELECT DISTINCT customer_id FROM customer_holding_snapshots WHERE security_name=?",
+                    (security_name,),
+                ).fetchall()
+                for prior in prior_customers:
+                    customer_id = prior["customer_id"]
+                    if customer_id in matched_customer_ids:
+                        continue
+                    existing = conn.execute(
+                        "SELECT quantity, market_value FROM customer_holding_snapshots WHERE customer_id=? AND snapshot_date=? AND security_name=?",
+                        (customer_id, snapshot_date, security_name),
+                    ).fetchone()
+                    save_holding_snapshots(conn, customer_id, [{
+                        "snapshotDate": snapshot_date,
+                        "securityName": security_name,
+                        "sourceLabel": snapshot.get("sourceLabel", ""),
+                        "quantity": 0,
+                        "marketValue": 0,
+                    }], user, allow_zero=True)
+                    if not existing or float(existing["quantity"] or 0) != 0 or float(existing["market_value"] or 0) != 0:
+                        zeroed.append({"id": customer_id, "snapshotDate": snapshot_date, "securityName": security_name})
+                        customer = conn.execute("SELECT customer_code FROM customers WHERE id=?", (customer_id,)).fetchone()
+                        updated.append({"row": None, "id": customer_id, "customerCode": customer["customer_code"] if customer else "", "changes": {"holdingSnapshot": "本期缺席，记为 0 股"}})
+                        audit(conn, user, "customer.pinyin_holding_snapshot_zeroed", "customer", customer_id, {"snapshotDate": snapshot_date, "securityName": security_name})
         job_id = str(uuid4())
         job_created_at = datetime.now(timezone.utc).astimezone().isoformat(timespec="microseconds")
-        quality = {"mode": "holding_pinyin", "profile": "holding_pinyin", "pinyin": diagnostics["counts"], "unchangedRows": unchanged_count}
+        quality = {"mode": "holding_pinyin", "profile": "holding_pinyin", "pinyin": diagnostics["counts"], "unchangedRows": unchanged_count, "missingRowsZeroed": len(zeroed)}
         conflicts = [{"row": item["row"], "name": item["pinyinName"], "detail": "拼音对应多个客户，未写入持仓。", "candidates": item["candidates"]} for item in diagnostics["ambiguous"]]
         conflicts.extend({"row": item["row"], "name": item["pinyinName"], "detail": "拼音未匹配客户，未写入持仓。"} for item in diagnostics["unmatched"])
         conn.execute(
@@ -4405,8 +4445,8 @@ def commit_pinyin_holding_import(payload: ImportCommitPayload, user: dict[str, A
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (job_id, payload.filename, UNASSIGNED_OWNER_ID, UNASSIGNED_OWNER["name"], len(payload.rows), 0, len(updated), len(conflicts), len(errors), user["id"], user["name"], job_created_at, json.dumps(quality, ensure_ascii=False), "[]", json.dumps([item["id"] for item in updated], ensure_ascii=False), "[]", json.dumps(review_items, ensure_ascii=False, default=str)),
         )
-        audit(conn, user, "import.pinyin_holding_completed", "import_job", job_id, {"updated": len(updated), "unchanged": unchanged_count, "conflicts": len(conflicts), "errors": len(errors)})
-    return {"jobId": job_id, "mode": "holding_pinyin", "profile": "holding_pinyin", "created": created, "updated": updated, "openedCount": 0, "unchangedCount": unchanged_count, "conflicts": conflicts, "errors": errors, "dataQuality": quality}
+        audit(conn, user, "import.pinyin_holding_completed", "import_job", job_id, {"updated": len(updated), "zeroed": len(zeroed), "unchanged": unchanged_count, "conflicts": len(conflicts), "errors": len(errors)})
+    return {"jobId": job_id, "mode": "holding_pinyin", "profile": "holding_pinyin", "created": created, "updated": updated, "zeroed": zeroed, "openedCount": 0, "unchangedCount": unchanged_count, "conflicts": conflicts, "errors": errors, "dataQuality": quality}
 
 
 WORKFLOW_CUSTOMER_FIELDS = (

@@ -628,6 +628,7 @@ def test_pinyin_holding_preview_writes_only_unique_customer_matches():
             {"twCode": "TW20990801001", "name": "测试匹配客户甲", "accountStatus": "已开通"},
             {"twCode": "TW20990801002", "name": "测试重名客户", "accountStatus": "已开通"},
             {"twCode": "TW20990801003", "name": "测试重名客户", "accountStatus": "已开通"},
+            {"twCode": "TW20990801004", "name": "测试匹配客户乙", "accountStatus": "已开通"},
         ]},
     )
     assert master.status_code == 200, master.text
@@ -641,7 +642,7 @@ def test_pinyin_holding_preview_writes_only_unique_customer_matches():
     rows = [{"name": row["name"], "holdingQuantity": row["qty"], "holdingSnapshots": [{"snapshotDate": "2026-08-28", "securityName": "中阳证券持仓", "sourceLabel": payload["filename"], "quantity": row["qty"], "marketValue": 0}]} for row in body["rows"]]
     denied = client.post("/api/imports/commit", headers=admin_headers, json={"filename": payload["filename"], "importProfile": "holding_pinyin", "rows": rows})
     assert denied.status_code == 422
-    commit = client.post("/api/imports/commit", headers=admin_headers, json={"filename": payload["filename"], "importProfile": "holding_pinyin", "confirmPinyinHolding": True, "rows": rows})
+    commit = client.post("/api/imports/commit", headers=admin_headers, json={"filename": payload["filename"], "importProfile": "holding_pinyin", "confirmPinyinHolding": True, "reconcileMissingHoldingRows": True, "rows": rows})
     assert commit.status_code == 200, commit.text
     result = commit.json()
     assert len(result["updated"]) == 1
@@ -660,6 +661,16 @@ def test_pinyin_holding_preview_writes_only_unique_customer_matches():
     assert resolved.status_code == 200, resolved.text
     remaining = client.get("/api/import-reviews", headers=admin_headers).json()["items"]
     assert all(item["id"] != review["id"] for item in remaining)
+
+    # A later full snapshot that omits the former holder must create a zero
+    # row, so the customer card cannot keep showing the old positive holding.
+    second_rows = [{"name": "CE SHI PI PEI KE HU YI", "holdingQuantity": 10, "holdingSnapshots": [{"snapshotDate": "2026-08-29", "securityName": "中阳证券持仓", "sourceLabel": "SXY SH 20260829.xlsx", "quantity": 10, "marketValue": 0}]}]
+    second = client.post("/api/imports/commit", headers=admin_headers, json={"filename": "SXY SH 20260829.xlsx", "importProfile": "holding_pinyin", "confirmPinyinHolding": True, "reconcileMissingHoldingRows": True, "rows": second_rows})
+    assert second.status_code == 200, second.text
+    assert second.json()["dataQuality"]["missingRowsZeroed"] >= 1
+    latest = client.get(f"/api/customers/{customer_id}", headers=admin_headers).json()["holdingSnapshots"]
+    assert latest[0]["snapshot_date"] == "2026-08-29"
+    assert latest[0]["quantity"] == 0
 
 
 def test_import_wizard_lists_workbook_tabs_and_estimates_changes_without_writing():
