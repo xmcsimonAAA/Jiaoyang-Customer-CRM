@@ -75,3 +75,12 @@ body .field textarea { box-sizing:border-box; width:100%; min-height:112px; padd
 @media(max-width:520px) { .history-grid { grid-template-columns:1fr; } }
 .p-import-option label { display:flex; flex-direction:row; align-items:center; gap:10px; cursor:pointer; color:#263c2f; }
 .p-import-option input[type="checkbox"] { appearance:auto; width:18px; height:18px; min-width:18px; min-height:18px; padding:0; margin:0; flex:none; accent-color:#23392f; }
+.priority-page .priority-roster-search { display:flex; flex-direction:row; align-items:center; gap:10px; max-width:420px; margin:0 0 10px; }
+.priority-roster-search span,.batch-customer-search label { color:#607066; font-size:12px; white-space:nowrap; }
+.priority-page .priority-roster-search input { box-sizing:border-box; width:min(280px,100%); min-width:0; height:38px; padding:7px 10px; }
+.batch-customer-search { display:flex; flex-wrap:wrap; align-items:center; gap:10px; margin:0 0 12px; }
+.batch-customer-search input { box-sizing:border-box; width:min(280px,100%); height:38px; padding:7px 10px; border:1px solid #d4ddd5; border-radius:8px; background:#fff; }
+.directory-table th { white-space:nowrap; }
+.directory-sort { display:inline-flex; align-items:center; gap:6px; padding:5px 3px; border:0; background:transparent; color:inherit; font:inherit; font-weight:inherit; cursor:pointer; }
+.directory-sort:hover,.directory-sort:focus-visible { color:#245b42; }
+.directory-sort span { color:#6f8075; font-size:11px; }
