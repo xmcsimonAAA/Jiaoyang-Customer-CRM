@@ -1,4 +1,5 @@
 from __future__ import annotations
+from backend.business_policy import require_active_placement, guard_placement_changes
 
 import base64
 import csv
@@ -934,7 +935,9 @@ def default_crm_permission_management(user: dict[str, Any]) -> bool:
 
 
 def default_shareholder_report_permission(user: dict[str, Any]) -> bool:
-    return user["rolePermission"] in {"manager", "supervisor", "admin", "developer"}
+    # The report is a management view.  Individual exceptions are still
+    # possible through user_permissions.can_view_shareholder_report.
+    return user["rolePermission"] in {"supervisor", "admin", "developer"}
 
 
 def stored_permission(row: Any | None, column: str, default: bool) -> bool:
@@ -1562,6 +1565,7 @@ def save_batch_participation(
     source_label: str = "手工录入",
     source_row: int | None = None,
 ) -> tuple[dict[str, Any], str]:
+    require_active_placement()
     existing_row = conn.execute(
         "SELECT * FROM batch_participations WHERE batch_id=? AND customer_id=?",
         (batch_id, customer_id),
@@ -1835,6 +1839,7 @@ def create_customer_record(conn: sqlite3.Connection, payload: dict[str, Any], ow
         "source_advisor_label": str(payload.get("sourceAdvisorLabel", payload.get("source_advisor_label", ""))).strip(),
         "notes": str(payload.get("notes", "")).strip(), "created_by": user["id"], "created_at": created_at, "updated_at": created_at, "import_job_id": None,
     }
+    guard_placement_changes(record)
     conn.execute(
         """INSERT INTO customers(id, customer_code, name, phone, email, wechat_nickname, name_pinyin, company, source, source_detail, stage, priority, owner_id, owner_name, owner_team,
         account_status, account_broker, account_opened_at, broker_deposit_amount, capital_destination, intent_status, placement_status, target_batch_id, intent_amount, funded_amount, actual_amount, lost_reason, closed_at, hongan_advisor, source_advisor_label,
@@ -2551,6 +2556,7 @@ def update_customer(customer_id: str, payload: CustomerPatch, user: dict[str, An
         if 'funded_amount' in values:
             conn.execute('UPDATE priority_write_lock SET version=version+1 WHERE id=1')
         current = assert_customer_access(conn, customer_id, user)
+        guard_placement_changes(values, current)
         if current["version"] != expected_version:
             raise HTTPException(409, "客户资料已被其他人更新，请刷新后重试。")
         if "hongan_advisor" in values and not user["canManageAdvisorBindings"]:
@@ -2860,6 +2866,7 @@ def list_batches(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]
 
 @app.post("/api/batches", status_code=201)
 def create_batch(payload: BatchPayload, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    require_active_placement()
     require_supervisor(user)
     if payload.status not in BATCH_STATUSES:
         raise HTTPException(422, "无效的批次状态。")
@@ -2879,6 +2886,7 @@ def create_batch(payload: BatchPayload, user: dict[str, Any] = Depends(current_u
 
 @app.patch("/api/batches/{batch_id}")
 def update_batch(batch_id: str, payload: BatchPatch, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    require_active_placement()
     require_supervisor(user)
     values = payload.model_dump(exclude_none=True)
     mapping = {"closeDate": "close_date", "targetAmount": "target_amount"}
@@ -2964,6 +2972,7 @@ def list_batch_participations(batch_id: str, user: dict[str, Any] = Depends(curr
 
 @app.post("/api/batches/{batch_id}/participations", status_code=201)
 def create_batch_participation(batch_id: str, payload: BatchParticipationPayload, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    require_active_placement()
     require_supervisor(user)
     with db() as conn:
         if not conn.execute("SELECT id FROM placement_batches WHERE id=?", (batch_id,)).fetchone():
@@ -2978,6 +2987,7 @@ def create_batch_participation(batch_id: str, payload: BatchParticipationPayload
 
 @app.patch("/api/batch-participations/{participation_id}")
 def update_batch_participation(participation_id: str, payload: BatchParticipationPatch, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    require_active_placement()
     require_supervisor(user)
     with db() as conn:
         row = conn.execute("SELECT * FROM batch_participations WHERE id=?", (participation_id,)).fetchone()
@@ -3005,6 +3015,7 @@ def update_batch_participation(participation_id: str, payload: BatchParticipatio
 
 @app.delete("/api/batch-participations/{participation_id}")
 def delete_batch_participation(participation_id: str, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    require_active_placement()
     require_supervisor(user)
     with db() as conn:
         row = conn.execute("SELECT * FROM batch_participations WHERE id=?", (participation_id,)).fetchone()
@@ -3033,6 +3044,7 @@ def batch_participation_impact(payload: BatchParticipationImportPayload, user: d
 
 @app.post("/api/batch-participations/import")
 def import_batch_participations(payload: BatchParticipationImportPayload, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    require_active_placement()
     if not user["canImportCustomers"]:
         raise HTTPException(403, "您的账号未开通批量导入权限。")
     require_supervisor(user)
@@ -4025,6 +4037,7 @@ def apply_hongan_activity_selected_values(
             custom_before[field_id] = previous
             custom_changes[f"custom:{field_id}"] = {"from": previous or "", "to": value}
 
+    guard_placement_changes(updates, current)
     changes = {field: {"from": current.get(field), "to": value} for field, value in updates.items()}
     changes.update(custom_changes)
     if not changes:
@@ -4701,6 +4714,7 @@ def placement_workflow_import_preview(
 
 
 def commit_placement_workflow_import(payload: ImportCommitPayload, user: dict[str, Any], profile: str) -> dict[str, Any]:
+    require_active_placement()
     if not payload.rows:
         raise HTTPException(422, "请至少保留一条名单记录。")
     with db() as conn:
@@ -5247,6 +5261,7 @@ def resolve_import_review(review_id: str, payload: ImportReviewResolvePayload, u
 def rollback_placement_workflow_job(
     conn: sqlite3.Connection, job: Any, quality: dict[str, Any], user: dict[str, Any], job_id: str,
 ) -> dict[str, Any]:
+    require_active_placement()
     snapshots = quality.get("workflowSnapshots") or {}
     restored: list[dict[str, Any]] = []
     protected: list[dict[str, Any]] = []

@@ -38,6 +38,9 @@ ICC_HEADER_FIELDS = {
     '签署优先劣后协议': 'agreementSigned',
     '优先劣后金额': 'agreementAmountUsd',
     '优先劣后协议金额': 'agreementAmountUsd',
+    '购买计划金额': 'agreementAmountUsd',
+    '购买计划协议金额': 'agreementAmountUsd',
+    '共同购买计划金额': 'agreementAmountUsd',
     '骄阳负责人': 'jiaoyangOwner',
     '备注说明': 'notes',
     '备注': 'notes',
@@ -120,13 +123,16 @@ def asset_summary(workbook, sheet):
         amount = summary_number(count_row.get('share'))
         if amount is None:
             amount = summary_number(count_row.get('note'))
-        if amount is None:
+        if amount is None and amount_label != count_label:
             amount = summary_number(cell(amount_label, first, last).get('value'))
         return dict(count=summary_number(count_row.get('value')), amount=amount)
 
     def note_number(label, pattern, first=0, last=120):
         match = re.search(pattern, text(cell(label, first, last).get('note')))
         return summary_number(match.group(1)) if match else None
+
+    price_row = next((entry for entries in cells.values() for entry in entries if '持仓市值' in entry['label'] and re.search(r'[$＄]\s*([\d.]+)\s*/股', entry['label'])), {})
+    price_match = re.search(r'[$＄]\s*([\d.]+)\s*/股', price_row.get('label', ''))
 
     return dict(
         assetBuckets=buckets,
@@ -155,10 +161,11 @@ def asset_summary(workbook, sheet):
             holders=summary_number(cell('持仓人数', 40, 45).get('value')),
             holderShare=summary_number(cell('持仓人数占比', 40, 45).get('value')),
             quantity=summary_number(cell('持仓股数', 40, 45).get('value')),
-            marketValue=summary_number(cell('持仓市值：$8.74/股', 40, 45).get('value')),
+            marketValue=summary_number(price_row.get('value')),
             blockHolders=note_number('持仓人数', r'大宗\s*(\d+)\s*人', 40, 45),
             blockQuantity=note_number('持仓股数', r'大宗[^\d]*(\d+)[^\d]*股', 40, 45),
-            price='8.74',
+            price=price_match.group(1) if price_match else None,
+            priceSourceLabel=price_row.get('label', ''),
         ),
         promisePlan=dict(
             signed=pair('意向签约人数', '意向签约人数', 46, 50),
@@ -252,7 +259,7 @@ def _parse(workbook, filename, as_of, batch_dates):
         for batch_date, sheet in selected:
             raw = workbook.rows(sheet)
             header = next(((i, row) for i, row in raw[:20] if '客户姓名' in {normalized(v) for v in row.values()}
-                           and '优先劣后金额' in {normalized(v) for v in row.values()}), None)
+                           and any(ICC_HEADER_FIELDS.get(normalized(v)) == 'agreementAmountUsd' for v in row.values())), None)
             if not header:
                 raise HTTPException(422, f'{sheet[0]} 不是已识别的港安 ICC 格式。')
             # Map known labels by name. The simplified template deliberately
@@ -320,22 +327,34 @@ def _parse(workbook, filename, as_of, batch_dates):
     totals = defaultdict(list)
     holding_mode = 'secondary'
     groups = defaultdict(list)
+    pending_holdings = []
+
+    def flush_holdings(mode):
+        for record in pending_holdings:
+            record['holdingType'] = mode
+            groups[record['twCode']].append(record)
+        pending_holdings.clear()
+
     for index, values in raw:
         if index <= header[0]:
             continue
         marker = normalized(values.get('A'))
-        if kind == 'secondary' and '大宗' in marker:
-            holding_mode = 'block'
-            if text(values.get(quantity_col)):
-                totals[holding_mode].append(number(values[quantity_col], '大宗持仓合计', nonnegative=True, integer=True))
-            continue
-        if kind == 'secondary' and '二级买入' in marker:
-            holding_mode = 'secondary'
-            if text(values.get(quantity_col)):
-                totals[holding_mode].append(number(values[quantity_col], '二级持仓合计', nonnegative=True, integer=True))
+        marker_mode = ('block' if '大宗' in marker else 'priority' if any(term in marker for term in ('购买计划', '优先劣后', '协议')) else 'secondary' if '二级' in marker else None)
+        if kind == 'secondary' and marker_mode:
+            # SXY labels each section AFTER its detail rows (e.g. 大宗累计).
+            # Also retain support for a section heading BEFORE its details.
+            total = text(values.get(quantity_col))
+            if total or any(term in marker for term in ('累计', '合计', '总计')):
+                flush_holdings(marker_mode)
+                if total:
+                    totals[marker_mode].append(number(total, '分类持仓合计', nonnegative=True, integer=True))
+            else:
+                flush_holdings(holding_mode)
+            holding_mode = marker_mode
             continue
         if kind == 'secondary' and not text(values.get('A')) and not text(values.get(name_col)):
             if text(values.get(quantity_col)):
+                flush_holdings(holding_mode)
                 totals[holding_mode].append(number(values[quantity_col], '持仓合计', nonnegative=True, integer=True))
             continue
         if not any(text(v) for v in values.values()):
@@ -353,7 +372,11 @@ def _parse(workbook, filename, as_of, batch_dates):
                 r['holdingType'] = holding_mode
             if r[field] is None:
                 raise HTTPException(422, f'{sheet[0]} 第 {index} 行缺少数值；空白不能作为零。')
-        groups[code].append(r)
+        if kind == 'secondary':
+            pending_holdings.append(r)
+        else:
+            groups[code].append(r)
+    flush_holdings(holding_mode)
     for code, items in groups.items():
         if kind == 'master' and len(items) > 1:
             raise HTTPException(422, f'{sheet[0]} 中 {code} 重复，需核对后重传。')
@@ -367,15 +390,16 @@ def _parse(workbook, filename, as_of, batch_dates):
             if kind == 'secondary':
                 r['secondaryQuantity'] = sum_values(x[field] for x in items if x.get('holdingType') == 'secondary')
                 r['blockQuantity'] = sum_values(x[field] for x in items if x.get('holdingType') == 'block')
+                r['priorityQuantity'] = sum_values(x[field] for x in items if x.get('holdingType') == 'priority')
                 types = sorted({x.get('holdingType') for x in items if x.get('holdingType')})
                 r['holdingTypes'] = types
                 r['holdingType'] = types[0] if len(types) == 1 else 'mixed'
         records.append(r)
     if kind == 'secondary':
         for mode, mode_totals in totals.items():
-            detail_total = sum_values(r.get('blockQuantity' if mode == 'block' else 'secondaryQuantity', 0) for r in records)
+            detail_total = sum_values(r.get(mode + 'Quantity', 0) for r in records)
             if mode_totals and any(Decimal(total) != Decimal(detail_total) for total in mode_totals):
-                label = '大宗' if mode == 'block' else '二级'
+                label = {'block': '大宗', 'priority': '购买计划', 'secondary': '二级'}[mode]
                 raise HTTPException(422, f'{label}持仓明细股数与表尾合计不一致，请核对来源文件。')
     if not records:
         raise HTTPException(422, f'{filename} 没有可导入记录。')

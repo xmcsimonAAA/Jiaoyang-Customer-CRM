@@ -32,28 +32,22 @@ function shareholderDonut(items, centerValue, centerLabel, palette) {
   return `<div class="report-donut-wrap"><svg class="report-donut" viewBox="0 0 140 140" role="img" aria-label="资产分层占比"><circle class="report-donut-track" cx="70" cy="70" r="${radius}"/><g>${rings}</g></svg><div class="report-donut-center"><strong>${esc(centerValue)}</strong><span>${esc(centerLabel)}</span></div></div>`;
 }
 
-function shareholderSparkline(trend, key, stroke, formatter) {
-  const values = trend.map(item => item[key] === null || item[key] === undefined ? null : Number(item[key]));
-  const available = values.map((value, index) => value === null ? null : [index, value]).filter(Boolean);
-  if (!available.length) return `<div class="report-chart-empty">暂无可绘制的来源数据</div>`;
-  const width = 720;
-  const height = 188;
-  const left = 18;
-  const right = 18;
-  const top = 18;
-  const bottom = 30;
-  const max = Math.max(...available.map(item => item[1]), 1);
-  const min = Math.min(...available.map(item => item[1]), 0);
-  const span = Math.max(max - min, 1);
-  const x = index => left + (width - left - right) * index / Math.max(values.length - 1, 1);
-  const y = value => top + (height - top - bottom) * (1 - (value - min) / span);
-  const points = available.map(([index, value]) => `${x(index).toFixed(1)},${y(value).toFixed(1)}`).join(' ');
-  const areaPoints = `${points} ${x(available[available.length - 1][0]).toFixed(1)},${height - bottom} ${x(available[0][0]).toFixed(1)},${height - bottom}`;
-  const grid = [0, .25, .5, .75, 1].map(fraction => `<line x1="${left}" x2="${width - right}" y1="${top + (height - top - bottom) * fraction}" y2="${top + (height - top - bottom) * fraction}"/>`).join('');
-  const dots = available.map(([index, value]) => `<circle cx="${x(index).toFixed(1)}" cy="${y(value).toFixed(1)}" r="3.6"/>`).join('');
-  const labels = [0, Math.floor((values.length - 1) / 2), values.length - 1].filter((index, position, array) => values[index] !== null && array.indexOf(index) === position).map(index => `<span style="left:${(x(index) / width * 100).toFixed(2)}%">${esc(String(trend[index].date || '').slice(5))}</span>`).join('');
-  const latest = available[available.length - 1][1];
-  return `<div class="report-chart-value"><strong>${esc(formatter(latest))}</strong><span>最新来源快照</span></div><div class="report-sparkline"><svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="趋势图"><g class="report-chart-grid">${grid}</g><polygon class="report-spark-area" points="${areaPoints}" fill="${stroke}"/><polyline class="report-spark-line" points="${points}" stroke="${stroke}"/> <g class="report-spark-dots" fill="${stroke}">${dots}</g></svg><div class="report-chart-labels">${labels}</div></div>`;
+function shareholderSparkline(trend,key,stroke,formatter) {
+  const values=trend.map(item=>item[key]==null?null:Number(item[key]));
+  const available=values.map((v,i)=>v==null?null:[i,v]).filter(Boolean);
+  if(!available.length)return '<div class="report-chart-empty">暂无可绘制的来源数据</div>';
+  const width=560,height=180,left=55,right=25,top=16,bottom=30;
+  const times=trend.map(r=>Date.parse(r.date)),start=Math.min(...times),span=Math.max(1,Math.max(...times)-start);
+  const min=Math.min(0,...available.map(r=>r[1])),max=Math.max(1,...available.map(r=>r[1])),range=Math.max(1,max-min);
+  const x=i=>left+(width-left-right)*(times[i]-start)/span,y=v=>top+(height-top-bottom)*(1-(v-min)/range);
+  const short=v=>Math.abs(v)>=1e6?`${(v/1e6).toFixed(1)}m`:Math.abs(v)>=1e4?`${(v/1e4).toFixed(1)}万`:shareholderNumber(v);
+  const grid=[0,.5,1].map(f=>{const value=min+range*f;return `<line x1="${left}" x2="${width-right}" y1="${y(value)}" y2="${y(value)}"/><text x="${left-8}" y="${y(value)+3}" text-anchor="end" fill="#8995a1" stroke="none" font-size="9">${esc(short(value))}</text>`;}).join('');
+  const segments=[];let current=[];
+  values.forEach((v,i)=>{if(v==null){if(current.length)segments.push(current);current=[];}else current.push([i,v]);});if(current.length)segments.push(current);
+  const lines=segments.map(points=>`<polyline class="report-spark-line" points="${points.map(([i,v])=>`${x(i)},${y(v)}`).join(' ')}" stroke="${stroke}"/>`).join('');
+  const dots=available.map(([i,v])=>`<circle cx="${x(i)}" cy="${y(v)}" r="3.4"><title>${esc(trend[i].date)}：${esc(formatter(v))}</title></circle>`).join('');
+  const labels=[available[0][0],available[Math.floor((available.length-1)/2)][0],available.at(-1)[0]].filter((v,i,arr)=>arr.indexOf(v)===i).map(i=>`<text x="${x(i)}" y="${height-9}" text-anchor="middle" fill="#8995a1" font-size="9">${esc(trend[i].date.slice(5))}</text>`).join('');
+  return `<div class="report-chart-value"><strong>${esc(formatter(available.at(-1)[1]))}</strong><span>${esc(trend[available.at(-1)[0]].date)} · ${available.length} 个时点</span></div><div class="report-sparkline"><svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${esc(key)}历史趋势"><g class="report-chart-grid">${grid}</g>${lines}<g class="report-spark-dots" fill="${stroke}">${dots}</g>${labels}</svg></div>`;
 }
 
 function shareholderFunnel(items, maxValue) {
@@ -75,82 +69,65 @@ function shareholderAmountBridge(onsite) {
   return `<div class="report-bridge">${items.map(([label, amount, tone]) => `<div class="report-bridge-item"><div class="report-bridge-bar"><i class="${tone}" style="height:${Math.max(8, Math.round((Number(amount) || 0) / max * 124))}px"></i></div><strong>${shareholderMoney(amount)}</strong><span>${label}</span></div>`).join('')}</div>`;
 }
 
+
 function shareholderReportMarkup(data, {standalone = false} = {}) {
-  const k = data.kpis || {};
-  const a = data.assets || {};
-  const f = data.funnel || {};
-  const h = data.holdings || {};
-  const p = data.priority || {};
-  const trend = data.trend || [];
-  const bucketPalette = ['#d8ef72', '#91bd68', '#6aa994', '#5b8f94', '#516f7e', '#d86f68'];
-  const bucketTotal = a.buckets?.reduce((sum, item) => sum + Number(item.count || 0), 0) || 0;
-  const assetLegend = (a.buckets || []).map((item, index) => `<div class="report-legend-row"><i style="background:${bucketPalette[index % bucketPalette.length]}"></i><span>${esc(item.label)}</span><strong>${shareholderNumber(item.count)} <small>${shareholderPercent(item.share)}</small></strong></div>`).join('');
-  const funnelItems = [
-    {label:'注册开户', count:f.registration?.total, note:'客户名单 / 注册口径'},
-    {label:'开户成功', count:f.registration?.opened, note:shareholderPercent(f.registration?.rate)},
-    {label:'资产入金', count:a.fundedAccounts, note:shareholderPercent(a.activationRate)},
-    {label:'现场签约', count:f.onsite?.signed?.count, note:'定增（含大宗）'},
-    {label:'现场转化', count:f.onsite?.converted?.count, note:'已形成实际参与'},
-  ];
-  const sourceLines = Object.entries(data.sourceDates || {}).filter(([, value]) => value).map(([key, value]) => `<span>${esc({master:'开户名单',assets:'资产明细',secondary:'XMAX 持仓',icc:'优先劣后'}[key] || key)} · ${esc(shareholderDateLabel(value))}</span>`).join('');
-  const asOfOptions = [...new Set((data.reportDates || trend.map(item => item.date)).filter(Boolean))].sort().reverse().map(value => `<option value="${esc(value)}" ${value === data.asOf ? 'selected' : ''}>${esc(shareholderDateLabel(value))}</option>`).join('');
-  const top10Text = a.top10Share === null || a.top10Share === undefined ? '暂无' : shareholderPercent(a.top10Share, 1);
-  return `<div class="shareholder-report" id="shareholder-report-page">
-    <header class="shareholder-hero">
-      <div class="shareholder-hero-top"><div><div class="shareholder-kicker">JY INVESTOR BRIEFING / 2026</div><h3>港安客户资产与业务经营报告</h3><p>将资产结构、开户效率与产品转化放在同一张经营地图中。</p></div><div class="shareholder-hero-mark"><span>JY</span><small>CONFIDENTIAL</small></div></div>
-      ${standalone ? '' : `<div class="shareholder-controls"><label>报告时点<select id="shareholder-as-of">${asOfOptions || `<option value="${esc(data.asOf)}">${esc(shareholderDateLabel(data.asOf))}</option>`}</select></label><button class="report-action report-action-light" id="download-shareholder-report" type="button">↓ 下载报告</button><button class="report-action report-action-outline" id="print-shareholder-report" type="button">打印 / PDF</button></div>`}
-      <div class="shareholder-hero-meta"><span>报告时点 <b>${esc(shareholderDateLabel(data.asOf))}</b></span><span>数据范围 <b>${esc(data.scope || '当前账号可见范围')}</b></span><span>源数据 <b>${sourceLines || '暂无已上传快照'}</b></span></div>
-    </header>
-    <section class="report-kpi-grid">
-      <article class="report-kpi report-kpi-featured"><span>实时总资产</span><strong>${shareholderMoney(k.assetAum)}</strong><small>${a.accounts == null ? '暂无资产来源' : `明细 ${shareholderNumber(a.accounts)} 个账户 · 入金 ${shareholderPercent(a.activationRate)}`}</small></article>
-      <article class="report-kpi"><span>注册 → 开户成功</span><strong>${shareholderPercent(k.accountSuccessRate)}</strong><small>${shareholderNumber(k.opened)} / ${shareholderNumber(k.customers)} 人</small></article>
-      <article class="report-kpi"><span>定增已转化金额</span><strong>${shareholderMoney(k.placementConvertedAmount)}</strong><small>${shareholderNumber(f.onsite?.converted?.count)} 人已形成实际参与</small></article>
-      <article class="report-kpi"><span>XMAX 持仓</span><strong>${shareholderNumber(h.quantity)} <em>股</em></strong><small>${shareholderNumber(h.holders)} 人 · 市值 ${h.marketValue == null ? '未提供' : shareholderMoney(h.marketValue)}</small></article>
-      <article class="report-kpi"><span>优先劣后协议金额</span><strong>${shareholderMoney(p.agreementUsd)}</strong><small>${shareholderNumber(p.participants)} 位已匹配参与客户</small></article>
-    </section>
-    <section class="report-grid report-grid-top">
-      <article class="report-panel report-panel-asset"><header class="report-panel-head"><div><span class="report-eyebrow">ASSET COMPOSITION</span><h4>客户资产分层</h4><p>高净值资产与未激活账户的结构对照</p></div><strong class="report-panel-value">${shareholderPercent(a.activationRate)}</strong></header><div class="report-asset-body">${shareholderDonut(a.buckets || [], shareholderPercent(a.activationRate, 1), '入金率', bucketPalette)}<div class="report-legend">${assetLegend || '<div class="report-chart-empty">暂无资产分层来源</div>'}</div></div><footer class="report-panel-foot"><span>前 10 大客户占资产</span><b>${top10Text}</b><span>快照账户合计 ${shareholderNumber(bucketTotal)} 个</span></footer></article>
-      <article class="report-panel report-panel-funnel"><header class="report-panel-head"><div><span class="report-eyebrow">CONVERSION FUNNEL</span><h4>从客户进入到实际参与</h4><p>每一步都保留源数据，不以缺失指标补齐漏斗</p></div><span class="report-chip">${esc(shareholderDateLabel(data.asOf))}</span></header>${shareholderFunnel(funnelItems, f.registration?.total)}<div class="report-funnel-callout"><span>最大提升空间</span><strong>${a.activationRate !== null && a.activationRate !== undefined && Number(a.activationRate) < 70 ? '资产激活' : '现场签约转化'}</strong><small>建议围绕低占比环节配置下一周期跟进</small></div></article>
-    </section>
-    <section class="report-grid report-grid-middle">
-      <article class="report-panel report-panel-trend"><header class="report-panel-head"><div><span class="report-eyebrow">MULTI-SNAPSHOT TREND</span><h4>客户池与资产动能</h4><p>按上传快照日期绘制，空缺日期保持空白</p></div><div class="report-inline-legend"><span><i class="legend-dot legend-dot-teal"></i>资产总额</span><span><i class="legend-dot legend-dot-lime"></i>客户数</span></div></header><div class="report-trend-grid"><div>${shareholderSparkline(trend, 'assetAum', '#5b9b8d', shareholderMoney)}</div><div>${shareholderSparkline(trend, 'customers', '#c2db5f', shareholderNumber)}</div></div></article>
-      <article class="report-panel report-panel-bridge"><header class="report-panel-head"><div><span class="report-eyebrow">CAPITAL BRIDGE</span><h4>定增现场金额桥</h4><p>签约金额拆解为已转化、已放弃 / 转二级与待转化</p></div><span class="report-chip">USD</span></header>${shareholderAmountBridge(f.onsite || {})}<div class="report-bridge-total"><span>签约总额</span><strong>${shareholderMoney(f.onsite?.signed?.amount)}</strong><small>已转化占签约金额 ${f.onsite?.signed?.amount ? shareholderPercent(f.onsite.converted.amount / f.onsite.signed.amount * 100, 1) : '—'}</small></div></article>
-    </section>
-    <section class="report-grid report-grid-bottom">
-      <article class="report-panel report-panel-holdings"><header class="report-panel-head"><div><span class="report-eyebrow">XMAX POSITION</span><h4>持仓结构与产品信号</h4><p>${h.available ? `持仓 ${shareholderNumber(h.quantity)} 股 · 市值 ${h.marketValue == null ? '未提供' : shareholderMoney(h.marketValue)}${h.price ? ` @ $${h.price}/股` : ''}` : '尚未上传持仓快照'}</p></div><strong class="report-panel-value">${shareholderNumber(h.holders)}<small> 位持仓客户</small></strong></header><div class="report-holding-metrics"><div><span>二级买入</span><strong>${shareholderNumber(h.secondaryQuantity)}</strong><small>${shareholderNumber(h.secondaryHolders)} 位</small></div><div><span>大宗交易</span><strong>${shareholderNumber(h.blockQuantity)}</strong><small>${shareholderNumber(h.blockHolders)} 位</small></div><div><span>持仓占开户</span><strong>${h.holders != null && k.opened ? shareholderPercent(h.holders / k.opened * 100, 1) : '—'}</strong><small>以开户成功数为分母</small></div></div><div class="report-holding-bar"><i style="width:${h.quantity ? Math.min(100, Number(h.secondaryQuantity || 0) / Number(h.quantity) * 100) : 0}%"></i></div><div class="report-holding-bar-label"><span>二级</span><span>大宗</span></div></article>
-      <article class="report-panel report-panel-insights"><header class="report-panel-head"><div><span class="report-eyebrow">EXECUTIVE READOUT</span><h4>经营解读</h4><p>用数据指出下一步应关注的经营动作</p></div><span class="report-chip">BOARD VIEW</span></header><div class="report-insight-list">${(data.insights || []).slice(0, 4).map(item => `<div class="report-insight report-insight-${esc(item.tone || 'neutral')}"><i></i><div><strong>${esc(item.title)}</strong><p>${esc(item.body)}</p></div></div>`).join('') || '<div class="report-chart-empty">当前资料不足以生成经营解读</div>'}</div></article>
-      <article class="report-panel report-panel-priority"><header class="report-panel-head"><div><span class="report-eyebrow">PRODUCT MIX</span><h4>优先劣后资金质量</h4><p>协议金额与入金记录分开呈现</p></div><strong class="report-panel-value">${shareholderNumber(p.participants)}<small> 位客户</small></strong></header><div class="report-priority-number"><strong>${shareholderMoney(p.agreementUsd)}</strong><span>协议金额 · USD</span></div><div class="report-priority-rows"><div><span>已有入金记录</span><b>${shareholderNumber(p.fundedAccounts)} 位</b><small>${shareholderMoney(p.depositUsd)}</small></div><div><span>身份待确认金额</span><b>${shareholderNumber(p.pendingIdentities)} 条</b><small>金额已计入协议总额</small></div></div><div class="report-product-submetrics"><div><span>定增单签转化</span><strong>${shareholderNumber(f.singleSign?.converted?.count)} 人</strong><small>${shareholderMoney(f.singleSign?.converted?.amount)}</small></div><div><span>承诺购买待转化</span><strong>${shareholderNumber(f.promisePlan?.pending?.count)} 人</strong><small>${shareholderMoney(f.promisePlan?.pending?.amount)}</small></div></div></article>
-    </section>
-    <footer class="report-footnote"><span>口径说明</span><p>${(data.notes || []).map(note => esc(note)).join(' · ')}</p><small>JY Customer Operations · ${esc(shareholderDateLabel(data.asOf))}</small></footer>
-  </div>`;
+  const k=data.kpis||{}, a=data.assets||{}, h=data.holdings||{}, historical=data.historical||{}, products=data.products||{};
+  const n=shareholderNumber, money=shareholderMoney, pct=shareholderPercent;
+  const colors=['#1c3c60','#315f8c','#4d7fab','#8faec9','#cbdbe7','#e9e5df'];
+  const ratio=(num,den)=>den&&num!=null?pct(num/den*100):'—';
+  const sources=Object.entries(data.sourceDates||{}).filter(([,v])=>v).map(([key,v])=>`${{master:'客户名单',assets:'资产明细',secondary:'分类持仓',icc:'ICC 活动'}[key]} ${shareholderDateLabel(v)}`).join(' · ');
+  const options=[...new Set(data.reportDates||[])].sort().reverse().map(d=>`<option value="${esc(d)}" ${d===data.asOf?'selected':''}>${esc(shareholderDateLabel(d))}</option>`).join('');
+  const section=(num,en,title,description,body,extra='')=>`<section class="brief-section ${extra}"><header class="brief-section-head"><div><span class="brief-eyebrow">${num} / ${en}</span><h4>${title}</h4><p>${description}</p></div></header>${body}</section>`;
+  const productLine=(board,label)=>{const p=products[board]||{}, signed=p.signed||{}, converted=p.converted||{}, pending=p.pending||{}, dropped=p.dropped||{};return `<article class="brief-product"><div><span class="brief-tag">在售</span><h5>${label}</h5><p>意向 ${n(signed.count)} 人 / ${money(signed.amount)}</p></div><div class="brief-product-value"><strong>${money(converted.amount)}</strong><span>${n(converted.count)} 人已完成 · 金额 ${ratio(converted.amount,signed.amount)}</span></div><div class="brief-stacked"><i style="width:${signed.amount?Math.min(100,(p.convertedIntentAmount||0)/signed.amount*100):0}%"></i></div><p>待转化 ${n(pending.count)} 人 / ${money(pending.amount)}${dropped.count?` · 已放弃 ${n(dropped.count)} 人 / ${money(dropped.amount)}`:''}</p>${p.historicalWorkflowUnavailable?'<p class="brief-review">该时点成交状态待核对</p>':''}</article>`;};
+  const rows=(a.buckets||[]).map(b=>`<tr><th scope="row">${esc(b.label)}</th><td>${n(b.count)}</td><td>${pct(b.share)}</td><td>${money(b.amount,2)}</td><td>${pct(b.assetShare)}<span class="brief-mini-bar"><i style="width:${Math.max(0,Math.min(100,b.assetShare||0))}%"></i></span></td></tr>`).join('');
+  const donut=(a.buckets||[]).filter(b=>b.amount>0).map(b=>({...b,count:b.amount}));
+  const topTwo=(a.buckets||[]).slice(0,2), topTwoAmount=a.totalUsd==null?null:topTwo.reduce((s,b)=>s+Number(b.amount||0),0), topTwoCount=a.accounts==null?null:topTwo.reduce((s,b)=>s+Number(b.count||0),0);
+  const assetBody=`<div class="brief-asset-layout"><div>${shareholderDonut(donut,n(a.accounts),'账户数 · 按资产金额分布',colors)}<div class="brief-legend">${donut.map((b,i)=>`<div><i style="background:${colors[i]}"></i><span>${esc(b.label)}</span><b>${pct(b.assetShare)}</b></div>`).join('')}</div></div><div class="brief-table-wrap"><table class="brief-table"><thead><tr><th>资产分层</th><th>账户数</th><th>账户占比</th><th>资产合计 · USD</th><th>资产占比</th></tr></thead><tbody>${rows}<tr class="brief-total"><th>合计</th><td>${n(a.accounts)}</td><td>${a.accounts?'100.00%':'—'}</td><td>${money(a.totalUsd,2)}</td><td>${a.totalUsd?'100.00%':'—'}</td></tr></tbody></table></div></div><div class="brief-readouts"><div><span>PARETO</span><p>前两档合计 ${n(topTwoCount)} 个账户，占 ${ratio(topTwoCount,a.accounts)}，持有 ${money(topTwoAmount)}、全表 ${ratio(topTwoAmount,a.totalUsd)} 的资产。</p></div><div><span>CONCENTRATION</span><p>前十大客户按 TW 合并账户计算，持有 ${money(a.top10Usd)}，占净资产 ${pct(a.top10Share)}。</p></div><div><span>DEFINITIONS</span><p>资产净额保留负数；开户人数按 TW 去重。账户分布与人数分别呈现。</p></div></div>`;
+  const funnelRows=[['注册开户',k.customers,'客户名单 / 注册口径',k.customers],['开户成功',k.opened,'资产表中有数值的 TW，合并重复账户',k.customers],['资产入金',a.fundedAccounts,'正资产账户数；与客户人数口径分开',a.accounts]];
+  const funnelBody=`<div class="brief-funnel">${funnelRows.map(([label,count,note,den])=>`<div><div><b>${label}</b><small>${note}</small></div><span class="brief-funnel-track"><i style="width:${den?Math.min(100,(count||0)/den*100):0}%"></i></span><div><strong>${n(count)} <small>${label==='资产入金'?'个账户':'人'}</small></strong><small>${ratio(count,den)} · ${label==='资产入金'?'占资产账户':'占注册客户'}</small></div></div>`).join('')}</div><div class="brief-product-grid">${productLine('priority','购买计划')}${productLine('block','大宗交易')}</div>`;
+  const bridgeBody=`<p class="brief-section-note">历史产品 · 已停售，单独留档，不并入当前客户资产</p><div class="brief-capital-grid">${[['签约总额','signed'],['已参与','converted'],['放弃','dropped'],['待转化','pending']].map(([label,key])=>`<div><span>${label}</span><strong>${money(historical[key]?.amount)}</strong><small>${n(historical[key]?.count)} 人${key==='converted'?` · 金额参与率 ${ratio(historical[key]?.amount,historical.signed?.amount)}`:''}</small></div>`).join('')}</div>`;
+  const holdingBody=`<div class="brief-holdings-grid">${[['二级买入','secondary'],['大宗已成交','block'],['购买计划已成交','priority']].map(([label,key],i)=>`<div style="--holding-color:${colors[i]}"><span>${label}</span><strong>${n(h[key+'Quantity'])} <small>股</small></strong><p>${n(h[key+'Holders'])} 位客户</p></div>`).join('')}<div class="brief-holding-total"><span>总持仓 · TW 去重</span><strong>${n(h.quantity)} <small>股</small></strong><p>${n(h.holders)} 位客户 · 占开户 ${ratio(h.holders,k.opened)}</p></div></div><div class="brief-valuation"><strong>${money(h.marketValue)}</strong><span>${h.price==null?'来源未提供估值价格，市值留空':`按 $${n(h.price,4)} / 股估算；非实时报价`}</span></div>`;
+  const trendBody=`<p class="brief-section-note">仅展示已上传的历史快照；日期按真实时间间隔绘制，不补造增长数据。鼠标悬停查看每个时点。</p><div class="brief-trend-grid"><article><h5>开户成功人数</h5>${shareholderSparkline(data.trend||[],'opened',colors[0],v=>`${n(v)} 人`)}</article><article><h5>客户资产净额 · USD</h5>${shareholderSparkline(data.trend||[],'assetAum',colors[1],money)}</article><article><h5>二级持仓 · 股</h5>${shareholderSparkline(data.trend||[],'secondaryQuantity',colors[2],n)}</article><article><h5>购买计划持仓 · 股</h5>${shareholderSparkline(data.trend||[],'priorityQuantity','#9b783d',n)}</article></div>`;
+  const reviews=(data.checks||[]).filter(c=>c.status!=='pass');
+  const controlBody=`<div class="brief-control-summary ${reviews.length?'brief-review':''}"><strong>${reviews.length?`${reviews.length} 项待核对`:'已通过现有勾稽检查'}</strong><span>${data.adjustments?.length?`${data.adjustments.length} 项人工修订已应用`:'当前使用系统计算值'}</span></div><div class="brief-check-list">${(data.checks||[]).map(c=>`<div class="${c.status==='pass'?'':'brief-review'}"><span>${c.status==='pass'?'✓':'!'}</span><p>${esc(c.label)}</p>${c.difference==null?'':`<b>${c.status==='pass'?'一致':`差额 ${n(c.difference,2)}`}</b>`}</div>`).join('')}</div>${data.adjustments?.length?`<table class="brief-table brief-corrections"><thead><tr><th>人工修订指标</th><th>采用值</th><th>依据 / 原因</th><th>修订人</th></tr></thead><tbody>${data.adjustments.map(c=>`<tr><th>${esc(data.correctionOptions?.find(o=>o.key===c.metric)?.label||c.metric)}</th><td>${n(c.value,4)}</td><td>${esc(c.source)}<small>${esc(c.reason)}</small></td><td>${esc(c.author_name)}<small>${esc(c.created_at?.slice(0,10)||'')}</small></td></tr>`).join('')}</tbody></table>`:''}`;
+  return `<div class="shareholder-report brief-report" id="shareholder-report-page"><header class="shareholder-hero"><div class="brief-eyebrow">JY INVESTOR BRIEFING / ${esc(data.asOf?.slice(0,4)||'')}</div><h3>港安客户资产与业务经营报告</h3><p>资产结构、客户转化与在售产品的经营全景</p><div class="shareholder-hero-meta"><span class="brief-confidential">JY CONFIDENTIAL</span><span>报告时点 <b>${esc(shareholderDateLabel(data.asOf))}</b></span><span>数据范围 <b>${esc(data.scope)}</b></span><span>来源 ${esc(sources||'暂无已上传来源')}</span></div>${standalone?'':`<div class="shareholder-controls"><label>报告时点<select id="shareholder-as-of">${options||`<option>${esc(data.asOf)}</option>`}</select></label><button class="report-action report-action-light" id="download-shareholder-report">↓ 下载完整报告</button><button class="report-action report-action-outline" id="print-shareholder-report">打印 / 保存 PDF</button>${data.canEdit?'<button class="report-action report-action-outline" id="correct-shareholder-report">修订报告数据</button>':''}</div>`}</header><section class="report-kpi-grid">${[
+    ['客户资产净额',money(k.assetAum),`${n(a.accounts)} 个账户 · 正资产合计 ${money(a.positiveUsd)}`],
+    ['注册 → 开户成功',pct(k.accountSuccessRate),`${n(k.opened)} / ${n(k.customers)} 人`],
+    ['历史定增已参与',money(historical.converted?.amount),`${n(historical.converted?.count)} 人 · 已停售`],
+    ['XMAX 总持仓',n(h.quantity),`${n(h.holders)} 人 · 市值 ${money(h.marketValue)}`],
+    ['购买计划意向',money(products.priority?.signed?.amount),`${n(products.priority?.signed?.count)} 人 · 已完成 ${n(products.priority?.converted?.count)} 人`]
+  ].map(([label,value,note])=>`<article class="report-kpi"><span>${label}</span><strong>${value}</strong><small>${note}</small></article>`).join('')}</section>${section('01','ASSET COMPOSITION','客户资产分层','账户数量与资产贡献并列展示，保留零资产及负资产。',assetBody)}${section('02','CONVERSION FUNNEL','从客户进入到实际参与','客户漏斗与产品线分别使用自己的分母；意向与实际成交分别呈现。',funnelBody)}${section('03','CAPITAL BRIDGE','历史定增金额桥','签约总额与已参与、放弃、待转化进行勾稽。',bridgeBody)}${section('04','XMAX POSITION','持仓结构与产品信号','二级、大宗、购买计划三条来源；同一 TW 可同时持有多个类别。',holdingBody)}${section('05','HISTORICAL TREND','历史数据与经营轨迹','按各期实际上传来源追踪规模变化。',trendBody)}${section('06','DATA ASSURANCE','数据核对与报告修订','保留系统原始计算；人工修订按日期、依据与操作人留痕。',controlBody,'brief-assurance')}<footer class="report-footnote"><span>统计口径</span><p>${(data.notes||[]).map(esc).join(' · ')}</p><small>JY Customer Operations · ${esc(data.asOf)}</small></footer></div>`;
 }
 
+let shareholderRequest=0;
 async function renderShareholderReport(content) {
-  const query = state.shareholderAsOf ? `?as_of=${encodeURIComponent(state.shareholderAsOf)}` : '';
-  const data = await api(`/api/workspace/dashboard/report${query}`);
-  state.shareholderAsOf = data.asOf;
-  content.innerHTML = shareholderReportMarkup(data);
-  content.querySelector('#shareholder-as-of')?.addEventListener('change', event => { state.shareholderAsOf = event.target.value; renderShareholderReport(content).catch(error => { content.innerHTML = `<section class="section"><div class="empty">${esc(error.message)}</div></section>`; }); });
-  content.querySelector('#print-shareholder-report')?.addEventListener('click', () => window.print());
-  content.querySelector('#download-shareholder-report')?.addEventListener('click', () => downloadShareholderReport(data));
+  const request=++shareholderRequest;
+  const query=state.shareholderAsOf?`?as_of=${encodeURIComponent(state.shareholderAsOf)}`:'';
+  const data=await api(`/api/workspace/dashboard/report${query}`);
+  if(request!==shareholderRequest||state.view!=='shareholder-report')return;
+  state.shareholderAsOf=data.asOf;
+  content.innerHTML=shareholderReportMarkup(data);
+  content.querySelector('#shareholder-as-of')?.addEventListener('change',event=>{state.shareholderAsOf=event.target.value;renderShareholderReport(content).catch(error=>toast(error.message));});
+  content.querySelector('#print-shareholder-report')?.addEventListener('click',()=>window.print());
+  content.querySelector('#download-shareholder-report')?.addEventListener('click',()=>downloadShareholderReport(data));
+  content.querySelector('#correct-shareholder-report')?.addEventListener('click',()=>openShareholderCorrection(data,content));
+}
+
+function openShareholderCorrection(data,content) {
+  openModal(`<div class="modal"><div class="modal-header"><div><h3>修订报告数据 · ${esc(data.asOf)}</h3><span class="hint">只作用于本期报告，不修改客户原档或导入数据。资产、持仓明细错误请重新上传。</span></div><button class="close-btn" data-close>×</button></div><form id="shareholder-correction-form"><div class="modal-body"><div class="field"><label>修订指标<select name="metric">${data.correctionOptions.map(o=>`<option value="${esc(o.key)}">${esc(o.label)}</option>`).join('')}</select></label></div><p id="correction-values" class="notice"></p><div class="field"><label>采用值<input type="number" name="value" min="0" step="any" required></label></div><div class="field"><label><input type="checkbox" name="restore"> 恢复为系统计算值</label></div><div class="field"><label>数据依据<input name="source" maxlength="1000" placeholder="例如：财务核对表、报告文件及章节" required></label></div><div class="field"><label>修订原因<textarea name="reason" maxlength="2000" required></textarea></label></div><p id="correction-error" class="p-error" role="alert"></p><details><summary>本期修订历史（${data.correctionHistory.length} 条）</summary>${data.correctionHistory.slice().reverse().map(r=>`<p>${esc(data.correctionOptions.find(o=>o.key===r.metric)?.label||r.metric)}：${r.value==null?'恢复系统值':shareholderNumber(r.value,4)} · ${esc(r.author_name)} · ${esc(r.created_at)}<br>${esc(r.source)} · ${esc(r.reason)}</p>`).join('')}</details></div><div class="modal-footer"><button type="button" class="secondary-btn" data-close>取消</button><button class="primary-btn">保存修订</button></div></form></div>`);
+  const form=document.querySelector('#shareholder-correction-form');
+  const update=()=>{const option=data.correctionOptions.find(o=>o.key===form.elements.metric.value);form.querySelector('#correction-values').textContent=`系统计算：${shareholderNumber(option.automatic,4)} · 当前报告：${shareholderNumber(option.effective,4)}`;form.elements.value.value=option.effective??'';form.elements.value.step=option.key.endsWith('Count')||['registered','opened'].includes(option.key)?'1':'any';};
+  form.elements.metric.onchange=update;update();
+  form.elements.restore.onchange=()=>{form.elements.value.disabled=form.elements.restore.checked;form.elements.value.required=!form.elements.restore.checked;};
+  form.onsubmit=async event=>{event.preventDefault();const button=event.submitter;button.disabled=true;try{await api('/api/workspace/dashboard/report/adjustments',{method:'POST',body:JSON.stringify({reportDate:data.asOf,metric:form.elements.metric.value,value:form.elements.restore.checked?null:form.elements.value.value,source:form.elements.source.value,reason:form.elements.reason.value,expectedId:data.adjustments.find(c=>c.metric===form.elements.metric.value)?.id||''})});closeModal();await renderShareholderReport(content);toast('报告修订已保存');}catch(error){form.querySelector('#correction-error').textContent=error.message;button.disabled=false;}};
 }
 
 async function downloadShareholderReport(data) {
-  const report = document.querySelector('#shareholder-report-page')?.cloneNode(true);
-  if (!report) return;
-  report.querySelector('.shareholder-controls')?.remove();
-  report.querySelectorAll('button, select, label').forEach(node => node.remove());
-  let css = '';
-  try { css = await fetch('/shareholder-report.css').then(response => response.text()); } catch {}
-  const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>港安客户资产与业务经营报告 · ${esc(data.asOf)}</title><style>${css}</style><style>body{margin:0;background:#f0f2ef}.shareholder-report{max-width:1440px;margin:0 auto}.shareholder-hero{border-radius:0!important}</style></head><body>${report.outerHTML}</body></html>`;
-  const blob = new Blob([html], {type:'text/html;charset=utf-8'});
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = `港安客户资产与业务经营报告-${data.asOf || '最新'}.html`;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1500);
-  toast('股东报告已下载');
+  const query=`?as_of=${encodeURIComponent(data.asOf)}`;
+  try {
+    const response=await fetch('/api/workspace/dashboard/report.pdf'+query,{headers:state.token?{Authorization:`Bearer ${state.token}`}:{}});
+    if(!response.ok){const detail=await response.json().catch(()=>({}));throw new Error(detail.detail||'PDF 报告下载失败');}
+    const blob=await response.blob(),url=URL.createObjectURL(blob),link=document.createElement('a');
+    link.href=url;link.download=`港安客户资产与业务经营报告_${data.asOf}.pdf`;link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),2000);toast('PDF 股东报告已下载');
+  }catch(error){toast(error.message);}
 }

@@ -5,11 +5,13 @@ from typing import Literal
 from uuid import uuid4
 
 from fastapi import Depends, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from backend.followup_access import can_followup, disabled_reason
+from backend.shareholder_reporting import SCHEMA as REPORT_SCHEMA, METRICS, build_report, can_edit, adjustments
 
-SCHEMA = ["""CREATE TABLE IF NOT EXISTS workspace_followups (
+SCHEMA = [REPORT_SCHEMA, """CREATE TABLE IF NOT EXISTS workspace_followups (
  id TEXT PRIMARY KEY, subject_key TEXT NOT NULL, business TEXT NOT NULL,
  batch_key TEXT NOT NULL, author_id TEXT NOT NULL, author_name TEXT NOT NULL,
  method TEXT NOT NULL, content TEXT NOT NULL, outcome TEXT NOT NULL,
@@ -29,13 +31,22 @@ def customer_note_count(conn, customer_id):
 
 class Note(BaseModel):
     subjectKey: str = Field(max_length=250)
-    business: Literal['service', 'placement', 'priority']
+    business: Literal['service', 'placement', 'priority', 'block']
     batchKey: str = Field(default='', max_length=100)
     method: str = Field(default='沟通', min_length=1, max_length=100)
     content: str = Field(min_length=1, max_length=10000)
     outcome: str = Field(default='', max_length=2000)
     nextAction: str = Field(default='', max_length=2000)
     nextFollowupAt: datetime | None = None
+
+
+class ReportAdjustment(BaseModel):
+    reportDate: str
+    metric: str
+    value: str | None = Field(default=None, max_length=100)
+    reason: str = Field(min_length=1, max_length=2000)
+    source: str = Field(min_length=1, max_length=1000)
+    expectedId: str = Field(default='', max_length=100)
 
 
 def install(app, db, current_user, access_clause, audit, now_iso, priority_scope, heads, platform_users):
@@ -79,10 +90,18 @@ def install(app, db, current_user, access_clause, audit, now_iso, priority_scope
                     aliases[anchor] = key
                 p = people.setdefault(key, dict(key=key, name=r.get('canonicalName') or r['customerName'], twCode=code or '', crm=[], priority=[], assets=[], secondary=[], master=[]))
                 p['priority' if d['kind']=='icc' else d['kind']].append(dict(r, date=d['business_date']))
+        holding_dates = [d['business_date'] for d in all_heads.values() if d['kind']=='secondary' and d.get('head_id')]
+        latest_holding_date = max(holding_dates) if holding_dates else None
+        if latest_holding_date:
+            for person in people.values():
+                if person['twCode'] and not any(r['date']==latest_holding_date for r in person['secondary']):
+                    person['secondary'].append(dict(date=latest_holding_date, quantity='0', secondaryQuantity='0',
+                        blockQuantity='0', priorityQuantity='0', holdingTypes=[], holdingType='当期完整持仓表未列示',
+                        snapshotMissing=True))
         return people, aliases
 
     def permits(person, business):
-        return business == 'service' or bool(person['crm'] if business in {'placement','legacy'} else person['priority'])
+        return business == 'service' or bool(person['crm'] if business in {'placement','legacy'} else (person['priority'] or (person['crm'] if business == 'block' else [])))
 
     def followup_permission(person, user):
         customer = person['crm'][-1] if person['crm'] else {}
@@ -136,12 +155,13 @@ def install(app, db, current_user, access_clause, audit, now_iso, priority_scope
                     latestAssetDate=latest_asset.get('date','') if latest_asset else '',
                     xmaxQuantity=latest_secondary.get('quantity') if latest_secondary else None,
                     secondaryQuantity=latest_secondary.get('secondaryQuantity') if latest_secondary else None,
+                    priorityQuantity=latest_secondary.get('priorityQuantity') if latest_secondary else None,
                     blockQuantity=latest_secondary.get('blockQuantity') if latest_secondary else None,
                     holdingTypes=latest_secondary.get('holdingTypes', []) if latest_secondary else [],
                     holdingType=latest_secondary.get('holdingType', '') if latest_secondary else '',
                     hasXmax=bool(latest_secondary and Decimal(str(latest_secondary.get('quantity') or 0)) > 0),
                     hasPriority=bool(p['priority']), hasPlacement=bool(p['crm']),
-                    businesses=['service'] + (['placement'] if p['crm'] else []) + (['priority'] if p['priority'] else []),
+                    businesses=['service'] + (['placement'] if p['crm'] else []) + (['priority'] if p['priority'] else []) + (['block'] if p['priority'] or p['crm'] else []),
                     **(followup_permission(p, user) if user else {}))
 
     @app.get('/api/workspace/dashboard')
@@ -280,273 +300,68 @@ def install(app, db, current_user, access_clause, audit, now_iso, priority_scope
         """
         report_permission = user.get('canViewShareholderReport')
         if report_permission is None:
-            report_permission = user.get('rolePermission') in {'manager', 'supervisor', 'admin', 'developer'}
+            report_permission = user.get('rolePermission') in {'supervisor', 'admin', 'developer'}
         if not report_permission:
             raise HTTPException(403, '您的账号未开通股东报告查看权限。')
-        def decimal(value):
-            try:
-                return Decimal(str(value or 0))
-            except (TypeError, ValueError, ArithmeticError):
-                return Decimal('0')
-
-        def number(value, digits=2):
-            if value is None:
-                return None
-            value = decimal(value)
-            return float(value) if digits else int(value)
-
-        def money_value(value):
-            return float(decimal(value))
-
-        def source_date(dataset):
-            return dataset.get('business_date') if dataset else None
-
-        def latest(datasets, selected):
-            values = [item for item in datasets if item.get('business_date') <= selected]
-            return values[-1] if values else None
-
-        def status_success(value):
-            compact = ''.join(str(value or '').split()).casefold()
-            return any(token in compact for token in ('开户成功', '已开户', '开户完成', '完成开户', '开通成功'))
-
-        def asset_rows(dataset):
-            """Expand grouped duplicate TW rows back into source accounts."""
-            rows = []
-            for row in (dataset or {}).get('rows', []):
-                rows.extend(row.get('sourceRows') or [row])
-            return rows
-
-        def asset_customer_count(dataset):
-            """Count opened customers from unique TW identities in the asset snapshot.
-
-            One TW account can have several source rows/accounts.  The shareholder
-            funnel is a customer funnel, so those rows must count once.
-            """
-            rows = (dataset or {}).get('rows', [])
-            codes = {str(row.get('twCode') or '').strip() for row in rows if str(row.get('twCode') or '').strip()}
-            return len(codes) if codes else (len(rows) if dataset else None)
-
-        def placement_rollup(conn, crm_ids):
-            records = []
-            if crm_ids:
-                placeholders = ','.join('?' for _ in crm_ids)
-                records = [dict(row) for row in conn.execute(
-                    f'''SELECT bp.status,bp.intent_amount,bp.actual_amount,bp.funded_amount,b.name batch_name
-                        FROM batch_participations bp JOIN placement_batches b ON b.id=bp.batch_id
-                        WHERE bp.customer_id IN ({placeholders})''', tuple(crm_ids)).fetchall()]
-            # Preserve the old customer-level source when no participation table exists.
-            if not records:
-                for c in crm_records:
-                    status = c.get('placement_status') or ''
-                    if status in {'批次确认', '资金筹备', '资金到账', '已参与', '已流失'}:
-                        records.append(dict(status='已参与' if status == '已参与' else '已锁定',
-                                            intent_amount=c.get('intent_amount') or 0,
-                                            actual_amount=c.get('actual_amount') or 0,
-                                            funded_amount=c.get('funded_amount') or 0,
-                                            batch_name='客户主档'))
-            return records
-
         with db() as conn:
             all_heads, _ = priority_scope(conn, heads(conn), user)
-            datasets = {
-                kind: sorted((d for d in all_heads.values() if d.get('kind') == kind and d.get('head_id')),
-                             key=lambda d: d.get('business_date', ''))
-                for kind in ('master', 'assets', 'secondary', 'icc')
-            }
-            all_dates = sorted({d.get('business_date') for rows in datasets.values() for d in rows if d.get('business_date')})
-            if as_of:
-                try:
-                    selected = date.fromisoformat(as_of).isoformat()
-                except ValueError as exc:
-                    raise HTTPException(422, '统计日期必须使用 YYYY-MM-DD 格式。') from exc
-                if all_dates and selected < all_dates[0]:
-                    raise HTTPException(422, '统计日期早于当前已上传的最早资料。')
-            else:
-                selected = all_dates[-1] if all_dates else date.today().isoformat()
-
-            latest_master = latest(datasets['master'], selected)
-            latest_assets = latest(datasets['assets'], selected)
-            latest_secondary = latest(datasets['secondary'], selected)
-            latest_icc = latest(datasets['icc'], selected)
-            asset_summary = (latest_assets or {}).get('summary') or {}
-            master_rows = (latest_master or {}).get('rows', [])
-            expanded_assets = asset_rows(latest_assets)
-            asset_values = [decimal(row.get('assetUsd')) for row in expanded_assets if row.get('assetUsd') is not None]
-            asset_values = [value for value in asset_values if value >= 0]
-
-            buckets = [
-                ('10万美金以上', Decimal('100000'), None),
-                ('5-10万美金', Decimal('50000'), Decimal('100000')),
-                ('1-5万美金', Decimal('10000'), Decimal('50000')),
-                ('1500美金-1万美金', Decimal('1500'), Decimal('10000')),
-                ('1500美金以下', Decimal('0'), Decimal('1500')),
-                ('无入金或已出金', None, Decimal('0')),
-            ]
-            bucket_items = []
-            for label, lower, upper in buckets:
-                if label == '无入金或已出金':
-                    count = sum(value <= 0 for value in asset_values)
-                elif upper is None:
-                    count = sum(value >= lower for value in asset_values)
-                else:
-                    count = sum((value > lower if lower == 0 else value >= lower) and value < upper
-                                for value in asset_values)
-                bucket_items.append(dict(label=label, count=count,
-                                         share=(round(count / len(asset_values) * 100, 2) if asset_values else None)))
-            if asset_summary.get('assetBuckets'):
-                bucket_items = [dict(label=item.get('label'), count=int(decimal(item.get('count'))),
-                                     share=(round(decimal(item.get('share')) * 100, 2) if item.get('share') is not None else None))
-                                for item in asset_summary['assetBuckets']]
-            funded_accounts = int(decimal(asset_summary.get('fundedAccounts'))) if asset_summary.get('fundedAccounts') is not None else sum(value > 0 for value in asset_values)
-            activation_rate = (float(decimal(asset_summary['activationRate']) * 100)
-                               if asset_summary.get('activationRate') is not None
-                               else (round(funded_accounts / len(asset_values) * 100, 2) if asset_values else None))
-            asset_total = sum(asset_values, Decimal('0'))
-            reported_account_aum = decimal(asset_summary.get('liveAccountAumUsd')) if asset_summary.get('liveAccountAumUsd') is not None else None
-            reported_total_aum = decimal(asset_summary.get('liveTotalAumUsd')) if asset_summary.get('liveTotalAumUsd') is not None else None
-            sorted_assets = sorted(asset_values, reverse=True)
-            top10 = sum(sorted_assets[:10], Decimal('0'))
-
-            crm_records = []
             people, _ = context(conn, user)
-            for person in people.values():
-                crm_records.extend(person.get('crm', []))
-            crm_ids = sorted({c['id'] for c in crm_records if c.get('id')})
-            master_statuses = [str(row.get('brokerAccountStatus') or '') for row in master_rows]
-            known_statuses = [value for value in master_statuses if value]
-            registration_summary = asset_summary.get('registration') or {}
-            registered = int(decimal(registration_summary.get('total'))) if registration_summary.get('total') is not None else (len(master_rows) if latest_master else len({p['key'] for p in people.values() if p.get('twCode')}))
-            opened = asset_customer_count(latest_assets) if latest_assets else (int(decimal(registration_summary.get('opened'))) if registration_summary.get('opened') is not None else (sum(status_success(value) for value in master_statuses) if latest_master else None))
-            registration_rate = (float(decimal(registration_summary['rate']) * 100)
-                                 if registration_summary.get('rate') is not None
-                                 else (round(opened / registered * 100, 2) if opened is not None and registered else None))
+            return build_report(conn, all_heads, people, user, as_of)
 
-            placements = placement_rollup(conn, crm_ids)
-            signed = [row for row in placements if row.get('status') != '未参与']
-            converted = [row for row in placements if row.get('status') in {'已参与', '资金到账'}]
-            dropped = [row for row in placements if row.get('status') == '未参与']
-            pending = [row for row in placements if row.get('status') == '已锁定']
+    @app.post('/api/workspace/dashboard/report/adjustments', status_code=201)
+    def correct_report(payload: ReportAdjustment, user=Depends(current_user)):
+        if not can_edit(user) or user.get('canViewShareholderReport') is False:
+            raise HTTPException(403, '仅有股东报告权限的管理员可修订报告。')
+        try:
+            report_date = date.fromisoformat(payload.reportDate).isoformat()
+        except ValueError as exc:
+            raise HTTPException(422, '报告日期格式无效。') from exc
+        if payload.metric not in METRICS:
+            raise HTTPException(422, '不支持修订此指标。资产和持仓明细应重新上传来源文件。')
+        if not payload.reason.strip() or not payload.source.strip():
+            raise HTTPException(422, '请填写修订原因和依据。')
+        value = payload.value
+        if value is not None:
+            try:
+                numeric = Decimal(value)
+                if not numeric.is_finite() or numeric < 0 or numeric > Decimal('1e15'):
+                    raise ValueError()
+                if (payload.metric.endswith('Count') or payload.metric in {'registered','opened'}) and numeric != numeric.to_integral_value():
+                    raise ValueError()
+                value = str(numeric)
+            except (ArithmeticError, ValueError) as exc:
+                raise HTTPException(422, '请输入非负有限数值；人数须为整数。') from exc
+        identifier = str(uuid4())
+        with db() as conn:
+            conn.execute('UPDATE priority_write_lock SET version=version+1 WHERE id=1')
+            created = datetime.now(timezone.utc).isoformat(timespec='microseconds')
+            current, _ = adjustments(conn, report_date)
+            previous = current.get(payload.metric)
+            if payload.expectedId != (previous['id'] if previous else ''):
+                raise HTTPException(409, '该指标已由其他人修订，请刷新后再提交。')
+            conn.execute('INSERT INTO shareholder_report_adjustments VALUES (?,?,?,?,?,?,?,?,?)',
+                         (identifier,report_date,payload.metric,value,payload.reason.strip(),payload.source.strip(),user['id'],user['name'],created))
+            audit(conn,user,'shareholder.report.adjusted','shareholder_report',report_date,
+                  dict(metric=payload.metric,before=previous, value=value,reason=payload.reason.strip(),source=payload.source.strip()))
+        return dict(id=identifier)
 
-            def funnel_item(rows, amount_key='intent_amount'):
-                return dict(count=len(rows), amount=money_value(sum((decimal(row.get(amount_key)) for row in rows), Decimal('0'))))
-
-            def source_pair(value, fallback):
-                if not isinstance(value, dict) or (value.get('count') is None and value.get('amount') is None):
-                    return fallback
-                return dict(count=(int(decimal(value.get('count'))) if value.get('count') is not None else 0),
-                            amount=(money_value(value.get('amount')) if value.get('amount') is not None else 0))
-
-            summary_onsite = asset_summary.get('onsite') or {}
-            onsite = dict(
-                signed=source_pair(summary_onsite.get('signed'), funnel_item(signed)),
-                converted=source_pair(summary_onsite.get('converted'), funnel_item(converted, 'actual_amount')),
-                dropped=source_pair(summary_onsite.get('dropped'), funnel_item(dropped)),
-                pending=source_pair(summary_onsite.get('pending'), funnel_item(pending)),
-            )
-
-            def named_rollup(terms):
-                selected_rows = [row for row in placements if any(term in str(row.get('batch_name') or '') for term in terms)]
-                return dict(available=bool(selected_rows), signed=funnel_item(selected_rows),
-                            converted=funnel_item([r for r in selected_rows if r.get('status') in {'已参与', '资金到账'}], 'actual_amount'),
-                            pending=funnel_item([r for r in selected_rows if r.get('status') == '已锁定']))
-
-            single_sign = named_rollup(('单签', '单独签约'))
-            summary_single = asset_summary.get('singleSign') or {}
-            if summary_single.get('consulted') is not None or summary_single.get('converted', {}).get('count') is not None:
-                single_sign = dict(available=True,
-                                   consulted=int(decimal(summary_single.get('consulted'))),
-                                   signed=dict(count=int(decimal(summary_single.get('consulted'))), amount=0),
-                                   converted=source_pair(summary_single.get('converted'), dict(count=0, amount=0)),
-                                   pending=source_pair(summary_single.get('pending'), dict(count=0, amount=0)))
-            promise_plan = named_rollup(('承诺购买', '购买计划', '计划'))
-            summary_promise = asset_summary.get('promisePlan') or {}
-            if summary_promise.get('signed', {}).get('count') is not None or summary_promise.get('converted', {}).get('count') is not None:
-                promise_plan = dict(available=True,
-                                    signed=source_pair(summary_promise.get('signed'), dict(count=0, amount=0)),
-                                    converted=source_pair(summary_promise.get('converted'), dict(count=0, amount=0)),
-                                    pending=source_pair(summary_promise.get('pending'), dict(count=0, amount=0)))
-
-            secondary_rows = (latest_secondary or {}).get('rows', [])
-            secondary_quantity = sum((decimal(row.get('secondaryQuantity')) for row in secondary_rows), Decimal('0'))
-            block_quantity = sum((decimal(row.get('blockQuantity')) for row in secondary_rows), Decimal('0'))
-            total_quantity = sum((decimal(row.get('quantity')) for row in secondary_rows), Decimal('0'))
-            holders = sum(decimal(row.get('quantity')) > 0 for row in secondary_rows)
-            secondary_holders = sum(decimal(row.get('secondaryQuantity')) > 0 for row in secondary_rows)
-            block_holders = sum(decimal(row.get('blockQuantity')) > 0 for row in secondary_rows)
-            xmax_summary = asset_summary.get('xmax') or {}
-            if xmax_summary.get('quantity') is not None or xmax_summary.get('holders') is not None:
-                holders = int(decimal(xmax_summary.get('holders'))) if xmax_summary.get('holders') is not None else holders
-                total_quantity = decimal(xmax_summary.get('quantity')) if xmax_summary.get('quantity') is not None else total_quantity
-                block_quantity = decimal(xmax_summary.get('blockQuantity')) if xmax_summary.get('blockQuantity') is not None else block_quantity
-                block_holders = int(decimal(xmax_summary.get('blockHolders'))) if xmax_summary.get('blockHolders') is not None else block_holders
-                secondary_quantity = total_quantity - block_quantity if xmax_summary.get('blockQuantity') is not None else secondary_quantity
-
-            from backend.priority_batches import rollup_activity
-            priority_rows = rollup_activity(conn, all_heads)['rows']
-            priority_positive = [row for row in priority_rows if decimal(row.get('agreementAmountUsd')) > 0]
-            priority_participants = {row.get('twCode') for row in priority_positive if row.get('twCode')}
-            priority_pending = sum(not row.get('twCode') for row in priority_positive)
-            priority_agreement = sum((decimal(row.get('agreementAmountUsd')) for row in priority_positive), Decimal('0'))
-            priority_deposit = sum((decimal(row.get('depositAmount')) for row in priority_positive), Decimal('0'))
-            priority_funded = sum(decimal(row.get('depositAmount')) > 0 for row in priority_positive)
-
-            trend_dates = sorted({d for d in all_dates if d <= selected})
-            trend = []
-            for trend_date in trend_dates:
-                master = latest(datasets['master'], trend_date)
-                assets = latest(datasets['assets'], trend_date)
-                secondary = latest(datasets['secondary'], trend_date)
-                master_values = (master or {}).get('rows', [])
-                trend_assets = asset_rows(assets)
-                values = [decimal(row.get('assetUsd')) for row in trend_assets if row.get('assetUsd') is not None]
-                statuses = [str(row.get('brokerAccountStatus') or '') for row in master_values]
-                trend_summary = (assets or {}).get('summary') or {}
-                trend_asset_aum = decimal(trend_summary.get('liveTotalAumUsd')) if trend_summary.get('liveTotalAumUsd') is not None else sum(values, Decimal('0'))
-                trend.append(dict(date=trend_date, customers=(int(decimal((trend_summary.get('registration') or {}).get('total'))) if (trend_summary.get('registration') or {}).get('total') is not None else (len(master_values) if master else None)),
-                                  opened=(asset_customer_count(assets) if assets else (int(decimal((trend_summary.get('registration') or {}).get('opened'))) if (trend_summary.get('registration') or {}).get('opened') is not None else (sum(status_success(value) for value in statuses) if master else None))),
-                                  assetAum=money_value(trend_asset_aum) if assets else None,
-                                  fundedRate=(float(decimal(trend_summary['activationRate']) * 100) if trend_summary.get('activationRate') is not None else (round(sum(value > 0 for value in values) / len(values) * 100, 2) if values else None)),
-                                  secondaryQuantity=(money_value(sum((decimal(row.get('secondaryQuantity')) for row in (secondary or {}).get('rows', [])), Decimal('0'))) if secondary else None),
-                                  blockQuantity=(money_value(sum((decimal(row.get('blockQuantity')) for row in (secondary or {}).get('rows', [])), Decimal('0'))) if secondary else None)))
-
-            source_dates = {kind: source_date(latest(datasets[kind], selected)) for kind in datasets}
-            insights = []
-            if asset_values:
-                inactive_share = next((item['share'] for item in bucket_items if item['label'] == '无入金或已出金'), 0) or 0
-                insights.append(dict(tone='attention', title='资产激活仍是最大增长杠杆', body=f'无入金或已出金账户占资产快照 {inactive_share:.2f}%，入金账户为 {funded_accounts:,} 个。'))
-                insights.append(dict(tone='positive', title='高净值客户贡献集中', body=f'资产排名前 10 的客户合计 ${float(top10):,.0f}，占快照资产 ${float(asset_total):,.0f} 的 {(float(top10 / asset_total * 100) if asset_total else 0):.1f}%。'))
-            if registered and opened is not None:
-                insights.append(dict(tone='neutral', title='开户漏斗保持可量化', body=f'开户成功 {opened:,} / 注册 {registered:,}，成功率 {opened / registered * 100:.2f}%。'))
-            if onsite['signed']['count']:
-                conversion_rate = onsite['converted']['count'] / onsite['signed']['count'] * 100
-                insights.append(dict(tone='positive' if conversion_rate >= 30 else 'attention', title='定增现场签约转化', body=f"现场签约 {onsite['signed']['count']:,} 人，已转化 {onsite['converted']['count']:,} 人，人数转化率 {conversion_rate:.1f}%。"))
-
-            return dict(asOf=selected, reportDates=all_dates, scope=('全量客户' if user.get('customerScope') == 'all' else '当前账号可见范围'),
-                        sourceDates=source_dates,
-                        kpis=dict(customers=registered, opened=opened, accountSuccessRate=registration_rate,
-                                  fundedAccounts=funded_accounts if latest_assets else None, activationRate=activation_rate,
-                                  assetAum=money_value(reported_total_aum if reported_total_aum is not None else asset_total) if latest_assets else None, top10Share=(round(float(top10 / asset_total * 100), 2) if asset_total else None),
-                                  placementConvertedAmount=onsite['converted']['amount'], priorityAgreementUsd=money_value(priority_agreement)),
-                        assets=dict(accounts=len(asset_values) if latest_assets else None, fundedAccounts=funded_accounts if latest_assets else None,
-                                    activationRate=activation_rate, totalUsd=(money_value(asset_total) if latest_assets else None),
-                                    reportedAccountAumUsd=(money_value(reported_account_aum) if reported_account_aum is not None else None),
-                                    reportedLiveTotalUsd=(money_value(reported_total_aum) if reported_total_aum is not None else None),
-                                    historicalPlacementUsd=(money_value(decimal(asset_summary['historicalPlacementUsd'])) if asset_summary.get('historicalPlacementUsd') is not None else None),
-                                    top10Usd=(money_value(top10) if latest_assets else None), buckets=bucket_items if latest_assets else [],
-                                    note='资产分层按上传资产明细的原始账户行统计；重复 TW 仍按原始账户记录保留。'),
-                        funnel=dict(registration=dict(total=registered, opened=opened, rate=registration_rate), onsite=onsite,
-                                    singleSign=single_sign, promisePlan=promise_plan),
-                        holdings=dict(available=bool(latest_secondary) or bool(xmax_summary), holders=holders if (latest_secondary or xmax_summary) else None,
-                                      secondaryHolders=secondary_holders if latest_secondary else None, blockHolders=block_holders if latest_secondary else None,
-                                      quantity=money_value(total_quantity) if (latest_secondary or xmax_summary) else None, secondaryQuantity=money_value(secondary_quantity) if (latest_secondary or xmax_summary) else None,
-                                      blockQuantity=money_value(block_quantity) if (latest_secondary or xmax_summary) else None,
-                                      marketValue=(money_value(decimal(xmax_summary['marketValue'])) if xmax_summary.get('marketValue') is not None else None),
-                                      price=xmax_summary.get('price'),
-                                      note=('持仓市值来自资产分析表的价格口径。' if xmax_summary.get('marketValue') is not None else '持仓资料未提供估值价格，市值保持空值，不用股数推算。')),
-                        priority=dict(available=bool(datasets['icc']), participants=len(priority_participants), records=len(priority_positive), pendingIdentities=priority_pending,
-                                      agreementUsd=money_value(priority_agreement), depositUsd=money_value(priority_deposit), fundedAccounts=priority_funded),
-                        trend=trend, insights=insights,
-                        notes=['所有指标按当前账号可见范围计算。', '来源日期不一致时，报告显示各指标自己的最新快照日期。', '没有上传来源的字段不会估算。'])
+    @app.get('/api/workspace/dashboard/report.pdf')
+    def download_report(as_of: str = '', user=Depends(current_user)):
+        # Recompute and enforce permission for each download; never trust browser metrics.
+        data = dashboard_report(as_of, user)
+        try:
+            from backend.shareholder_pdf import ReportFontUnavailable, render_report
+            result = render_report(data)
+        except ImportError as exc:
+            raise HTTPException(503, 'PDF 导出依赖尚未安装，请管理员更新 requirements.txt 后重启服务。') from exc
+        except ReportFontUnavailable as exc:
+            raise HTTPException(503, str(exc)) from exc
+        from urllib.parse import quote
+        filename = quote('港安客户资产与业务经营报告_' + data['asOf'] + '.pdf')
+        return Response(result, media_type='application/pdf', headers={
+            'Content-Disposition': "attachment; filename=JY-Report-" + data['asOf'] + ".pdf; filename*=UTF-8''" + filename,
+            'Cache-Control': 'no-store',
+        })
 
     @app.get('/api/workspace/customers')
     def directory(user=Depends(current_user)):
@@ -633,6 +448,9 @@ def install(app, db, current_user, access_clause, audit, now_iso, priority_scope
 
     @app.post('/api/workspace/followups', status_code=201)
     def create_note(payload: Note, user=Depends(current_user)):
+        if payload.business == 'placement':
+            from backend.business_policy import require_active_placement
+            require_active_placement()
         if not payload.content.strip():
             raise HTTPException(422,'请填写沟通内容。')
         with db() as conn:
@@ -647,7 +465,7 @@ def install(app, db, current_user, access_clause, audit, now_iso, priority_scope
                 raise HTTPException(403, permission['followupDisabledReason'])
             activity_dates = None
             if payload.batchKey:
-                if payload.business == 'priority':
+                if payload.business in {'priority','block'}:
                     valid = {r['date'] for r in p['priority']}
                     mapped = [dict(row) for row in conn.execute(
                         'SELECT batch_id,activity_date FROM priority_batch_activities').fetchall()]
@@ -668,7 +486,7 @@ def install(app, db, current_user, access_clause, audit, now_iso, priority_scope
             when = when.astimezone(timezone.utc).isoformat() if when else None
             # Preserve an unmatched row anchor so later identity confirmation automatically links its history.
             subject = payload.subjectKey if payload.subjectKey.startswith('icc:') else key
-            if payload.business == 'priority':
+            if payload.business in {'priority','block'}:
                 activity = [r for r in p['priority'] if not payload.batchKey or r['date']==payload.batchKey
                             or r['date'] in (activity_dates or set())][-1]
                 subject = 'icc:' + activity['date'] + '/' + activity['recordKey']

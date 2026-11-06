@@ -1,3 +1,4 @@
+import pytest
 import base64
 import hashlib
 import hmac
@@ -19,6 +20,12 @@ from fastapi.testclient import TestClient
 
 from backend.main import app
 import backend.main as crm_main
+
+@pytest.fixture(autouse=True)
+def legacy_placement_contract(monkeypatch):
+    from backend import business_policy
+    monkeypatch.setattr(business_policy, "PLACEMENT_ARCHIVED", False)
+
 
 client = TestClient(app)
 

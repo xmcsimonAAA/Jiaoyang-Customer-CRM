@@ -51,7 +51,7 @@ SCHEMA = [
 ]
 MATCHING_VERSION = 3
 
-LABELS = {'master': '客户身份与券商开户', 'assets': '客户资产（USD）', 'secondary': 'XMax 二级持仓（股）', 'icc': '港安 ICC 批次'}
+LABELS = {'master': '客户身份与券商开户', 'assets': '客户资产（USD）', 'secondary': 'XMax 分类持仓（股）', 'icc': '港安 ICC 批次'}
 
 
 class BindingChange(BaseModel):
@@ -385,6 +385,7 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                     assetUsd=sum_values(r.get('assetUsd') for r in rows), quantity=sum_values(r.get('quantity') for r in rows),
                     secondaryQuantity=sum_values(r.get('secondaryQuantity') for r in rows),
                     blockQuantity=sum_values(r.get('blockQuantity') for r in rows),
+                    priorityQuantity=sum_values(r.get('priorityQuantity') for r in rows),
                     automaticIdentity=dataset.get('automaticIdentity', False),
                     pending=sum(1 for r in rows if dataset['kind'] == 'icc' and not r.get('twCode')),
                     iccAccountFilter=dataset.get('iccAccountFilter'),
@@ -597,14 +598,14 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                     if anchor in seen_board or not row or d.get('kind') != 'icc':
                         raise HTTPException(422, '板块选择无效，请重新核对上传预览。')
                     seen_board.add(anchor)
-                    priority_amount = number(selection.get('agreementAmountUsd'), '优先劣后金额', nonnegative=True)
+                    priority_amount = number(selection.get('agreementAmountUsd'), '购买计划金额', nonnegative=True)
                     block_amount = number(selection.get('blockAgreementAmountUsd'), '大宗交易金额', nonnegative=True)
                     if not selection.get('priority'):
                         priority_amount = None
                     if not selection.get('block'):
                         block_amount = None
                     if selection.get('priority') and (priority_amount is None or Decimal(priority_amount) <= 0):
-                        raise HTTPException(422, f"{row.get('customerName', '客户')} 已选择优先劣后，但金额为空或为零。")
+                        raise HTTPException(422, f"{row.get('customerName', '客户')} 已选择购买计划，但金额为空或为零。")
                     if selection.get('block') and (block_amount is None or Decimal(block_amount) <= 0):
                         raise HTTPException(422, f"{row.get('customerName', '客户')} 已选择大宗交易，但金额为空或为零。")
                     row['agreementAmountUsd'] = priority_amount
@@ -718,7 +719,7 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                 customers[code] = dict(twCode=code, customerName=identity.get('customerName') or (own[-1].get('canonicalName') or own[-1]['customerName'] if own else '') or (a or q or {}).get('customerName', ''),
                     brokerAccountStatus=identity.get('brokerAccountStatus', ''), assetUsd=a.get('assetUsd') if a else None,
                     quantity=q.get('quantity') if q else None, secondaryQuantity=q.get('secondaryQuantity') if q else None,
-                    blockQuantity=q.get('blockQuantity') if q else None, holdingTypes=q.get('holdingTypes', []) if q else [], secondaryPresent=q is not None,
+                    priorityQuantity=q.get('priorityQuantity') if q else None, blockQuantity=q.get('blockQuantity') if q else None, holdingTypes=q.get('holdingTypes', []) if q else [], secondaryPresent=q is not None,
                     isSecondary=q is not None and Decimal(q['quantity']) > 0,
                     agreementUsd=sum_values(r['agreementAmountUsd'] for r in participating),
                     batchDates=[r['batchDate'] for r in participating],
@@ -740,6 +741,7 @@ def install(app: Any, db: Callable, current_user: Callable, access_clause: Calla
                                      quantity=sum_values(r['quantity'] for r in customers.values()) if date_by_kind['secondary'] else None,
                                      secondaryQuantity=sum_values(r['secondaryQuantity'] for r in customers.values() if r.get('secondaryQuantity') is not None) if date_by_kind['secondary'] else None,
                                      blockQuantity=sum_values(r['blockQuantity'] for r in customers.values() if r.get('blockQuantity') is not None) if date_by_kind['secondary'] else None,
+                                     priorityQuantity=sum_values(r.get('priorityQuantity') for r in customers.values()) if date_by_kind['secondary'] else None,
                                      pending=sum(1 for r in activity if not r.get('twCode'))))
 
     @app.get('/api/priority-inferior/tasks')

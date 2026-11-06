@@ -61,6 +61,8 @@ def assets(date='2026.09.11', amount='20'):
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
+    from backend import business_policy
+    monkeypatch.setattr(business_policy, 'PLACEMENT_ARCHIVED', False)
     monkeypatch.setattr(main,'DB_PATH',tmp_path/'db.sqlite')
     monkeypatch.setattr(main,'DATABASE_URL','')
     monkeypatch.setattr(main,'MUSKZOOM_DB_PATH',tmp_path/'missing-platform.db')

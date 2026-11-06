@@ -179,6 +179,25 @@ sudo systemctl restart jy-customer.service
 curl --fail https://crm.muskzoom.com/api/health
 ```
 
+PDF 报告需要服务器安装可嵌入的中文 TrueType 字体。ReportLab 无法嵌入常见的
+Noto CJK CFF OpenType 字体；Ubuntu 请安装文泉驿 TrueType 字体（字体本身不放进 Git）：
+
+```bash
+sudo apt install -y fonts-wqy-zenhei
+```
+
+服务会自动检测 `/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc`。如果此前已配置过
+`JY_REPORT_FONT` 指向 Noto CJK，请通过 `sudo systemctl edit jy-customer.service` 改为：
+
+```ini
+[Service]
+Environment=JY_REPORT_FONT=/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc
+```
+
+保存后执行 `sudo systemctl daemon-reload && sudo systemctl restart jy-customer.service`。
+若找不到可嵌入的中文 TrueType 字体，PDF 接口会返回明确错误，不会下载缺字或依赖收件人
+电脑字体的报告。
+
 The pinyin holding importer uses the `pypinyin` dependency. It identifies
 `name`/`qty` workbooks, previews unique and ambiguous matches, and only writes
 the unique matches after an explicit confirmation in the CRM.
